@@ -129,6 +129,13 @@ class SnapshotTests(unittest.TestCase):
         finding.update(commit_id="b" * 40, original_commit_id="a" * 40)
         self.assertEqual(self.api(inline=[finding]).snapshot(1)["findings"], [10])
 
+    def test_null_historical_authors_are_ignored(self):
+        self.assertFalse(gate.bot({"user": None}))
+        api = self.api(inline=[{"id": 1, "user": None}],
+                       reactions=[{"id": 2, "user": None, "content": "+1"}])
+        self.assertEqual(api.snapshot(1)["findings"], [])
+        self.assertEqual(api.snapshot(1)["thumbs"], [])
+
     def test_api_failure_cannot_become_empty_clean_snapshot(self):
         with self.assertRaises(OSError):
             self.api(error=True).snapshot(1)
@@ -137,6 +144,30 @@ class SnapshotTests(unittest.TestCase):
         rows = ("| 📝 **Code Review** | ✅ **Completed** | `aaaaaaa` | New commits |\n"
                 "| **Security Review** | **Running** | `aaaaaaa` | New commits |")
         self.assertFalse(self.api(rows=rows).snapshot(1)["completed"])
+
+
+class HTTPTests(unittest.TestCase):
+    def test_authenticated_conditional_get_reuses_304_body(self):
+        api = gate.GitHub("example-token", "owner/repo")
+        response = io.BytesIO(b'{"value": 1}')
+        response.headers = {"ETag": '"version-1"'}
+        unchanged = gate.urllib.error.HTTPError("https://api.github.com/test", 304, "unchanged", {}, None)
+        with mock.patch.object(gate.urllib.request, "urlopen", side_effect=[response, unchanged]) as get:
+            first = api.call("test")
+            first["value"] = 99
+            self.assertEqual(api.call("test"), {"value": 1})
+            request = get.call_args.args[0]
+            self.assertEqual(request.get_header("If-none-match"), '"version-1"')
+            self.assertEqual(request.get_header("Authorization"), "Bearer example-token")
+
+    def test_rate_limit_stops_without_another_network_request(self):
+        for code in (403, 429):
+            api = gate.GitHub("example-token", "owner/repo")
+            error = gate.urllib.error.HTTPError("https://api.github.com/test", code, "blocked", {}, None)
+            with mock.patch.object(gate.urllib.request, "urlopen", side_effect=error) as get:
+                with self.assertRaises(gate.APIBlocked):
+                    api.call("test")
+                self.assertEqual(get.call_count, 1)
 
 
 class FakeGitHub:
@@ -267,6 +298,17 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.run_gate(api), gate.TIMEOUT)
         self.assertEqual(api.writes[0]["status"], "in_progress")
         self.assertEqual(api.check["conclusion"], "failure")
+
+    def test_unchanged_pending_output_is_not_written_each_poll(self):
+        api = FakeGitHub([sample()])
+        self.run_gate(api)
+        self.assertEqual(len(api.writes), 3)  # create, initial observation, timeout
+
+    def test_rate_limit_does_not_trigger_failure_patch_or_retry(self):
+        api = FakeGitHub([gate.APIBlocked("stop")])
+        with self.assertRaises(gate.APIBlocked):
+            self.run_gate(api)
+        self.assertEqual(len(api.writes), 1)  # pending creation only
 
     def test_generated_workflow_matches_single_source_and_compiles(self):
         spec = importlib.util.spec_from_file_location("render", ROOT / "tools/render_codex_review_gate.py")

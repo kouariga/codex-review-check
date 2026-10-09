@@ -66,6 +66,13 @@ trusted writable workflows share that identity. Do not execute untrusted PR code
 with this write token. Do not make this report-only check required until live
 behavior and repository policies have been validated.
 
+Authenticated conditional GETs reuse unchanged responses (304) without consuming
+GitHub's primary REST quota; identical check outputs are not repeatedly written.
+A denied/rate-limited API response (403/429) stops the job without retrying.
+After the API recovers, a later authorized event can resume observation. The
+last published check may remain unchanged when GitHub refuses writes; inspect
+the failed observer job rather than treating old check evidence as a new pass.
+
 ## Development
 
 `tools/codex_review_gate.py` is the canonical implementation. The generator embeds

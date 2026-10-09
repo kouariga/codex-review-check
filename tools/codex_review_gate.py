@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Observe Codex's review lifecycle; never start a review or execute PR code."""
+import copy
 import hashlib
 import json
 import os
 import re
 import time
 import urllib.request
+import urllib.error
 
 BOT_ID = 199175422
 CODEX_APP_ID = 1144995
@@ -17,8 +19,8 @@ MARKER = "<!-- codex-pull-request-review-summary -->"
 
 
 def bot(value):
-    return (value.get("user", {}).get("id") == BOT_ID
-            and value.get("user", {}).get("type") == "Bot")
+    return ((value.get("user") or {}).get("id") == BOT_ID
+            and (value.get("user") or {}).get("type") == "Bot")
 
 
 def trusted(value):
@@ -70,11 +72,16 @@ def observe(state, snapshot, now):
     return "success", "Fresh Codex acceptance confirmed twice on the same head"
 
 
+class APIBlocked(RuntimeError):
+    """Stop this run on denied/rate-limited requests; never retry in a tight loop."""
+
+
 class GitHub:
     def __init__(self, token, repo):
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
             raise ValueError("Invalid repository")
         self.token, self.repo = token, repo
+        self.cache = {}
 
     def call(self, path, data=None, method=None):
         payload = None if data is None else json.dumps(data).encode()
@@ -83,8 +90,21 @@ class GitHub:
                                      headers={"Authorization": "Bearer " + self.token,
                                               "Accept": "application/vnd.github+json",
                                               "X-GitHub-Api-Version": "2022-11-28"})
-        with urllib.request.urlopen(req, timeout=20) as response:
-            return json.load(response)
+        cached = self.cache.get(path) if req.get_method() == "GET" else None
+        if cached:
+            req.add_header("If-None-Match", cached[0])
+        try:
+            with urllib.request.urlopen(req, timeout=20) as response:
+                value = json.load(response)
+                if req.get_method() == "GET" and response.headers.get("ETag"):
+                    self.cache[path] = (response.headers["ETag"], value)
+                return copy.deepcopy(value)
+        except urllib.error.HTTPError as error:
+            if error.code == 304 and cached:
+                return copy.deepcopy(cached[1])
+            if error.code in (403, 429):
+                raise APIBlocked("GitHub denied or rate-limited this run; no retries") from None
+            raise
 
     def repo_call(self, path, data=None, method=None):
         return self.call("repos/" + self.repo + "/" + path, data, method)
@@ -124,8 +144,7 @@ class GitHub:
             resolved = self.repo_call("commits/" + match[1])["sha"]
             completed = completed and resolved == head and "**Completed**" in cells[2]
         reactions = self.pages(f"issues/{number}/reactions")
-        reactions = [r for r in reactions if r["user"]["id"] == BOT_ID
-                     and r["user"]["type"] == "Bot"]
+        reactions = [r for r in reactions if bot(r)]
         inline = self.pages(f"pulls/{number}/comments")
         reviews = self.pages(f"pulls/{number}/reviews")
         findings = [c["id"] for c in inline if bot(c)
@@ -151,7 +170,12 @@ def publish(api, check_id, state, status, reason):
                           "text": json.dumps(state, sort_keys=True)}}
     if payload["status"] == "completed":
         payload["conclusion"] = "success" if status == "success" else "failure"
+    previous = getattr(api, "last_publish", {})
+    if previous.get(check_id) == payload:
+        return
     api.repo_call(f"check-runs/{check_id}", payload, "PATCH")
+    previous[check_id] = payload
+    api.last_publish = previous
 
 
 def run(api, number, clock=time.time, sleep=time.sleep):
@@ -185,6 +209,8 @@ def run(api, number, clock=time.time, sleep=time.sleep):
                 if status == "success":
                     return
                 state = initialize(snapshot, now)
+            except APIBlocked:
+                raise
             except Exception:
                 state["started"] = now
                 state["candidate"] = state["candidate_at"] = None
@@ -209,6 +235,8 @@ def run(api, number, clock=time.time, sleep=time.sleep):
             print(status + ": " + reason, flush=True)
             if status != "pending":
                 return
+        except APIBlocked:
+            raise
         except Exception as error:
             # Do not log response bodies, credentials, or untrusted PR content.
             state["candidate"] = state["candidate_at"] = None
