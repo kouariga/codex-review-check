@@ -33,6 +33,8 @@ Every 30 seconds, for at most 20 minutes, observe trusted Codex metadata:
 - Summary author bot ID `199175422`, GitHub App ID `1144995`.
 - All observed review rows completed and their commit IDs resolved to the
   current full head SHA; no current-head findings.
+- The same target branch and base revision throughout observation. Retargeting
+  or base advancement invalidates persisted acceptance on the next observation.
 - A thumbs-up reaction ID absent from the initial baseline and no active eyes.
 - Eyes observed during this lifecycle, or a changed summary if eyes was missed.
 - The same clean evidence on two observations at least 30 seconds apart.
@@ -44,11 +46,14 @@ failed, or unavailable evidence does not pass; no automatic review retry is sent
 Resolving a current-head finding does not erase it from this conservative gate.
 A new head and fresh review is the normal correction path.
 
-State lives in the owned check output. Per-PR Actions concurrency serializes
-runs; restart resumes the baseline and deadline instead of creating another
+State lives in the owned check output. Per-PR job concurrency, after trusted-event filtering, serializes
+observations; ordinary comments do not enter that queue. A restart resumes the baseline and deadline instead of creating another
 check. GitHub may coalesce pending runs; the observer reads the latest live head.
 Same-head review restarts invalidate previous success when running evidence is
-observed. A head change during evidence collection is rejected. A change after
+observed. A head or base change during evidence collection is rejected. The caller
+subscribes to `edited` to observe retargeting. Base-branch pushes alone may not
+produce a caller event, so base advancement is detected on the next observation;
+this adapter cannot attest an unobserved base update. A change after
 the last API read can briefly race check publication; the check is still bound
 to the captured SHA and subsequent events re-evaluate evidence.
 

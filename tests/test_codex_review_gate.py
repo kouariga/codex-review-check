@@ -14,7 +14,7 @@ spec.loader.exec_module(gate)
 
 
 def sample(**changes):
-    result = dict(head="a" * 40, eyes=False, thumbs=["old"], summary="old-summary",
+    result = dict(head="a" * 40, base={"ref": "main", "sha": "d" * 40}, eyes=False, thumbs=["old"], summary="old-summary",
                   completed=False, findings=[], failed=False)
     return result | changes
 
@@ -41,6 +41,14 @@ class LifecycleTests(unittest.TestCase):
         state = gate.initialize(sample(), 0)
         for head in ("b" * 40, "c" * 40):
             self.assertEqual(gate.observe(state, sample(head=head, completed=True), 30)[0], "stale")
+
+    def test_retarget_or_base_revision_change_invalidates_acceptance(self):
+        clean = sample(thumbs=["new"], summary="complete", completed=True)
+        for base in ({"ref": "release", "sha": "d" * 40},
+                     {"ref": "main", "sha": "e" * 40}):
+            state = gate.initialize(sample(), 0)
+            gate.observe(state, clean, 30)
+            self.assertEqual(gate.observe(state, clean | {"base": base}, 60)[0], "stale")
 
     def test_restart_preserves_baseline_and_confirmation(self):
         state = gate.initialize(sample(), 0)
@@ -82,7 +90,7 @@ class SnapshotTests(unittest.TestCase):
     def api(self, *, rows=None, reactions=None, inline=None, error=False):
         api = gate.GitHub("never-used", "owner/repo")
         head = "a" * 40
-        pr = {"state": "open", "draft": False, "head": {"sha": head}, "base": {"ref": "main"}}
+        pr = {"state": "open", "draft": False, "head": {"sha": head}, "base": {"ref": "main", "sha": "d" * 40}}
         rows = rows or "| 📝 **Code Review** | ✅ **Completed** | `aaaaaaa` | New commits |"
         comment = {"id": 1, "body": gate.MARKER + "\n" + rows, "updated_at": "now",
                    "user": {"id": gate.BOT_ID, "type": "Bot"},
@@ -137,7 +145,7 @@ class FakeGitHub:
 
     def repo_call(self, path, data=None, method=None):
         if path.startswith("pulls/"):
-            return {"state": "open", "draft": False, "head": {"sha": "a" * 40}}
+            return {"state": "open", "draft": False, "head": {"sha": "a" * 40}, "base": sample()["base"]}
         self.writes.append(copy.deepcopy(data))
         if path == "check-runs":
             self.check = dict(data, id=1, app={"id": gate.ACTIONS_APP_ID}, conclusion=None)
@@ -238,6 +246,20 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(api.writes[0]["status"], "in_progress")
         self.assertEqual(api.check["conclusion"], "success")
 
+    def test_saved_success_for_different_base_requires_new_evidence(self):
+        old = sample(base={"ref": "release", "sha": "e" * 40})
+        state = gate.initialize(old, -60)
+        gate.observe(state, old | {"thumbs": ["new"], "summary": "complete", "completed": True}, -30)
+        saved = {"id": 1, "name": gate.CHECK, "head_sha": "a" * 40,
+                 "app": {"id": gate.ACTIONS_APP_ID}, "conclusion": "success",
+                 "external_id": "codex-gate-v1:owner/repo:1:" + "a" * 40,
+                 "output": {"text": json.dumps(state)}}
+        stale = sample(thumbs=["new"], summary="complete", completed=True)
+        api = FakeGitHub([stale], saved)
+        self.assertEqual(self.run_gate(api), gate.TIMEOUT)
+        self.assertEqual(api.writes[0]["status"], "in_progress")
+        self.assertEqual(api.check["conclusion"], "failure")
+
     def test_generated_workflow_matches_single_source_and_compiles(self):
         spec = importlib.util.spec_from_file_location("render", ROOT / "tools/render_codex_review_gate.py")
         module = importlib.util.module_from_spec(spec)
@@ -249,6 +271,9 @@ class RunnerTests(unittest.TestCase):
         compile(textwrap.dedent(embedded), "workflow observer", "exec")
         self.assertNotIn("actions/checkout", generated)
         self.assertNotIn("secrets.", generated)
+        self.assertNotIn("\nconcurrency:", generated)
+        self.assertIn("\n    concurrency:", generated)
+        self.assertIn("reopened, edited]", (ROOT / "examples/caller.yml").read_text())
         self.assertIn("workflow_call:", generated)
         self.assertNotIn("pull_request_target:", generated)
         self.assertIn("GITHUB_TOKEN: ${{ github.token }}", generated)

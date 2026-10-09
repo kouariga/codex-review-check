@@ -29,8 +29,12 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
+def base_identity(pr):
+    return {"ref": pr["base"]["ref"], "sha": pr["base"]["sha"]}
+
+
 def initialize(snapshot, now):
-    return {"version": 1, "head": snapshot["head"], "started": now,
+    return {"version": 1, "head": snapshot["head"], "base": snapshot["base"], "started": now,
             "baseline": snapshot["thumbs"], "baseline_summary": snapshot["summary"],
             "eyes": snapshot["eyes"], "candidate": None, "candidate_at": None}
 
@@ -39,6 +43,8 @@ def observe(state, snapshot, now):
     """Return (status, reason), mutating only this head's persisted observation."""
     if snapshot["head"] != state["head"]:
         return "stale", "PR head changed; this observation cannot pass the new head"
+    if snapshot["base"] != state["base"]:
+        return "stale", "PR base changed; previous evidence cannot approve this diff"
     if now - state["started"] >= TIMEOUT:
         return "failure", "Timed out without unambiguous current-head acceptance"
     state["eyes"] = state["eyes"] or snapshot["eyes"]
@@ -55,7 +61,7 @@ def observe(state, snapshot, now):
         if snapshot["failed"]:
             return "failure", "Codex review failed; no automatic retry is requested"
         return "pending", reason
-    candidate = digest([snapshot["head"], snapshot["summary"], fresh])
+    candidate = digest([snapshot["head"], snapshot["base"], snapshot["summary"], fresh])
     if state["candidate"] != candidate:
         state["candidate"], state["candidate_at"] = candidate, now
         return "pending", "Clean evidence observed; confirming again after 30 seconds"
@@ -129,10 +135,10 @@ class GitHub:
                           or (r.get("body", "").strip() and r["state"] == "COMMENTED"
                               and "Didn't find any major issues" not in r["body"]))]
         after = self.repo_call(f"pulls/{number}")
-        if (after["head"]["sha"] != head or after["base"]["ref"] != pr["base"]["ref"]
+        if (after["head"]["sha"] != head or base_identity(after) != base_identity(pr)
                 or after["state"] != "open" or after["draft"]):
             raise ValueError("PR changed during evidence collection")
-        return {"head": head, "eyes": any(r["content"] == "eyes" for r in reactions),
+        return {"head": head, "base": base_identity(pr), "eyes": any(r["content"] == "eyes" for r in reactions),
                 "thumbs": sorted(str(r["id"]) for r in reactions if r["content"] == "+1"),
                 "summary": digest([summary.get("id"), body, summary.get("updated_at")]),
                 "completed": bool(completed), "findings": findings,
@@ -153,6 +159,7 @@ def run(api, number, clock=time.time, sleep=time.sleep):
     if pr["state"] != "open" or pr["draft"]:
         return
     head = pr["head"]["sha"]
+    base = base_identity(pr)
     external = f"codex-gate-v1:{api.repo}:{number}:{head}"
     owned = [c for c in api.pages(f"commits/{head}/check-runs?filter=all", "check_runs")
              if c["name"] == CHECK and c["app"]["id"] == ACTIONS_APP_ID
@@ -167,7 +174,10 @@ def run(api, number, clock=time.time, sleep=time.sleep):
             raise ValueError("Invalid saved observation")
         # A new same-head review is a new lifecycle; preserve success only while
         # its exact evidence still agrees. Failed attempts do not reset deadlines.
-        if check["conclusion"] == "success":
+        if state.get("base") != base:
+            state = {"version": 1, "head": head, "base": base,
+                     "started": now, "initialized": False}
+        elif check["conclusion"] == "success":
             try:
                 snapshot = api.snapshot(number)
                 renewed = dict(state, started=now, candidate_at=now - INTERVAL)
@@ -180,7 +190,7 @@ def run(api, number, clock=time.time, sleep=time.sleep):
                 state["candidate"] = state["candidate_at"] = None
         check_id = check["id"]
     else:
-        state = {"version": 1, "head": head, "started": now, "initialized": False}
+        state = {"version": 1, "head": head, "base": base, "started": now, "initialized": False}
         check = api.repo_call("check-runs", {"name": CHECK, "head_sha": head,
                               "external_id": external, "status": "in_progress",
                               "output": {"title": "Observing Codex review", "summary": "Report-only rollout",
@@ -189,8 +199,8 @@ def run(api, number, clock=time.time, sleep=time.sleep):
     while True:
         try:
             snapshot = api.snapshot(number)
-            if snapshot["head"] != head:
-                status, reason = "stale", "PR head changed; observation stopped"
+            if snapshot["head"] != head or snapshot["base"] != base:
+                status, reason = "stale", "PR head or base changed; observation stopped"
             else:
                 if state.get("initialized") is False:
                     state = initialize(snapshot, state["started"])
