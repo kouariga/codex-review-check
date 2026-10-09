@@ -1,6 +1,6 @@
 # Codex Review Check
 
-Observe an existing Codex Cloud review and publish `codex-cloud-review` on the
+Observe an existing automatic Codex Cloud review and publish `codex-cloud-review` on the
 exact PR head. The adapter never requests a review, changes application code,
 resolves discussions, or merges PRs. Initial deployment is report-only.
 
@@ -19,7 +19,13 @@ The caller uses this public reusable workflow with its own repository-scoped
 needed. Private callers do not publish their code into this repository.
 `checks: write` is repository-wide capability; the implementation limits writes
 to its observation check but token permissions cannot restrict a check name.
-Organization Actions policy must allow this reusable workflow.
+Organization Actions policy must allow this reusable workflow and its caller's
+`pull_request_target` event. Public callers need an applicable event policy that
+permits `pull_request_target`: GitHub's default public-repository policy begins
+enforcement on November 2, 2026. Private/internal callers are exempt from that
+default policy. Review [GitHub's event-policy guidance](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target#default-policy-for-pull_request_target)
+before installing; this adapter does not change security policies. The public
+reusable-workflow source itself only uses `workflow_call`, not this PR event.
 
 Compatible releases update the moving `v1` reference centrally. Callers need no
 update PRs for those releases. Event subscriptions, permissions, or breaking
@@ -49,9 +55,10 @@ attributed to their original reviewed commit, not a later re-anchored location.
 Trusted priority-badge findings posted as plain issue comments have no reliable
 reviewed SHA and block conservatively, including after a new push, until a
 maintainer resolves that ambiguous evidence. The adapter does not delete comments.
-For existing manually requested reviews, lifecycle reactions on
-`@codex review` / `@codex security review` comments are observed alongside root
-reactions; the adapter still never posts those requests.
+Manually requested reviews are outside this adapter's acceptance contract:
+comment reactions do not provide a reliable current-head binding. Only observed
+automatic trigger labels (`PR opened`, `New commits`, `Draft marked ready`) are
+accepted. Manual or unknown trigger labels block; no fallback request is posted.
 
 State lives in the owned check output. Per-PR job concurrency, after trusted-event filtering, serializes
 observations; ordinary comments do not enter that queue. A restart resumes the baseline and deadline instead of creating another

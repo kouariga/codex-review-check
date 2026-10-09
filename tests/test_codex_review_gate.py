@@ -129,21 +129,14 @@ class SnapshotTests(unittest.TestCase):
         finding.update(commit_id="b" * 40, original_commit_id="a" * 40)
         self.assertEqual(self.api(inline=[finding]).snapshot(1)["findings"], [10])
 
-    def test_unreacted_later_request_cannot_mask_real_invocation(self):
-        api = self.api()
-        original = api.pages
-        def pages(path):
-            if path == "issues/1/comments":
-                return original(path) + [{"id": 2, "body": "@codex review"},
-                                         {"id": 3, "body": "@codex security review"}]
-            if path == "issues/comments/2/reactions":
-                return [{"id": 42, "content": "+1",
-                         "user": {"id": gate.BOT_ID, "type": "Bot"}}]
-            if path == "issues/comments/3/reactions":
-                return []
-            return original(path)
-        api.pages = pages
-        self.assertEqual(api.snapshot(1)["thumbs"], ["42"])
+    def test_manual_and_unknown_review_triggers_are_not_accepted(self):
+        for trigger in ("Manual request", "Unknown trigger"):
+            rows = f"| 📝 **Code Review** | ✅ **Completed** | `aaaaaaa` | {trigger} |"
+            with self.assertRaises(ValueError):
+                self.api(rows=rows).snapshot(1)
+        for trigger in ("PR opened", "New commits", "Draft marked ready"):
+            rows = f"| 📝 **Code Review** | ✅ **Completed** | `aaaaaaa` | {trigger} |"
+            self.assertTrue(self.api(rows=rows).snapshot(1)["completed"])
 
     def test_unscoped_trusted_issue_finding_blocks_without_guessing_head(self):
         api = self.api()
