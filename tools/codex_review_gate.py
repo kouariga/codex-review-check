@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""Observe Codex's review lifecycle; never start a review or execute PR code."""
+import copy
+import hashlib
+import json
+import os
+import re
+import time
+import urllib.request
+import urllib.error
+
+BOT_ID = 199175422
+CODEX_APP_ID = 1144995
+ACTIONS_APP_ID = 15368
+CHECK = "codex-cloud-review"
+INTERVAL = 30
+TIMEOUT = 1200
+MARKER = "<!-- codex-pull-request-review-summary -->"
+
+
+def bot(value):
+    return ((value.get("user") or {}).get("id") == BOT_ID
+            and (value.get("user") or {}).get("type") == "Bot")
+
+
+def trusted(value):
+    return bot(value) and (value.get("performed_via_github_app") or {}).get("id") == CODEX_APP_ID
+
+
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def base_identity(pr):
+    return {"ref": pr["base"]["ref"], "sha": pr["base"]["sha"]}
+
+
+def initialize(snapshot, now):
+    return {"version": 1, "head": snapshot["head"], "base": snapshot["base"], "started": now,
+            "baseline": snapshot["thumbs"], "baseline_summary": snapshot["summary"],
+            "eyes": snapshot["eyes"], "candidate": None, "candidate_at": None}
+
+
+def observe(state, snapshot, now):
+    """Return (status, reason), mutating only this head's persisted observation."""
+    if snapshot["head"] != state["head"]:
+        return "stale", "PR head changed; this observation cannot pass the new head"
+    if snapshot["base"] != state["base"]:
+        return "stale", "PR base changed; previous evidence cannot approve this diff"
+    if now - state["started"] >= TIMEOUT:
+        return "failure", "Timed out without unambiguous current-head acceptance"
+    state["eyes"] = state["eyes"] or snapshot["eyes"]
+    fresh = sorted(set(snapshot["thumbs"]) - set(state["baseline"]))
+    changed_summary = snapshot["summary"] != state["baseline_summary"]
+    clean = (snapshot["completed"] and not snapshot["findings"]
+             and not snapshot["eyes"] and fresh
+             and (state["eyes"] or changed_summary))
+    if not clean or snapshot["failed"]:
+        state["candidate"] = state["candidate_at"] = None
+        reason = "Waiting for fresh trusted reaction and completed current-head review"
+        if snapshot["findings"]:
+            reason = "Current-head Codex findings remain; waiting for a clean review"
+        if snapshot["failed"]:
+            return "failure", "Codex review failed; no automatic retry is requested"
+        return "pending", reason
+    candidate = digest([snapshot["head"], snapshot["base"], snapshot["summary"], fresh])
+    if state["candidate"] != candidate:
+        state["candidate"], state["candidate_at"] = candidate, now
+        return "pending", "Clean evidence observed; confirming again after 30 seconds"
+    if now - state["candidate_at"] < INTERVAL:
+        return "pending", "Waiting for the second stable observation"
+    return "success", "Fresh Codex acceptance confirmed twice on the same head"
+
+
+class APIBlocked(RuntimeError):
+    """Stop this run on denied/rate-limited requests; never retry in a tight loop."""
+
+
+class GitHub:
+    def __init__(self, token, repo):
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+            raise ValueError("Invalid repository")
+        self.token, self.repo = token, repo
+        self.cache = {}
+
+    def call(self, path, data=None, method=None):
+        payload = None if data is None else json.dumps(data).encode()
+        req = urllib.request.Request("https://api.github.com/" + path, data=payload,
+                                     method=method or ("POST" if data is not None else "GET"),
+                                     headers={"Authorization": "Bearer " + self.token,
+                                              "Accept": "application/vnd.github+json",
+                                              "X-GitHub-Api-Version": "2022-11-28"})
+        cached = self.cache.get(path) if req.get_method() == "GET" else None
+        if cached:
+            req.add_header("If-None-Match", cached[0])
+        try:
+            with urllib.request.urlopen(req, timeout=20) as response:
+                value = json.load(response)
+                if req.get_method() == "GET" and response.headers.get("ETag"):
+                    self.cache[path] = (response.headers["ETag"], value)
+                return copy.deepcopy(value)
+        except urllib.error.HTTPError as error:
+            if error.code == 304 and cached:
+                return copy.deepcopy(cached[1])
+            if error.code in (403, 429):
+                raise APIBlocked("GitHub denied or rate-limited this run; no retries") from None
+            raise
+
+    def repo_call(self, path, data=None, method=None):
+        return self.call("repos/" + self.repo + "/" + path, data, method)
+
+    def pages(self, path, key=None):
+        result = []
+        for page in range(1, 101):
+            sep = "&" if "?" in path else "?"
+            values = self.repo_call(f"{path}{sep}per_page=100&page={page}")
+            values = values[key] if key else values
+            result.extend(values)
+            if len(values) < 100:
+                return result
+        raise ValueError("Pagination limit reached; evidence is incomplete")
+
+    def snapshot(self, number):
+        pr = self.repo_call(f"pulls/{number}")
+        head = pr["head"]["sha"]
+        if pr["state"] != "open" or pr["draft"]:
+            raise ValueError("PR must be open and ready")
+        comments = self.pages(f"issues/{number}/comments")
+        summaries = [c for c in comments if trusted(c) and c["body"].startswith(MARKER)]
+        if len(summaries) > 1:
+            raise ValueError("Multiple trusted summary comments; ambiguous evidence")
+        summary = summaries[0] if summaries else {}
+        body = summary.get("body", "")
+        rows = [line for line in body.splitlines()
+                if line.startswith("|") and not line.startswith("| Review |")
+                and not re.fullmatch(r"[| :\-]+", line)]
+        completed = any("**Code Review**" in row.split("|")[1] for row in rows)
+        for row in rows:
+            cells = row.split("|")
+            if (len(cells) != 6 or not cells[1].strip().endswith(
+                    ("**Code Review**", "**Security Review**"))):
+                raise ValueError("Unknown review summary format")
+            if cells[4].strip() not in ("PR opened", "New commits", "Draft marked ready"):
+                raise ValueError("Only recognized automatic review lifecycles are supported")
+            match = re.fullmatch(r"\s*`([0-9a-f]{7,40})`\s*", cells[3])
+            if not match:
+                raise ValueError("Missing reviewed commit")
+            resolved = self.repo_call("commits/" + match[1])["sha"]
+            completed = completed and resolved == head and "**Completed**" in cells[2]
+        reactions = self.pages(f"issues/{number}/reactions")
+        reactions = [r for r in reactions if bot(r)]
+        inline = self.pages(f"pulls/{number}/comments")
+        reviews = self.pages(f"pulls/{number}/reviews")
+        findings = [c["id"] for c in inline if bot(c)
+                    and (c.get("original_commit_id") or c.get("commit_id")) == head]
+        findings += [r["id"] for r in reviews if bot(r) and r.get("commit_id") == head
+                     and (r["state"] == "CHANGES_REQUESTED"
+                          or (r.get("body", "").strip() and r["state"] == "COMMENTED"
+                              and "Didn't find any major issues" not in r["body"]))]
+        # Plain finding comments have no authoritative reviewed SHA. Treat their
+        # known priority badges as ambiguous blockers rather than guessing a head.
+        findings += [c["id"] for c in comments if trusted(c)
+                     and not c["body"].startswith(MARKER)
+                     and re.search(r"\bP[0-3] Badge\b", c["body"])]
+        after = self.repo_call(f"pulls/{number}")
+        if (after["head"]["sha"] != head or base_identity(after) != base_identity(pr)
+                or after["state"] != "open" or after["draft"]):
+            raise ValueError("PR changed during evidence collection")
+        return {"head": head, "base": base_identity(pr), "eyes": any(r["content"] == "eyes" for r in reactions),
+                "thumbs": sorted(str(r["id"]) for r in reactions if r["content"] == "+1"),
+                "summary": digest([summary.get("id"), body, summary.get("updated_at")]),
+                "completed": bool(completed), "findings": findings,
+                "failed": any("**Failed**" in row for row in rows)}
+
+
+def publish(api, check_id, state, status, reason):
+    payload = {"status": "completed" if status in ("success", "failure", "stale") else "in_progress",
+               "output": {"title": reason, "summary": "Report-only rollout. Not a required check.",
+                          "text": json.dumps(state, sort_keys=True)}}
+    if payload["status"] == "completed":
+        payload["conclusion"] = "success" if status == "success" else "failure"
+    previous = getattr(api, "last_publish", {})
+    if previous.get(check_id) == payload:
+        return
+    api.repo_call(f"check-runs/{check_id}", payload, "PATCH")
+    previous[check_id] = payload
+    api.last_publish = previous
+
+
+def run(api, number, clock=time.time, sleep=time.sleep):
+    pr = api.repo_call(f"pulls/{number}")
+    if pr["state"] != "open" or pr["draft"]:
+        return
+    head = pr["head"]["sha"]
+    base = base_identity(pr)
+    external = f"codex-gate-v1:{api.repo}:{number}:{head}"
+    owned = [c for c in api.pages(f"commits/{head}/check-runs?filter=all", "check_runs")
+             if c["name"] == CHECK and c["app"]["id"] == ACTIONS_APP_ID
+             and c.get("external_id") == external]
+    if sum(c["conclusion"] is None for c in owned) > 1:
+        raise ValueError("Multiple active owned checks; refusing ambiguous state")
+    now = clock()
+    check_id = None
+    if owned:
+        check = max(owned, key=lambda c: c["id"])
+        state = json.loads(check["output"]["text"])
+        if state["version"] != 1 or state["head"] != head:
+            raise ValueError("Invalid saved observation")
+        # A new authorized invocation can recover a failed/expired attempt.
+        # Retain its original baseline, but require two fresh stable observations.
+        if check["conclusion"] == "failure" or (check["conclusion"] != "success"
+                and now - state["started"] >= TIMEOUT):
+            state["started"] = now
+            state["candidate"] = state["candidate_at"] = None
+        # Preserve success only while its exact evidence still agrees.
+        if state.get("base") != base:
+            state = {"version": 1, "head": head, "base": base,
+                     "started": now, "initialized": False}
+        elif check["conclusion"] == "success":
+            try:
+                snapshot = api.snapshot(number)
+                renewed = dict(state, started=now, candidate_at=now - INTERVAL)
+                status, reason = observe(renewed, snapshot, now)
+                if status == "success":
+                    return
+                state = initialize(snapshot, now)
+            except APIBlocked:
+                raise
+            except Exception:
+                state["started"] = now
+                state["candidate"] = state["candidate_at"] = None
+        if check["conclusion"] is None:
+            check_id = check["id"]
+    else:
+        state = {"version": 1, "head": head, "base": base, "started": now, "initialized": False}
+    if check_id is None:
+        check = api.repo_call("check-runs", {"name": CHECK, "head_sha": head,
+                              "external_id": external, "status": "in_progress",
+                              "output": {"title": "Observing Codex review", "summary": "Report-only rollout",
+                                         "text": json.dumps(state)}})
+        check_id = check["id"]
+    while True:
+        try:
+            snapshot = api.snapshot(number)
+            if snapshot["head"] != head or snapshot["base"] != base:
+                status, reason = "stale", "PR head or base changed; observation stopped"
+            else:
+                if state.get("initialized") is False:
+                    state = initialize(snapshot, state["started"])
+                status, reason = observe(state, snapshot, clock())
+            publish(api, check_id, state, status, reason)
+            print(status + ": " + reason, flush=True)
+            if status != "pending":
+                return
+        except APIBlocked:
+            raise
+        except Exception as error:
+            # Do not log response bodies, credentials, or untrusted PR content.
+            state["candidate"] = state["candidate_at"] = None
+            reason = "Evidence unavailable: " + type(error).__name__
+            status = "failure" if clock() - state["started"] >= TIMEOUT else "pending"
+            publish(api, check_id, state, status, reason)
+            print(reason, flush=True)
+            if status == "failure":
+                return
+        sleep(INTERVAL)
+
+
+def main():
+    if os.environ["GITHUB_EVENT_NAME"] not in ("pull_request_target", "issue_comment", "workflow_dispatch"):
+        raise ValueError("Unsupported caller event")
+    api = GitHub(os.environ["GITHUB_TOKEN"], os.environ["GITHUB_REPOSITORY"])
+    with open(os.environ["GITHUB_EVENT_PATH"]) as event_file:
+        event = json.load(event_file)
+    number = int(event.get("pull_request", {}).get("number")
+                 or event.get("issue", {}).get("number")
+                 or event.get("inputs", {}).get("pr", 0))
+    if number <= 0:
+        raise ValueError("Missing PR number")
+    if os.environ["GITHUB_EVENT_NAME"] == "issue_comment":
+        if not event["issue"].get("pull_request") or not trusted(event["comment"]):
+            return
+    run(api, number)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,20 @@
+name: Observe Codex review
+on:
+  pull_request_target:
+    types: [opened, synchronize, ready_for_review, reopened, edited]
+  issue_comment:
+    types: [created, edited, deleted]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number to observe (does not request a review)
+        required: true
+        type: number
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  checks: write
+jobs:
+  review:
+    uses: kouariga/codex-review-check/.github/workflows/review.yml@v1
