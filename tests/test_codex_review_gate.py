@@ -110,6 +110,22 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue(snapshot["completed"])
         self.assertEqual(snapshot["thumbs"], ["5"])
 
+    def test_live_reaction_user_type_completes_fresh_lifecycle(self):
+        eyes = {"id": 4, "content": "eyes", "user": {"id": gate.BOT_ID, "type": "User"}}
+        thumb = {"id": 5, "content": "+1", "user": {"id": gate.BOT_ID, "type": "User"}}
+        running = self.api(rows="| 📝 **Code Review** | 🔄 **Running** | `aaaaaaa` | PR opened |",
+                           reactions=[eyes]).snapshot(1)
+        state = gate.initialize(running, 0)
+        complete = self.api(reactions=[thumb]).snapshot(1)
+        self.assertTrue(state["eyes"])
+        self.assertEqual(gate.observe(state, complete, 30)[0], "pending")
+        self.assertEqual(gate.observe(state, complete, 60)[0], "success")
+
+    def test_reaction_identity_rejects_same_name_with_another_id(self):
+        fake = {"id": 6, "content": "+1", "user": {
+            "id": 1, "type": "User", "login": "chatgpt-codex-connector[bot]"}}
+        self.assertEqual(self.api(reactions=[fake]).snapshot(1)["thumbs"], [])
+
     def test_short_sha_resolves_to_exact_head(self):
         api = self.api()
         original = api.repo_call
