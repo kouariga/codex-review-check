@@ -158,7 +158,7 @@ jobs:
                   inline = self.pages(f"pulls/{number}/comments")
                   reviews = self.pages(f"pulls/{number}/reviews")
                   findings = [c["id"] for c in inline if bot(c)
-                              and (c.get("commit_id") == head or c.get("original_commit_id") == head)]
+                              and (c.get("original_commit_id") or c.get("commit_id")) == head]
                   findings += [r["id"] for r in reviews if bot(r) and r.get("commit_id") == head
                                and (r["state"] == "CHANGES_REQUESTED"
                                     or (r.get("body", "").strip() and r["state"] == "COMMENTED"

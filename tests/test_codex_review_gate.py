@@ -121,6 +121,14 @@ class SnapshotTests(unittest.TestCase):
                    "user": {"id": gate.BOT_ID, "type": "Bot"}}
         self.assertEqual(self.api(inline=[finding]).snapshot(1)["findings"], [10])
 
+    def test_reanchored_old_finding_does_not_block_new_head(self):
+        finding = {"id": 10, "commit_id": "a" * 40,
+                   "original_commit_id": "b" * 40,
+                   "user": {"id": gate.BOT_ID, "type": "Bot"}}
+        self.assertEqual(self.api(inline=[finding]).snapshot(1)["findings"], [])
+        finding.update(commit_id="b" * 40, original_commit_id="a" * 40)
+        self.assertEqual(self.api(inline=[finding]).snapshot(1)["findings"], [10])
+
     def test_api_failure_cannot_become_empty_clean_snapshot(self):
         with self.assertRaises(OSError):
             self.api(error=True).snapshot(1)
