@@ -129,6 +129,33 @@ class SnapshotTests(unittest.TestCase):
         finding.update(commit_id="b" * 40, original_commit_id="a" * 40)
         self.assertEqual(self.api(inline=[finding]).snapshot(1)["findings"], [10])
 
+    def test_latest_manual_request_comment_reactions_are_observed(self):
+        api = self.api()
+        original = api.pages
+        def pages(path):
+            if path == "issues/1/comments":
+                return original(path) + [{"id": 2, "body": "@codex review"},
+                                         {"id": 3, "body": "@codex security review"}]
+            if path == "issues/comments/3/reactions":
+                return [{"id": 42, "content": "+1",
+                         "user": {"id": gate.BOT_ID, "type": "Bot"}}]
+            if path == "issues/comments/2/reactions":
+                self.fail("obsolete invocation must not be polled")
+            return original(path)
+        api.pages = pages
+        self.assertEqual(api.snapshot(1)["thumbs"], ["42"])
+
+    def test_unscoped_trusted_issue_finding_blocks_without_guessing_head(self):
+        api = self.api()
+        original = api.pages
+        finding = {"id": 99, "body": "**![P1 Badge](url)** Finding",
+                   "user": {"id": gate.BOT_ID, "type": "Bot"},
+                   "performed_via_github_app": {"id": gate.CODEX_APP_ID}}
+        api.pages = lambda path: original(path) + [finding] if path == "issues/1/comments" else original(path)
+        self.assertEqual(api.snapshot(1)["findings"], [99])
+        finding["user"]["id"] = 123
+        self.assertEqual(api.snapshot(1)["findings"], [])
+
     def test_null_historical_authors_are_ignored(self):
         self.assertFalse(gate.bot({"user": None}))
         api = self.api(inline=[{"id": 1, "user": None}],
@@ -327,7 +354,8 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("workflow_call:", generated)
         self.assertNotIn("pull_request_target:", generated)
         self.assertIn("GITHUB_TOKEN: ${{ github.token }}", generated)
-        self.assertIn("github.event.inputs.pr", generated)
+        self.assertIn("fromJSON(github.event.inputs.pr || '0')", generated)
+        self.assertIn("type: number", (ROOT / "examples/caller.yml").read_text())
 
 
 if __name__ == "__main__":

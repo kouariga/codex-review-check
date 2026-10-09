@@ -44,7 +44,14 @@ An already-finished review first seen after completion cannot be retroactively
 accepted. Rebase/force-push/new head starts separate state. Missing, ambiguous,
 failed, or unavailable evidence does not pass; no automatic review retry is sent.
 Resolving a current-head finding does not erase it from this conservative gate.
-A new head and fresh review is the normal correction path.
+A new head and fresh review is the normal correction path. Inline findings are
+attributed to their original reviewed commit, not a later re-anchored location.
+Trusted priority-badge findings posted as plain issue comments have no reliable
+reviewed SHA and block conservatively, including after a new push, until a
+maintainer resolves that ambiguous evidence. The adapter does not delete comments.
+For existing manually requested reviews, lifecycle reactions on the latest
+`@codex review` / `@codex security review` comment are observed alongside root
+reactions; the adapter still never posts those requests.
 
 State lives in the owned check output. Per-PR job concurrency, after trusted-event filtering, serializes
 observations; ordinary comments do not enter that queue. A restart resumes the baseline and deadline instead of creating another

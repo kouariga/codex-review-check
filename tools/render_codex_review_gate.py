@@ -22,7 +22,7 @@ jobs:
        github.event.comment.user.id == 199175422 &&
        github.event.comment.performed_via_github_app.id == 1144995)
     concurrency:
-      group: codex-review-check-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr }}
+      group: codex-review-check-${{ github.event.pull_request.number || github.event.issue.number || fromJSON(github.event.inputs.pr || '0') }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 25

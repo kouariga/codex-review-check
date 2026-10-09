@@ -144,6 +144,11 @@ class GitHub:
             resolved = self.repo_call("commits/" + match[1])["sha"]
             completed = completed and resolved == head and "**Completed**" in cells[2]
         reactions = self.pages(f"issues/{number}/reactions")
+        requests = [c for c in comments if re.match(
+            r"(?i)^@codex\s+(?:security\s+)?review\b", c.get("body", "").strip())]
+        if requests:
+            latest = max(requests, key=lambda c: c["id"])
+            reactions += self.pages(f"issues/comments/{latest['id']}/reactions")
         reactions = [r for r in reactions if bot(r)]
         inline = self.pages(f"pulls/{number}/comments")
         reviews = self.pages(f"pulls/{number}/reviews")
@@ -153,6 +158,11 @@ class GitHub:
                      and (r["state"] == "CHANGES_REQUESTED"
                           or (r.get("body", "").strip() and r["state"] == "COMMENTED"
                               and "Didn't find any major issues" not in r["body"]))]
+        # Plain finding comments have no authoritative reviewed SHA. Treat their
+        # known priority badges as ambiguous blockers rather than guessing a head.
+        findings += [c["id"] for c in comments if trusted(c)
+                     and not c["body"].startswith(MARKER)
+                     and re.search(r"\bP[0-3] Badge\b", c["body"])]
         after = self.repo_call(f"pulls/{number}")
         if (after["head"]["sha"] != head or base_identity(after) != base_identity(pr)
                 or after["state"] != "open" or after["draft"]):
