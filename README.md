@@ -61,8 +61,10 @@ automatic trigger labels (`PR opened`, `New commits`, `Draft marked ready`) are
 accepted. Manual or unknown trigger labels block; no fallback request is posted.
 
 State lives in the owned check output. Per-PR job concurrency, after trusted-event filtering, serializes
-observations; ordinary comments do not enter that queue. A restart resumes the baseline and deadline instead of creating another
-check. GitHub may coalesce pending runs; the observer reads the latest live head.
+observations; ordinary comments do not enter that queue. A restart resumes the baseline instead of creating another check. A new authorized
+invocation renews a failed/expired attempt's deadline and clears its candidate
+confirmation, while retaining the original reaction baseline. Each attempt is
+still bounded to 20 minutes and recovery requires two stable observations. GitHub may coalesce pending runs; the observer reads the latest live head.
 Same-head review restarts invalidate previous success when running evidence is
 observed. A head or base change during evidence collection is rejected. The caller
 subscribes to `edited` to observe retargeting. Base-branch pushes alone may not

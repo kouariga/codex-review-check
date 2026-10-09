@@ -337,6 +337,21 @@ class RunnerTests(unittest.TestCase):
             self.run_gate(api)
         self.assertEqual(len(api.writes), 1)  # pending creation only
 
+    def test_failed_or_expired_attempt_can_resume_without_duplicate_check(self):
+        for conclusion in ("failure", None):
+            for recovered in (True, False):
+                state = gate.initialize(sample(), -gate.TIMEOUT)
+                saved = {"id": 1, "name": gate.CHECK, "head_sha": "a" * 40,
+                         "app": {"id": gate.ACTIONS_APP_ID}, "conclusion": conclusion,
+                         "external_id": "codex-gate-v1:owner/repo:1:" + "a" * 40,
+                         "output": {"text": json.dumps(state)}}
+                evidence = sample(thumbs=["new"], summary="complete", completed=True) if recovered else sample()
+                api = FakeGitHub([evidence], saved)
+                self.assertEqual(self.run_gate(api), 30 if recovered else gate.TIMEOUT)
+                self.assertEqual(api.check["id"], 1)
+                self.assertEqual(api.check["conclusion"], "success" if recovered else "failure")
+                self.assertNotIn("name", api.writes[0])  # PATCH, never another create
+
     def test_generated_workflow_matches_single_source_and_compiles(self):
         spec = importlib.util.spec_from_file_location("render", ROOT / "tools/render_codex_review_gate.py")
         module = importlib.util.module_from_spec(spec)

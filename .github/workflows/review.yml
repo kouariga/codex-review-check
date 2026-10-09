@@ -234,8 +234,13 @@ jobs:
                   state = json.loads(check["output"]["text"])
                   if state["version"] != 1 or state["head"] != head:
                       raise ValueError("Invalid saved observation")
-                  # A new same-head review is a new lifecycle; preserve success only while
-                  # its exact evidence still agrees. Failed attempts do not reset deadlines.
+                  # A new authorized invocation can recover a failed/expired attempt.
+                  # Retain its original baseline, but require two fresh stable observations.
+                  if check["conclusion"] == "failure" or (check["conclusion"] != "success"
+                          and now - state["started"] >= TIMEOUT):
+                      state["started"] = now
+                      state["candidate"] = state["candidate_at"] = None
+                  # Preserve success only while its exact evidence still agrees.
                   if state.get("base") != base:
                       state = {"version": 1, "head": head, "base": base,
                                "started": now, "initialized": False}
