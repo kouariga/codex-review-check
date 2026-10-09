@@ -36,7 +36,8 @@ used instead when per-repository adoption control is preferred.
 
 Every 30 seconds, for at most 20 minutes, observe trusted Codex metadata:
 
-- Summary author bot ID `199175422`, GitHub App ID `1144995`.
+- Summary author ID `199175422`, GitHub App ID `1144995`. Reactions use the
+  same immutable author ID; GitHub can report their `user.type` as `User`.
 - All observed review rows completed and their commit IDs resolved to the
   current full head SHA; no current-head findings.
 - The same target branch and base revision throughout observation. Retargeting

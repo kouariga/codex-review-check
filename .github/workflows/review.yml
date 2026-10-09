@@ -48,8 +48,8 @@ jobs:
 
 
           def bot(value):
-              return ((value.get("user") or {}).get("id") == BOT_ID
-                      and (value.get("user") or {}).get("type") == "Bot")
+              # Reactions can report type="User" for the same immutable Codex bot ID.
+              return (value.get("user") or {}).get("id") == BOT_ID
 
 
           def trusted(value):
