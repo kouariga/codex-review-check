@@ -132,11 +132,13 @@ class GitHub:
         summary = summaries[0] if summaries else {}
         body = summary.get("body", "")
         rows = [line for line in body.splitlines()
-                if line.startswith("|") and "**" in line and "Review**" in line]
+                if line.startswith("|") and not line.startswith("| Review |")
+                and not re.fullmatch(r"[| :\-]+", line)]
         completed = bool(rows)
         for row in rows:
             cells = row.split("|")
-            if len(cells) != 6:
+            if (len(cells) != 6 or not cells[1].strip().endswith(
+                    ("**Code Review**", "**Security Review**"))):
                 raise ValueError("Unknown review summary format")
             match = re.fullmatch(r"\s*`([0-9a-f]{7,40})`\s*", cells[3])
             if not match:
@@ -146,9 +148,8 @@ class GitHub:
         reactions = self.pages(f"issues/{number}/reactions")
         requests = [c for c in comments if re.match(
             r"(?i)^@codex\s+(?:security\s+)?review\b", c.get("body", "").strip())]
-        if requests:
-            latest = max(requests, key=lambda c: c["id"])
-            reactions += self.pages(f"issues/comments/{latest['id']}/reactions")
+        for request in requests:
+            reactions += self.pages(f"issues/comments/{request['id']}/reactions")
         reactions = [r for r in reactions if bot(r)]
         inline = self.pages(f"pulls/{number}/comments")
         reviews = self.pages(f"pulls/{number}/reviews")

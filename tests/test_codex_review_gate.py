@@ -129,18 +129,18 @@ class SnapshotTests(unittest.TestCase):
         finding.update(commit_id="b" * 40, original_commit_id="a" * 40)
         self.assertEqual(self.api(inline=[finding]).snapshot(1)["findings"], [10])
 
-    def test_latest_manual_request_comment_reactions_are_observed(self):
+    def test_unreacted_later_request_cannot_mask_real_invocation(self):
         api = self.api()
         original = api.pages
         def pages(path):
             if path == "issues/1/comments":
                 return original(path) + [{"id": 2, "body": "@codex review"},
                                          {"id": 3, "body": "@codex security review"}]
-            if path == "issues/comments/3/reactions":
+            if path == "issues/comments/2/reactions":
                 return [{"id": 42, "content": "+1",
                          "user": {"id": gate.BOT_ID, "type": "Bot"}}]
-            if path == "issues/comments/2/reactions":
-                self.fail("obsolete invocation must not be polled")
+            if path == "issues/comments/3/reactions":
+                return []
             return original(path)
         api.pages = pages
         self.assertEqual(api.snapshot(1)["thumbs"], ["42"])
@@ -166,6 +166,13 @@ class SnapshotTests(unittest.TestCase):
     def test_api_failure_cannot_become_empty_clean_snapshot(self):
         with self.assertRaises(OSError):
             self.api(error=True).snapshot(1)
+
+    def test_unknown_review_row_cannot_hide_running_or_failed_review(self):
+        for label in ("New Audit", "Code Review", "**Other Review**"):
+            rows = ("| 📝 **Code Review** | ✅ **Completed** | `aaaaaaa` | New commits |\n"
+                    f"| {label} | **Running** | `aaaaaaa` | New commits |")
+            with self.assertRaises(ValueError):
+                self.api(rows=rows).snapshot(1)
 
     def test_all_review_rows_must_complete(self):
         rows = ("| 📝 **Code Review** | ✅ **Completed** | `aaaaaaa` | New commits |\n"

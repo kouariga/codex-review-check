@@ -49,8 +49,8 @@ attributed to their original reviewed commit, not a later re-anchored location.
 Trusted priority-badge findings posted as plain issue comments have no reliable
 reviewed SHA and block conservatively, including after a new push, until a
 maintainer resolves that ambiguous evidence. The adapter does not delete comments.
-For existing manually requested reviews, lifecycle reactions on the latest
-`@codex review` / `@codex security review` comment are observed alongside root
+For existing manually requested reviews, lifecycle reactions on
+`@codex review` / `@codex security review` comments are observed alongside root
 reactions; the adapter still never posts those requests.
 
 State lives in the owned check output. Per-PR job concurrency, after trusted-event filtering, serializes
