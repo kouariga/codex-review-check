@@ -60,10 +60,13 @@ comment reactions do not provide a reliable current-head binding. Only observed
 automatic trigger labels (`PR opened`, `New commits`, `Draft marked ready`) are
 accepted. Manual or unknown trigger labels block; no fallback request is posted.
 
-State lives in the owned check output. Per-PR job concurrency, after trusted-event filtering, serializes
-observations; ordinary comments do not enter that queue. A restart resumes the baseline instead of creating another check. A new authorized
-invocation renews a failed/expired attempt's deadline and clears its candidate
-confirmation, while retaining the original reaction baseline. Each attempt is
+State lives in the latest owned check output. Code Review must be present;
+Security Review alone cannot approve the check. Per-PR job concurrency, after trusted-event filtering, serializes
+observations; ordinary comments do not enter that queue. A restart resumes an incomplete run. A new authorized invocation creates a new
+run when renewing a completed lifecycle, preserving the original reaction baseline
+and clearing candidate confirmation. Completed runs remain history; only the
+latest owned run supplies resumable state. Multiple active runs block as ambiguous.
+Failed or expired attempts get a renewed deadline. Each attempt is
 still bounded to 20 minutes and recovery requires two stable observations. GitHub may coalesce pending runs; the observer reads the latest live head.
 Same-head review restarts invalidate previous success when running evidence is
 observed. A head or base change during evidence collection is rejected. The caller

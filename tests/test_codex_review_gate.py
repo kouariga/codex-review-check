@@ -167,6 +167,10 @@ class SnapshotTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.api(rows=rows).snapshot(1)
 
+    def test_security_only_summary_cannot_approve_code_review(self):
+        rows = "| **Security Review** | **Completed** | `aaaaaaa` | New commits |"
+        self.assertFalse(self.api(rows=rows).snapshot(1)["completed"])
+
     def test_all_review_rows_must_complete(self):
         rows = ("| 📝 **Code Review** | ✅ **Completed** | `aaaaaaa` | New commits |\n"
                 "| **Security Review** | **Running** | `aaaaaaa` | New commits |")
@@ -214,7 +218,7 @@ class FakeGitHub:
             return {"state": "open", "draft": False, "head": {"sha": "a" * 40}, "base": sample()["base"]}
         self.writes.append(copy.deepcopy(data))
         if path == "check-runs":
-            self.check = dict(data, id=1, app={"id": gate.ACTIONS_APP_ID}, conclusion=None)
+            self.check = dict(data, id=(self.check["id"] + 1 if self.check else 1), app={"id": gate.ACTIONS_APP_ID}, conclusion=None)
         else:
             self.check.update(data)
         return copy.deepcopy(self.check)
@@ -337,7 +341,7 @@ class RunnerTests(unittest.TestCase):
             self.run_gate(api)
         self.assertEqual(len(api.writes), 1)  # pending creation only
 
-    def test_failed_or_expired_attempt_can_resume_without_duplicate_check(self):
+    def test_failed_attempt_gets_new_run_but_incomplete_attempt_resumes(self):
         for conclusion in ("failure", None):
             for recovered in (True, False):
                 state = gate.initialize(sample(), -gate.TIMEOUT)
@@ -348,9 +352,28 @@ class RunnerTests(unittest.TestCase):
                 evidence = sample(thumbs=["new"], summary="complete", completed=True) if recovered else sample()
                 api = FakeGitHub([evidence], saved)
                 self.assertEqual(self.run_gate(api), 30 if recovered else gate.TIMEOUT)
-                self.assertEqual(api.check["id"], 1)
+                self.assertEqual(api.check["id"], 2 if conclusion else 1)
                 self.assertEqual(api.check["conclusion"], "success" if recovered else "failure")
-                self.assertNotIn("name", api.writes[0])  # PATCH, never another create
+                self.assertEqual("name" in api.writes[0], conclusion == "failure")
+
+    def test_terminal_history_uses_latest_run_and_multiple_active_runs_block(self):
+        state = gate.initialize(sample(), -gate.TIMEOUT)
+        old = {"id": 1, "name": gate.CHECK, "head_sha": "a" * 40,
+               "app": {"id": gate.ACTIONS_APP_ID}, "conclusion": "failure",
+               "external_id": "codex-gate-v1:owner/repo:1:" + "a" * 40,
+               "output": {"text": json.dumps(state)}}
+        latest = old | {"id": 2}
+        clean = sample(thumbs=["new"], summary="complete", completed=True)
+        api = FakeGitHub([clean], latest)
+        api.pages = lambda path, key: [latest, old]
+        self.assertEqual(self.run_gate(api), 30)
+        self.assertEqual(api.check["id"], 3)
+        self.assertEqual(api.check["conclusion"], "success")
+        api = FakeGitHub([clean])
+        api.pages = lambda path, key: [old | {"conclusion": None}, latest | {"conclusion": None}]
+        with self.assertRaises(ValueError):
+            self.run_gate(api)
+        self.assertEqual(api.writes, [])
 
     def test_generated_workflow_matches_single_source_and_compiles(self):
         spec = importlib.util.spec_from_file_location("render", ROOT / "tools/render_codex_review_gate.py")

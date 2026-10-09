@@ -134,7 +134,7 @@ class GitHub:
         rows = [line for line in body.splitlines()
                 if line.startswith("|") and not line.startswith("| Review |")
                 and not re.fullmatch(r"[| :\-]+", line)]
-        completed = bool(rows)
+        completed = any("**Code Review**" in row.split("|")[1] for row in rows)
         for row in rows:
             cells = row.split("|")
             if (len(cells) != 6 or not cells[1].strip().endswith(
@@ -197,11 +197,12 @@ def run(api, number, clock=time.time, sleep=time.sleep):
     owned = [c for c in api.pages(f"commits/{head}/check-runs?filter=all", "check_runs")
              if c["name"] == CHECK and c["app"]["id"] == ACTIONS_APP_ID
              and c.get("external_id") == external]
-    if len(owned) > 1:
-        raise ValueError("Multiple owned checks; refusing ambiguous state")
+    if sum(c["conclusion"] is None for c in owned) > 1:
+        raise ValueError("Multiple active owned checks; refusing ambiguous state")
     now = clock()
+    check_id = None
     if owned:
-        check = owned[0]
+        check = max(owned, key=lambda c: c["id"])
         state = json.loads(check["output"]["text"])
         if state["version"] != 1 or state["head"] != head:
             raise ValueError("Invalid saved observation")
@@ -228,9 +229,11 @@ def run(api, number, clock=time.time, sleep=time.sleep):
             except Exception:
                 state["started"] = now
                 state["candidate"] = state["candidate_at"] = None
-        check_id = check["id"]
+        if check["conclusion"] is None:
+            check_id = check["id"]
     else:
         state = {"version": 1, "head": head, "base": base, "started": now, "initialized": False}
+    if check_id is None:
         check = api.repo_call("check-runs", {"name": CHECK, "head_sha": head,
                               "external_id": external, "status": "in_progress",
                               "output": {"title": "Observing Codex review", "summary": "Report-only rollout",
