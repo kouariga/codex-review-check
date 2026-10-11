@@ -330,6 +330,40 @@ class ManualFixtureTests(unittest.TestCase):
         for now in (origin + 560, origin + 590):
             self.assertEqual(gate.observe(state, later, now)[0], "pending")
 
+    def test_automatic_restart_invalidates_old_manual_completion(self):
+        fixture = self.fixture()
+        complete = self.api(fixture).snapshot(1)
+        origin = fixture["state"]["started"]
+        for phase in ({"completed": False, "eyes": True},
+                      {"completed": False, "failed": True}):
+            with self.subTest(phase=phase):
+                state = gate.initialize(complete, origin + 300, observed_since=origin)
+                self.assertEqual(gate.observe(state, complete, origin + 300)[0], "pending")
+                restarted = complete | phase | {"manual": None, "summary": "automatic-restart"}
+                self.assertEqual(gate.observe(state, restarted, origin + 310)[0],
+                                 "failure" if phase.get("failed") else "pending")
+                later = copy.deepcopy(complete)
+                later["summary"] = "later-manual-completion"
+                later["manual"]["completed_at"] = origin + 350
+                later["manual"]["summary_updated"] = origin + 351
+                later["manual"]["thumbs"] = {"11": origin + 352}
+                later["thumbs"] = ["11"]
+                for now in (origin + 360, origin + 390):
+                    self.assertEqual(gate.observe(state, later, now)[0], "pending")
+                later["manual"]["comments"] = [later["manual"]["comments"][0] | {
+                    "id": 3, "created": origin + 348, "updated": origin + 348,
+                    "digest": "fresh-manual-completion"}]
+                self.assertEqual(gate.observe(state, later, origin + 400)[0], "pending")
+                self.assertEqual(gate.observe(state, later, origin + 430)[0], "success")
+                gate.observe(state, restarted, origin + 440)
+                later["summary"] = "another-manual-completion"
+                later["manual"]["completed_at"] = origin + 480
+                later["manual"]["summary_updated"] = origin + 481
+                later["manual"]["thumbs"] = {"12": origin + 482}
+                later["thumbs"] = ["12"]
+                for now in (origin + 490, origin + 520):
+                    self.assertEqual(gate.observe(state, later, now)[0], "pending")
+
     def test_completed_same_head_rerun_cannot_reuse_previous_comment(self):
         fixture = self.fixture()
         complete = self.api(fixture).snapshot(1)
@@ -369,6 +403,96 @@ class ManualFixtureTests(unittest.TestCase):
         restored = json.loads(api.check["output"]["text"])
         self.assertEqual(restored["observed_since"], origin)
         self.assertEqual(now[0], origin + 3630)
+
+
+    def retry_history(self):
+        fixture = self.fixture()
+        snapshot = self.api(fixture).snapshot(1)
+        origin = fixture["state"]["started"]
+        def record(identifier, started):
+            return {"id": identifier, "name": gate.CHECK,
+                    "head_sha": snapshot["head"], "app": {"id": gate.ACTIONS_APP_ID},
+                    "conclusion": "failure",
+                    "external_id": "codex-gate-v1:owner/repo:1:" + snapshot["head"],
+                    "output": {"text": json.dumps(fixture["state"] | {"started": started})}}
+        return snapshot, origin, [record(3, origin + 3600), record(2, origin + 1800), record(1, origin)]
+
+    def run_history(self, snapshot, origin, history):
+        api = FakeGitHub([snapshot], history[0])
+        api.pages = lambda path, key: copy.deepcopy(history)
+        now = [origin + 7200]
+        with contextlib.redirect_stdout(io.StringIO()):
+            gate.run(api, 1, lambda: now[0], lambda seconds: now.__setitem__(0, now[0] + seconds))
+        return api, now[0]
+
+    def test_legacy_failed_retry_chain_recovers_original_origin(self):
+        snapshot, origin, history = self.retry_history()
+        api, ended = self.run_history(snapshot, origin, history)
+        self.assertEqual(api.check["conclusion"], "success")
+        self.assertEqual(json.loads(api.check["output"]["text"])["observed_since"], origin)
+        self.assertEqual(ended, origin + 7230)
+
+    def test_recovery_rejects_reaction_at_exact_completion_second(self):
+        snapshot, origin, history = self.retry_history()
+        completed_at = snapshot["manual"]["completed_at"]
+        snapshot["manual"]["thumbs"] = dict.fromkeys(snapshot["thumbs"], completed_at)
+        api, _ = self.run_history(snapshot, origin, history)
+        self.assertEqual(api.check["conclusion"], "failure")
+        self.assertNotIn("success", [write.get("conclusion") for write in api.writes])
+
+    def test_retry_history_stops_at_invalid_predecessor(self):
+        for change in ("base", "head", "version", "initialized", "success", "malformed",
+                       "external", "started", "boolean_time", "nan_time", "duplicate_id",
+                       "observed_since", "null_state", "record_head", "missing_started"):
+            with self.subTest(change=change):
+                snapshot, origin, history = self.retry_history()
+                boundary = history[1]
+                state = json.loads(boundary["output"]["text"])
+                if change == "base": state["base"]["sha"] = "e" * 40
+                elif change == "head": state["head"] = "b" * 40
+                elif change == "version": state["version"] = 2
+                elif change == "initialized": state["initialized"] = True
+                elif change == "success": boundary["conclusion"] = "success"
+                elif change == "external": boundary["external_id"] += "other"
+                elif change == "started": state["started"] = origin + 4000
+                elif change == "boolean_time": state["started"] = False
+                elif change == "nan_time": state["started"] = float("nan")
+                elif change == "duplicate_id": boundary["id"] = history[0]["id"]
+                elif change == "observed_since": state["observed_since"] = origin
+                elif change == "record_head": boundary["head_sha"] = "b" * 40
+                elif change == "missing_started": del state["started"]
+                elif change == "null_state": state = None
+                boundary["output"]["text"] = "invalid" if change == "malformed" else json.dumps(state)
+                api, _ = self.run_history(snapshot, origin, history)
+                self.assertEqual(api.check["conclusion"], "failure")
+                self.assertNotIn("success", [write.get("conclusion") for write in api.writes])
+
+    def test_recovery_keeps_valid_prefix_without_crossing_boundary(self):
+        snapshot, origin, history = self.retry_history()
+        middle = json.loads(history[1]["output"]["text"])
+        middle["started"] = origin + 10
+        history[1]["output"]["text"] = json.dumps(middle)
+        history[2]["output"]["text"] = "invalid"
+        api, ended = self.run_history(snapshot, origin, history)
+        self.assertEqual(api.check["conclusion"], "success")
+        self.assertEqual(json.loads(api.check["output"]["text"])["observed_since"], origin + 10)
+        self.assertEqual(ended, origin + 7230)
+
+    def test_initialized_latest_record_cannot_recover_older_origin(self):
+        snapshot, origin, history = self.retry_history()
+        history[0]["output"]["text"] = json.dumps(gate.initialize(snapshot, origin + 3600))
+        api, _ = self.run_history(snapshot, origin, history)
+        self.assertEqual(api.check["conclusion"], "failure")
+        self.assertEqual(json.loads(api.check["output"]["text"])["observed_since"], origin + 3600)
+
+    def test_saved_origin_never_rewinds_using_legacy_history(self):
+        snapshot, origin, history = self.retry_history()
+        state = json.loads(history[0]["output"]["text"])
+        state["observed_since"] = origin + 3600
+        history[0]["output"]["text"] = json.dumps(state)
+        api, _ = self.run_history(snapshot, origin, history)
+        self.assertEqual(api.check["conclusion"], "failure")
+        self.assertEqual(json.loads(api.check["output"]["text"])["observed_since"], origin + 3600)
 
 
 class HTTPTests(unittest.TestCase):

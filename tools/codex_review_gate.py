@@ -4,6 +4,7 @@ import copy
 import datetime
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -66,14 +67,21 @@ def observe(state, snapshot, now):
     changed_summary = snapshot["summary"] != state["baseline_summary"]
     manual = snapshot.get("manual")
     manual_proof = None
+    if not snapshot["completed"] or snapshot["eyes"] or snapshot["failed"]:
+        active = digest([snapshot["summary"], snapshot["completed"],
+                         snapshot["eyes"], snapshot["failed"]])
+        if state.get("manual_active") != active:
+            state["manual_since"] = now
+            state["manual_active"] = active
+        state["manual_recovery"] = False
+        if manual is not None:
+            state["manual_baseline"] = [c["id"] for c in manual["comments"]]
+    elif "manual_active" in state:
+        del state["manual_active"]
     if manual is not None:
         if "manual_baseline" not in state:
             state["manual_baseline"] = [c["id"] for c in manual["comments"]]
             state["manual_recovery"] = False
-        if not snapshot["completed"] or snapshot["eyes"] or snapshot["failed"]:
-            state["manual_baseline"] = [c["id"] for c in manual["comments"]]
-            state["manual_recovery"] = False
-            state["manual_since"] = now
         origin = max(state.get("observed_since", state["started"]),
                      state.get("manual_since", state.get("observed_since", state["started"])))
         comments = [c for c in manual["comments"]
@@ -81,7 +89,7 @@ def observe(state, snapshot, now):
                     and origin < c["created"] <= c["updated"] <= manual["completed_at"]
                     <= manual["summary_updated"] <= now]
         eligible = sorted(r for r, created in manual["thumbs"].items()
-                          if origin < manual["completed_at"] <= created <= now
+                          if origin < manual["completed_at"] < created <= now
                           and (state.get("manual_recovery") or r in fresh))
         if len(comments) == 1 and eligible:
             manual_proof = [comments[0], {r: manual["thumbs"][r] for r in eligible},
@@ -252,6 +260,38 @@ def publish(api, check_id, state, status, reason):
     api.last_publish = previous
 
 
+def legacy_observation_origin(checks, latest, state, head, base, external, now):
+    origin = state["started"]
+    if "observed_since" in state or state.get("initialized") is not False:
+        return state.get("observed_since", origin)
+    previous_id = None
+    for check in sorted(checks, key=lambda row: row["id"], reverse=True):
+        try:
+            saved = json.loads(check["output"]["text"])
+            if not isinstance(saved, dict):
+                break
+            started = saved["started"]
+            identifier = check["id"]
+            if (type(identifier) is not int or identifier <= 0
+                    or (previous_id is not None and identifier >= previous_id)
+                    or check.get("external_id") != external
+                    or check.get("head_sha") != head
+                    or check.get("conclusion") != "failure"
+                    or type(saved.get("version")) is not int or saved["version"] != 1
+                    or saved.get("head") != head or saved.get("base") != base
+                    or saved.get("initialized") is not False or "observed_since" in saved
+                    or type(started) not in (int, float) or not math.isfinite(started)
+                    or not 0 <= started <= origin <= now):
+                break
+        except (KeyError, TypeError, ValueError):
+            break
+        if previous_id is None and identifier != latest["id"]:
+            break
+        origin = started
+        previous_id = identifier
+    return origin
+
+
 def run(api, number, clock=time.time, sleep=time.sleep):
     pr = api.repo_call(f"pulls/{number}")
     if pr["state"] != "open" or pr["draft"]:
@@ -259,9 +299,9 @@ def run(api, number, clock=time.time, sleep=time.sleep):
     head = pr["head"]["sha"]
     base = base_identity(pr)
     external = f"codex-gate-v1:{api.repo}:{number}:{head}"
-    owned = [c for c in api.pages(f"commits/{head}/check-runs?filter=all", "check_runs")
-             if c["name"] == CHECK and c["app"]["id"] == ACTIONS_APP_ID
-             and c.get("external_id") == external]
+    history = [c for c in api.pages(f"commits/{head}/check-runs?filter=all", "check_runs")
+               if c["name"] == CHECK and c["app"]["id"] == ACTIONS_APP_ID]
+    owned = [c for c in history if c.get("external_id") == external]
     if sum(c["conclusion"] is None for c in owned) > 1:
         raise ValueError("Multiple active owned checks; refusing ambiguous state")
     now = clock()
@@ -271,7 +311,8 @@ def run(api, number, clock=time.time, sleep=time.sleep):
         state = json.loads(check["output"]["text"])
         if state["version"] != 1 or state["head"] != head:
             raise ValueError("Invalid saved observation")
-        state.setdefault("observed_since", state["started"])
+        state["observed_since"] = legacy_observation_origin(
+            history, check, state, head, base, external, now)
         # A new authorized invocation can recover a failed/expired attempt.
         # Retain its original baseline, but require two fresh stable observations.
         if check["conclusion"] == "failure" or (check["conclusion"] != "success"

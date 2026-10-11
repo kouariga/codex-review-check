@@ -64,7 +64,8 @@ A reaction alone cannot approve a manual review. Unknown triggers block.
 
 Manual acceptance requires a new completion-comment ID and a fresh trusted
 thumbs-up. The completion comment must precede the summary completion time,
-which must precede the reaction. All evidence must follow the observation's
+which must strictly precede the reaction. Equal-second completion and reaction
+timestamps are ambiguous and cannot supply acceptance. All evidence must follow the observation's
 original start and must not have a future timestamp. Missing or malformed times,
 multiple eligible completion comments, findings, and head or base changes block.
 The observer confirms the same comment digest, summary, and reaction IDs and
@@ -72,10 +73,20 @@ timestamps twice, at least 30 seconds apart.
 
 An existing observation that could not initialize can recover a manual review
 completed after that observation started. Recovery preserves the original start
-when renewing the 20-minute deadline. It cannot accept a review completed before
-observation began. Observing a running or failed manual review ends recovery and
-records the current completion-comment IDs as its baseline. Subsequent manual
-evidence must also follow the latest observed running or failed state. Older initialized
+when renewing the 20-minute deadline. For legacy failed checks that lack a stored
+origin, recovery walks consecutive GitHub Actions observation records in descending
+check-ID order. Each record must be uninitialized, failed, and match the exact head,
+external ID, state version, and base identity. Start times must be finite, nonnegative,
+not in the future, and nonincreasing while walking backward. An initialized, successful,
+mismatched, malformed, or nonmonotonic record stops the walk. A stored origin is
+preserved and never replaced by historical starts. This recovers an original start
+lost by legacy retries without crossing another review lifecycle.
+It cannot accept a review completed before
+observation began. Observing any running or failed review ends recovery and
+records any available manual completion-comment IDs as its baseline. Subsequent manual
+evidence must follow the first observation of that active review state. A changed
+summary or status advances this boundary; identical active polls do not. Completion
+resets the active-state identity so a later restart advances the boundary again. Older initialized
 state without these IDs also records a baseline before accepting manual evidence.
 This prevents an earlier completion comment from approving an observed same-head
 restart. Unobserved overlapping same-head reviews cannot be fully distinguished
@@ -86,7 +97,8 @@ Security Review alone cannot approve the check. Per-PR job concurrency, after tr
 observations; ordinary comments do not enter that queue. A restart resumes an incomplete run. A new authorized invocation creates a new
 run when renewing a completed lifecycle, preserving the original reaction baseline
 and clearing candidate confirmation. Completed runs remain history; only the
-latest owned run supplies resumable state. Multiple active runs block as ambiguous.
+latest owned run supplies resumable state, except for the bounded legacy origin
+recovery described above. Multiple active runs block as ambiguous.
 Failed or expired attempts get a renewed deadline. Each attempt is
 still bounded to 20 minutes and recovery requires two stable observations. GitHub may coalesce pending runs; the observer reads the latest live head.
 Same-head review restarts invalidate previous success when running evidence is
