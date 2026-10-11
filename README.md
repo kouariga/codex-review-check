@@ -48,7 +48,7 @@ Every 30 seconds, for at most 20 minutes, observe trusted Codex metadata:
 
 Existing thumbs-up and old-head summaries never supply fresh acceptance.
 A new observation cannot retroactively accept an already-finished review.
-The bounded recovery of an earlier uninitialized observation is described below.
+The bounded recovery of an earlier legacy observation is described below.
 Rebase/force-push/new head starts separate state. Missing, ambiguous,
 failed, or unavailable evidence does not pass; no automatic review retry is sent.
 Resolving a current-head finding does not erase it from this conservative gate.
@@ -79,10 +79,26 @@ check-ID order. Each record must be uninitialized, failed, and match the exact h
 external ID, state version, and base identity. Start times must be finite, nonnegative,
 not in the future, and nonincreasing while walking backward. An initialized, successful,
 mismatched, malformed, or nonmonotonic record stops the walk. A stored origin is
-preserved and never replaced by historical starts. This recovers an original start
+preserved except for the narrowly verified migration described below. This recovers an original start
 lost by legacy retries without crossing another review lifecycle.
-It cannot accept a review completed before
-observation began. Observing any running or failed review ends recovery and
+An initialized legacy observation can also recover when every consecutive failed
+record has the exact original state shape: an empty reaction baseline, the digest
+of an absent summary, no observed eyes, and no candidate. Only the start time may
+change. Any lifecycle, identity, malformed-state, or ordering boundary stops recovery.
+This path preserves the empty reaction baseline and still requires a new reaction;
+it does not enable the uninitialized path's reaction-baseline exception.
+
+The first manual-evidence release could promote this virgin legacy state by storing
+the most recent retry time as its origin and the already-completed comment IDs as
+its manual baseline. Recovery recognizes only that exact mechanical promotion of
+its immediate legacy predecessor, with no extra fields, active lifecycle, or
+candidate. The current trusted manual comment IDs must match the promotion's
+baseline, and their update times and summary update time must precede the promotion.
+Only this verified migration can replace a stored origin and discard its
+migration-created manual baseline. Ordinary new observations and states that
+observed a review restart cannot rewind their origins.
+
+Recovery cannot accept a review completed before observation began. Observing any running or failed review ends recovery and
 records any available manual completion-comment IDs as its baseline. Subsequent manual
 evidence must follow the first observation of that active review state. A changed
 summary or status advances this boundary; identical active polls do not. Completion
