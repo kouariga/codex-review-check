@@ -1,6 +1,6 @@
 # Codex Review Check
 
-Observe an existing automatic Codex Cloud review and publish `codex-cloud-review` on the
+Observe an existing Codex Cloud review and publish `codex-cloud-review` on the
 exact PR head. The adapter never requests a review, changes application code,
 resolves discussions, or merges PRs. Initial deployment is report-only.
 
@@ -47,8 +47,9 @@ Every 30 seconds, for at most 20 minutes, observe trusted Codex metadata:
 - The same clean evidence on two observations at least 30 seconds apart.
 
 Existing thumbs-up and old-head summaries never supply fresh acceptance.
-An already-finished review first seen after completion cannot be retroactively
-accepted. Rebase/force-push/new head starts separate state. Missing, ambiguous,
+A new observation cannot retroactively accept an already-finished review.
+The bounded recovery of an earlier uninitialized observation is described below.
+Rebase/force-push/new head starts separate state. Missing, ambiguous,
 failed, or unavailable evidence does not pass; no automatic review retry is sent.
 Resolving a current-head finding does not erase it from this conservative gate.
 A new head and fresh review is the normal correction path. Inline findings are
@@ -56,10 +57,29 @@ attributed to their original reviewed commit, not a later re-anchored location.
 Trusted priority-badge findings posted as plain issue comments have no reliable
 reviewed SHA and block conservatively, including after a new push, until a
 maintainer resolves that ambiguous evidence. The adapter does not delete comments.
-Manually requested reviews are outside this adapter's acceptance contract:
-comment reactions do not provide a reliable current-head binding. Only observed
-automatic trigger labels (`PR opened`, `New commits`, `Draft marked ready`) are
-accepted. Manual or unknown trigger labels block; no fallback request is posted.
+Manual Code Review is accepted when the trusted summary and a trusted
+`Codex Review: Didn't find any major issues.` comment each resolve to the exact
+current head. The comment must contain exactly one explicit reviewed commit.
+A reaction alone cannot approve a manual review. Unknown triggers block.
+
+Manual acceptance requires a new completion-comment ID and a fresh trusted
+thumbs-up. The completion comment must precede the summary completion time,
+which must precede the reaction. All evidence must follow the observation's
+original start and must not have a future timestamp. Missing or malformed times,
+multiple eligible completion comments, findings, and head or base changes block.
+The observer confirms the same comment digest, summary, and reaction IDs and
+timestamps twice, at least 30 seconds apart.
+
+An existing observation that could not initialize can recover a manual review
+completed after that observation started. Recovery preserves the original start
+when renewing the 20-minute deadline. It cannot accept a review completed before
+observation began. Observing a running or failed manual review ends recovery and
+records the current completion-comment IDs as its baseline. Subsequent manual
+evidence must also follow the latest observed running or failed state. Older initialized
+state without these IDs also records a baseline before accepting manual evidence.
+This prevents an earlier completion comment from approving an observed same-head
+restart. Unobserved overlapping same-head reviews cannot be fully distinguished
+without an upstream lifecycle ID; multiple eligible comments fail closed.
 
 State lives in the latest owned check output. Code Review must be present;
 Security Review alone cannot approve the check. Per-PR job concurrency, after trusted-event filtering, serializes
