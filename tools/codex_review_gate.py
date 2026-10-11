@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Observe Codex's review lifecycle; never start a review or execute PR code."""
 import copy
+import datetime
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -35,10 +37,21 @@ def base_identity(pr):
     return {"ref": pr["base"]["ref"], "sha": pr["base"]["sha"]}
 
 
-def initialize(snapshot, now):
+def timestamp(value):
+    if not isinstance(value, str) or not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", value):
+        raise ValueError("Missing or malformed evidence timestamp")
+    return datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
+def initialize(snapshot, now, observed_since=None):
     return {"version": 1, "head": snapshot["head"], "base": snapshot["base"], "started": now,
             "baseline": snapshot["thumbs"], "baseline_summary": snapshot["summary"],
-            "eyes": snapshot["eyes"], "candidate": None, "candidate_at": None}
+            "eyes": snapshot["eyes"], "candidate": None, "candidate_at": None,
+            "observed_since": now if observed_since is None else observed_since,
+            "manual_baseline": [] if observed_since is not None else
+                [c["id"] for c in (snapshot.get("manual") or {}).get("comments", [])],
+            "manual_recovery": observed_since is not None}
 
 
 def observe(state, snapshot, now):
@@ -52,6 +65,37 @@ def observe(state, snapshot, now):
     state["eyes"] = state["eyes"] or snapshot["eyes"]
     fresh = sorted(set(snapshot["thumbs"]) - set(state["baseline"]))
     changed_summary = snapshot["summary"] != state["baseline_summary"]
+    manual = snapshot.get("manual")
+    manual_proof = None
+    if not snapshot["completed"] or snapshot["eyes"] or snapshot["failed"]:
+        active = digest([snapshot["summary"], snapshot["completed"],
+                         snapshot["eyes"], snapshot["failed"]])
+        if state.get("manual_active") != active:
+            state["manual_since"] = now
+            state["manual_active"] = active
+        state["manual_recovery"] = False
+        if manual is not None:
+            state["manual_baseline"] = [c["id"] for c in manual["comments"]]
+    elif "manual_active" in state:
+        del state["manual_active"]
+    if manual is not None:
+        if "manual_baseline" not in state:
+            state["manual_baseline"] = [c["id"] for c in manual["comments"]]
+            state["manual_recovery"] = False
+        origin = max(state.get("observed_since", state["started"]),
+                     state.get("manual_since", state.get("observed_since", state["started"])))
+        comments = [c for c in manual["comments"]
+                    if c["id"] not in state.get("manual_baseline", [])
+                    and origin < c["created"] <= c["updated"] <= manual["completed_at"]
+                    <= manual["summary_updated"] <= now]
+        eligible = sorted(r for r, created in manual["thumbs"].items()
+                          if origin < manual["completed_at"] < created <= now
+                          and (state.get("manual_recovery") or r in fresh))
+        if len(comments) == 1 and eligible:
+            manual_proof = [comments[0], {r: manual["thumbs"][r] for r in eligible},
+                            manual["completed_at"], manual["summary_updated"]]
+        fresh = eligible if manual_proof else []
+        changed_summary = bool(manual_proof)
     clean = (snapshot["completed"] and not snapshot["findings"]
              and not snapshot["eyes"] and fresh
              and (state["eyes"] or changed_summary))
@@ -63,7 +107,8 @@ def observe(state, snapshot, now):
         if snapshot["failed"]:
             return "failure", "Codex review failed; no automatic retry is requested"
         return "pending", reason
-    candidate = digest([snapshot["head"], snapshot["base"], snapshot["summary"], fresh])
+    evidence = [snapshot["head"], snapshot["base"], snapshot["summary"], fresh]
+    candidate = digest(evidence + [manual_proof] if manual is not None else evidence)
     if state["candidate"] != candidate:
         state["candidate"], state["candidate_at"] = candidate, now
         return "pending", "Clean evidence observed; confirming again after 30 seconds"
@@ -135,13 +180,18 @@ class GitHub:
                 if line.startswith("|") and not line.startswith("| Review |")
                 and not re.fullmatch(r"[| :\-]+", line)]
         completed = any("**Code Review**" in row.split("|")[1] for row in rows)
+        manual = False
+        completion_times = []
         for row in rows:
             cells = row.split("|")
             if (len(cells) != 6 or not cells[1].strip().endswith(
                     ("**Code Review**", "**Security Review**"))):
                 raise ValueError("Unknown review summary format")
-            if cells[4].strip() not in ("PR opened", "New commits", "Draft marked ready"):
-                raise ValueError("Only recognized automatic review lifecycles are supported")
+            if cells[4].strip() not in ("PR opened", "New commits", "Draft marked ready", "Manual request"):
+                raise ValueError("Unknown review trigger")
+            manual = manual or cells[4].strip() == "Manual request"
+            times = re.findall(r'<relative-time datetime="([^"<>]+)">', cells[2])
+            completion_times.append(timestamp(times[0]) if len(times) == 1 else None)
             match = re.fullmatch(r"\s*`([0-9a-f]{7,40})`\s*", cells[3])
             if not match:
                 raise ValueError("Missing reviewed commit")
@@ -162,6 +212,29 @@ class GitHub:
         findings += [c["id"] for c in comments if trusted(c)
                      and not c["body"].startswith(MARKER)
                      and re.search(r"\bP[0-3] Badge\b", c["body"])]
+        manual_evidence = None
+        if manual:
+            completions = []
+            for comment in comments:
+                if not trusted(comment) or not comment["body"].startswith(
+                        "Codex Review: Didn't find any major issues."):
+                    continue
+                commits = re.findall(r"^\*\*Reviewed commit:\*\* `([0-9a-f]{7,40})`$",
+                                     comment["body"], re.MULTILINE)
+                if len(commits) != 1 or comment["body"].count("**Reviewed commit:**") != 1:
+                    raise ValueError("Ambiguous manual reviewed commit")
+                if self.repo_call("commits/" + commits[0])["sha"] == head:
+                    completions.append({"id": comment["id"], "digest": digest(comment),
+                                        "created": timestamp(comment.get("created_at")),
+                                        "updated": timestamp(comment.get("updated_at"))})
+            if completed and any(value is None for value in completion_times):
+                raise ValueError("Missing manual completion timestamp")
+            manual_evidence = {"comments": completions,
+                               "completed_at": max(completion_times) if completed else 0,
+                               "summary_updated": timestamp(summary.get("updated_at")),
+                               "thumbs": {str(r["id"]): timestamp(r.get("created_at"))
+                                          for r in reactions if r["content"] == "+1"}}
+            completed = completed and bool(completions)
         after = self.repo_call(f"pulls/{number}")
         if (after["head"]["sha"] != head or base_identity(after) != base_identity(pr)
                 or after["state"] != "open" or after["draft"]):
@@ -170,7 +243,7 @@ class GitHub:
                 "thumbs": sorted(str(r["id"]) for r in reactions if r["content"] == "+1"),
                 "summary": digest([summary.get("id"), body, summary.get("updated_at")]),
                 "completed": bool(completed), "findings": findings,
-                "failed": any("**Failed**" in row for row in rows)}
+                "failed": any("**Failed**" in row for row in rows), "manual": manual_evidence}
 
 
 def publish(api, check_id, state, status, reason):
@@ -187,6 +260,38 @@ def publish(api, check_id, state, status, reason):
     api.last_publish = previous
 
 
+def legacy_observation_origin(checks, latest, state, head, base, external, now):
+    origin = state["started"]
+    if "observed_since" in state or state.get("initialized") is not False:
+        return state.get("observed_since", origin)
+    previous_id = None
+    for check in sorted(checks, key=lambda row: row["id"], reverse=True):
+        try:
+            saved = json.loads(check["output"]["text"])
+            if not isinstance(saved, dict):
+                break
+            started = saved["started"]
+            identifier = check["id"]
+            if (type(identifier) is not int or identifier <= 0
+                    or (previous_id is not None and identifier >= previous_id)
+                    or check.get("external_id") != external
+                    or check.get("head_sha") != head
+                    or check.get("conclusion") != "failure"
+                    or type(saved.get("version")) is not int or saved["version"] != 1
+                    or saved.get("head") != head or saved.get("base") != base
+                    or saved.get("initialized") is not False or "observed_since" in saved
+                    or type(started) not in (int, float) or not math.isfinite(started)
+                    or not 0 <= started <= origin <= now):
+                break
+        except (KeyError, TypeError, ValueError):
+            break
+        if previous_id is None and identifier != latest["id"]:
+            break
+        origin = started
+        previous_id = identifier
+    return origin
+
+
 def run(api, number, clock=time.time, sleep=time.sleep):
     pr = api.repo_call(f"pulls/{number}")
     if pr["state"] != "open" or pr["draft"]:
@@ -194,9 +299,9 @@ def run(api, number, clock=time.time, sleep=time.sleep):
     head = pr["head"]["sha"]
     base = base_identity(pr)
     external = f"codex-gate-v1:{api.repo}:{number}:{head}"
-    owned = [c for c in api.pages(f"commits/{head}/check-runs?filter=all", "check_runs")
-             if c["name"] == CHECK and c["app"]["id"] == ACTIONS_APP_ID
-             and c.get("external_id") == external]
+    history = [c for c in api.pages(f"commits/{head}/check-runs?filter=all", "check_runs")
+               if c["name"] == CHECK and c["app"]["id"] == ACTIONS_APP_ID]
+    owned = [c for c in history if c.get("external_id") == external]
     if sum(c["conclusion"] is None for c in owned) > 1:
         raise ValueError("Multiple active owned checks; refusing ambiguous state")
     now = clock()
@@ -206,6 +311,8 @@ def run(api, number, clock=time.time, sleep=time.sleep):
         state = json.loads(check["output"]["text"])
         if state["version"] != 1 or state["head"] != head:
             raise ValueError("Invalid saved observation")
+        state["observed_since"] = legacy_observation_origin(
+            history, check, state, head, base, external, now)
         # A new authorized invocation can recover a failed/expired attempt.
         # Retain its original baseline, but require two fresh stable observations.
         if check["conclusion"] == "failure" or (check["conclusion"] != "success"
@@ -246,7 +353,8 @@ def run(api, number, clock=time.time, sleep=time.sleep):
                 status, reason = "stale", "PR head or base changed; observation stopped"
             else:
                 if state.get("initialized") is False:
-                    state = initialize(snapshot, state["started"])
+                    state = initialize(snapshot, state["started"],
+                                       observed_since=state.get("observed_since", state["started"]))
                 status, reason = observe(state, snapshot, clock())
             publish(api, check_id, state, status, reason)
             print(status + ": " + reason, flush=True)

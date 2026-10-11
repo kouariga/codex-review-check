@@ -193,6 +193,308 @@ class SnapshotTests(unittest.TestCase):
         self.assertFalse(self.api(rows=rows).snapshot(1)["completed"])
 
 
+class ManualFixtureTests(unittest.TestCase):
+    def fixture(self, number=1):
+        return json.loads((ROOT / f"tests/fixtures/manual-{number}.json").read_text())
+
+    def api(self, fixture):
+        api = gate.GitHub("never-used", "owner/repo")
+        def call(path):
+            if path.startswith("pulls/"):
+                return copy.deepcopy(fixture["pr"])
+            short = path.removeprefix("commits/")
+            head = fixture["pr"]["head"]["sha"]
+            if not head.startswith(short):
+                raise ValueError("Unknown or ambiguous commit")
+            return {"sha": head}
+        api.repo_call = call
+        api.pages = lambda path: copy.deepcopy(
+            fixture["reactions"] if path.endswith("reactions") else
+            fixture["comments"] if path.startswith("issues/") else [])
+        return api
+
+    def test_manual_review_can_recover_original_observation(self):
+        for number in (1, 2):
+            fixture = self.fixture(number)
+            snapshot = self.api(fixture).snapshot(1)
+            self.assertTrue(snapshot["completed"])
+            origin = fixture["state"]["started"]
+            state = gate.initialize(snapshot, origin + 3600, observed_since=origin)
+            self.assertEqual(gate.observe(state, snapshot, origin + 3600)[0], "pending")
+            self.assertEqual(gate.observe(state, snapshot, origin + 3630)[0], "success")
+
+    def test_existing_completion_is_not_fresh_for_new_observer(self):
+        fixture = self.fixture()
+        snapshot = self.api(fixture).snapshot(1)
+        now = fixture["state"]["started"] + 3600
+        state = gate.initialize(snapshot, now)
+        self.assertEqual(gate.observe(state, snapshot, now + 30)[0], "pending")
+        self.assertEqual(gate.observe(state, snapshot, now + 60)[0], "pending")
+
+    def test_recovery_rejects_untrusted_wrong_stale_or_ambiguous_evidence(self):
+        def duplicate(f):
+            f["comments"].append(f["comments"][1] | {"id": 99})
+        changes = {
+            "author": lambda f: f["comments"][1].update(user={"id": 1}),
+            "app": lambda f: f["comments"][1].update(performed_via_github_app={"id": 1}),
+            "summary-author": lambda f: f["comments"][0].update(user={"id": 1}),
+            "reaction-author": lambda f: f["reactions"][0].update(user={"id": 1}),
+            "wrong-sha": lambda f: f["comments"][1].update(body=f["comments"][1]["body"].replace("a" * 10, "c" * 10)),
+            "ambiguous-sha": lambda f: f["comments"][1].update(body=f["comments"][1]["body"] + "\n**Reviewed commit:** `aaaaaaa`"),
+            "stale-comment": lambda f: f["comments"][1].update(created_at="2026-10-09T00:00:00Z"),
+            "stale-reaction": lambda f: f["reactions"][0].update(created_at="2026-10-09T00:00:00Z"),
+            "early-reaction": lambda f: f["reactions"][0].update(created_at=f["comments"][1]["created_at"]),
+            "malformed-time": lambda f: f["reactions"][0].update(created_at="yesterday"),
+            "missing-timezone": lambda f: f["comments"][1].update(created_at="2026-10-10T14:33:32"),
+            "future-summary": lambda f: f["comments"][0].update(updated_at="2099-01-01T00:00:00Z"),
+            "edited-after-completion": lambda f: f["comments"][1].update(updated_at="2026-10-10T14:34:00Z"),
+            "duplicate": duplicate,
+            "unknown-trigger": lambda f: f["comments"][0].update(body=f["comments"][0]["body"].replace("Manual request", "Unknown")),
+        }
+        for label, change in changes.items():
+            with self.subTest(label=label):
+                fixture = self.fixture()
+                change(fixture)
+                origin = fixture["state"]["started"]
+                try:
+                    snapshot = self.api(fixture).snapshot(1)
+                except ValueError:
+                    continue
+                state = gate.initialize(snapshot, origin + 3600, observed_since=origin)
+                for now in (origin + 3600, origin + 3630):
+                    self.assertNotEqual(gate.observe(state, snapshot, now)[0], "success")
+
+    def test_manual_findings_head_and_base_changes_block(self):
+        fixture = self.fixture()
+        snapshot = self.api(fixture).snapshot(1)
+        origin = fixture["state"]["started"]
+        for change in ({"findings": [1]}, {"head": "c" * 40},
+                       {"base": {"ref": "main", "sha": "e" * 40}}, {"failed": True}):
+            state = gate.initialize(snapshot, origin + 3600, observed_since=origin)
+            gate.observe(state, snapshot, origin + 3600)
+            self.assertNotEqual(gate.observe(state, snapshot | change, origin + 3630)[0], "success")
+
+    def test_reaction_or_comment_mutation_requires_new_confirmation(self):
+        fixture = self.fixture()
+        snapshot = self.api(fixture).snapshot(1)
+        origin = fixture["state"]["started"]
+        for field in ("reaction", "comment"):
+            state = gate.initialize(snapshot, origin + 3600, observed_since=origin)
+            gate.observe(state, snapshot, origin + 3600)
+            changed = copy.deepcopy(snapshot)
+            if field == "reaction":
+                changed["manual"]["thumbs"]["10"] += 1
+            else:
+                changed["manual"]["comments"][0]["digest"] = "edited"
+            self.assertEqual(gate.observe(state, changed, origin + 3630)[0], "pending")
+
+    def test_legacy_initialized_state_cannot_assume_empty_manual_baseline(self):
+        fixture = self.fixture()
+        snapshot = self.api(fixture).snapshot(1)
+        origin = fixture["state"]["started"]
+        state = gate.initialize(sample(head=snapshot["head"]), origin)
+        del state["manual_baseline"]
+        state["baseline"] = []
+        for now in (origin + 300, origin + 330):
+            self.assertEqual(gate.observe(state, snapshot, now)[0], "pending")
+
+    def test_manual_observed_running_accepts_only_new_completion(self):
+        fixture = self.fixture()
+        complete = self.api(fixture).snapshot(1)
+        origin = fixture["state"]["started"]
+        running = copy.deepcopy(complete)
+        running.update(completed=False, eyes=True)
+        running["manual"]["comments"] = []
+        running["thumbs"] = []
+        running["summary"] = "running"
+        state = gate.initialize(running, origin)
+        self.assertEqual(gate.observe(state, complete, origin + 300)[0], "pending")
+        self.assertEqual(gate.observe(state, complete, origin + 330)[0], "success")
+        gate.observe(state, complete | {"completed": False, "eyes": True}, origin + 360)
+        self.assertEqual(gate.observe(state, complete, origin + 390)[0], "pending")
+
+    def test_late_old_comment_after_running_cannot_approve_new_cycle(self):
+        fixture = self.fixture()
+        complete = self.api(fixture).snapshot(1)
+        origin = fixture["state"]["started"]
+        running = copy.deepcopy(complete)
+        running.update(completed=False, eyes=True)
+        running["manual"]["comments"] = []
+        state = gate.initialize(running, origin)
+        gate.observe(state, running, origin + 500)
+        later = copy.deepcopy(complete)
+        later["manual"]["completed_at"] = origin + 550
+        later["manual"]["summary_updated"] = origin + 551
+        later["manual"]["thumbs"] = {"11": origin + 552}
+        later["thumbs"] = ["11"]
+        for now in (origin + 560, origin + 590):
+            self.assertEqual(gate.observe(state, later, now)[0], "pending")
+
+    def test_automatic_restart_invalidates_old_manual_completion(self):
+        fixture = self.fixture()
+        complete = self.api(fixture).snapshot(1)
+        origin = fixture["state"]["started"]
+        for phase in ({"completed": False, "eyes": True},
+                      {"completed": False, "failed": True}):
+            with self.subTest(phase=phase):
+                state = gate.initialize(complete, origin + 300, observed_since=origin)
+                self.assertEqual(gate.observe(state, complete, origin + 300)[0], "pending")
+                restarted = complete | phase | {"manual": None, "summary": "automatic-restart"}
+                self.assertEqual(gate.observe(state, restarted, origin + 310)[0],
+                                 "failure" if phase.get("failed") else "pending")
+                later = copy.deepcopy(complete)
+                later["summary"] = "later-manual-completion"
+                later["manual"]["completed_at"] = origin + 350
+                later["manual"]["summary_updated"] = origin + 351
+                later["manual"]["thumbs"] = {"11": origin + 352}
+                later["thumbs"] = ["11"]
+                for now in (origin + 360, origin + 390):
+                    self.assertEqual(gate.observe(state, later, now)[0], "pending")
+                later["manual"]["comments"] = [later["manual"]["comments"][0] | {
+                    "id": 3, "created": origin + 348, "updated": origin + 348,
+                    "digest": "fresh-manual-completion"}]
+                self.assertEqual(gate.observe(state, later, origin + 400)[0], "pending")
+                self.assertEqual(gate.observe(state, later, origin + 430)[0], "success")
+                gate.observe(state, restarted, origin + 440)
+                later["summary"] = "another-manual-completion"
+                later["manual"]["completed_at"] = origin + 480
+                later["manual"]["summary_updated"] = origin + 481
+                later["manual"]["thumbs"] = {"12": origin + 482}
+                later["thumbs"] = ["12"]
+                for now in (origin + 490, origin + 520):
+                    self.assertEqual(gate.observe(state, later, now)[0], "pending")
+
+    def test_completed_same_head_rerun_cannot_reuse_previous_comment(self):
+        fixture = self.fixture()
+        complete = self.api(fixture).snapshot(1)
+        origin = fixture["state"]["started"]
+        state = gate.initialize(complete, origin + 300, observed_since=origin)
+        gate.observe(state, complete, origin + 300)
+        gate.observe(state, complete, origin + 330)
+        saved = {"id": 1, "name": gate.CHECK, "app": {"id": gate.ACTIONS_APP_ID},
+                 "conclusion": "success", "external_id": "codex-gate-v1:owner/repo:1:" + complete["head"],
+                 "output": {"text": json.dumps(state)}}
+        rerun = copy.deepcopy(complete)
+        rerun["summary"] = "new-completed-lifecycle"
+        rerun["thumbs"] = ["11"]
+        rerun["manual"]["completed_at"] += 120
+        rerun["manual"]["summary_updated"] += 120
+        rerun["manual"]["thumbs"] = {"11": complete["manual"]["thumbs"]["10"] + 120}
+        api = FakeGitHub([rerun], saved)
+        now = [origin + 600]
+        with contextlib.redirect_stdout(io.StringIO()):
+            gate.run(api, 1, lambda: now[0], lambda seconds: now.__setitem__(0, now[0] + seconds))
+        self.assertEqual(api.check["conclusion"], "failure")
+        self.assertNotIn("success", [write.get("conclusion") for write in api.writes])
+
+    def test_failed_uninitialized_observer_preserves_origin_on_retry(self):
+        fixture = self.fixture()
+        snapshot = self.api(fixture).snapshot(1)
+        origin = fixture["state"]["started"]
+        state = fixture["state"]
+        saved = {"id": 1, "name": gate.CHECK, "app": {"id": gate.ACTIONS_APP_ID},
+                 "conclusion": "failure", "external_id": "codex-gate-v1:owner/repo:1:" + snapshot["head"],
+                 "output": {"text": json.dumps(state)}}
+        api = FakeGitHub([snapshot], saved)
+        now = [origin + 3600]
+        with contextlib.redirect_stdout(io.StringIO()):
+            gate.run(api, 1, lambda: now[0], lambda seconds: now.__setitem__(0, now[0] + seconds))
+        self.assertEqual(api.check["conclusion"], "success")
+        restored = json.loads(api.check["output"]["text"])
+        self.assertEqual(restored["observed_since"], origin)
+        self.assertEqual(now[0], origin + 3630)
+
+
+    def retry_history(self):
+        fixture = self.fixture()
+        snapshot = self.api(fixture).snapshot(1)
+        origin = fixture["state"]["started"]
+        def record(identifier, started):
+            return {"id": identifier, "name": gate.CHECK,
+                    "head_sha": snapshot["head"], "app": {"id": gate.ACTIONS_APP_ID},
+                    "conclusion": "failure",
+                    "external_id": "codex-gate-v1:owner/repo:1:" + snapshot["head"],
+                    "output": {"text": json.dumps(fixture["state"] | {"started": started})}}
+        return snapshot, origin, [record(3, origin + 3600), record(2, origin + 1800), record(1, origin)]
+
+    def run_history(self, snapshot, origin, history):
+        api = FakeGitHub([snapshot], history[0])
+        api.pages = lambda path, key: copy.deepcopy(history)
+        now = [origin + 7200]
+        with contextlib.redirect_stdout(io.StringIO()):
+            gate.run(api, 1, lambda: now[0], lambda seconds: now.__setitem__(0, now[0] + seconds))
+        return api, now[0]
+
+    def test_legacy_failed_retry_chain_recovers_original_origin(self):
+        snapshot, origin, history = self.retry_history()
+        api, ended = self.run_history(snapshot, origin, history)
+        self.assertEqual(api.check["conclusion"], "success")
+        self.assertEqual(json.loads(api.check["output"]["text"])["observed_since"], origin)
+        self.assertEqual(ended, origin + 7230)
+
+    def test_recovery_rejects_reaction_at_exact_completion_second(self):
+        snapshot, origin, history = self.retry_history()
+        completed_at = snapshot["manual"]["completed_at"]
+        snapshot["manual"]["thumbs"] = dict.fromkeys(snapshot["thumbs"], completed_at)
+        api, _ = self.run_history(snapshot, origin, history)
+        self.assertEqual(api.check["conclusion"], "failure")
+        self.assertNotIn("success", [write.get("conclusion") for write in api.writes])
+
+    def test_retry_history_stops_at_invalid_predecessor(self):
+        for change in ("base", "head", "version", "initialized", "success", "malformed",
+                       "external", "started", "boolean_time", "nan_time", "duplicate_id",
+                       "observed_since", "null_state", "record_head", "missing_started"):
+            with self.subTest(change=change):
+                snapshot, origin, history = self.retry_history()
+                boundary = history[1]
+                state = json.loads(boundary["output"]["text"])
+                if change == "base": state["base"]["sha"] = "e" * 40
+                elif change == "head": state["head"] = "b" * 40
+                elif change == "version": state["version"] = 2
+                elif change == "initialized": state["initialized"] = True
+                elif change == "success": boundary["conclusion"] = "success"
+                elif change == "external": boundary["external_id"] += "other"
+                elif change == "started": state["started"] = origin + 4000
+                elif change == "boolean_time": state["started"] = False
+                elif change == "nan_time": state["started"] = float("nan")
+                elif change == "duplicate_id": boundary["id"] = history[0]["id"]
+                elif change == "observed_since": state["observed_since"] = origin
+                elif change == "record_head": boundary["head_sha"] = "b" * 40
+                elif change == "missing_started": del state["started"]
+                elif change == "null_state": state = None
+                boundary["output"]["text"] = "invalid" if change == "malformed" else json.dumps(state)
+                api, _ = self.run_history(snapshot, origin, history)
+                self.assertEqual(api.check["conclusion"], "failure")
+                self.assertNotIn("success", [write.get("conclusion") for write in api.writes])
+
+    def test_recovery_keeps_valid_prefix_without_crossing_boundary(self):
+        snapshot, origin, history = self.retry_history()
+        middle = json.loads(history[1]["output"]["text"])
+        middle["started"] = origin + 10
+        history[1]["output"]["text"] = json.dumps(middle)
+        history[2]["output"]["text"] = "invalid"
+        api, ended = self.run_history(snapshot, origin, history)
+        self.assertEqual(api.check["conclusion"], "success")
+        self.assertEqual(json.loads(api.check["output"]["text"])["observed_since"], origin + 10)
+        self.assertEqual(ended, origin + 7230)
+
+    def test_initialized_latest_record_cannot_recover_older_origin(self):
+        snapshot, origin, history = self.retry_history()
+        history[0]["output"]["text"] = json.dumps(gate.initialize(snapshot, origin + 3600))
+        api, _ = self.run_history(snapshot, origin, history)
+        self.assertEqual(api.check["conclusion"], "failure")
+        self.assertEqual(json.loads(api.check["output"]["text"])["observed_since"], origin + 3600)
+
+    def test_saved_origin_never_rewinds_using_legacy_history(self):
+        snapshot, origin, history = self.retry_history()
+        state = json.loads(history[0]["output"]["text"])
+        state["observed_since"] = origin + 3600
+        history[0]["output"]["text"] = json.dumps(state)
+        api, _ = self.run_history(snapshot, origin, history)
+        self.assertEqual(api.check["conclusion"], "failure")
+        self.assertEqual(json.loads(api.check["output"]["text"])["observed_since"], origin + 3600)
+
+
 class HTTPTests(unittest.TestCase):
     def test_authenticated_conditional_get_reuses_304_body(self):
         api = gate.GitHub("example-token", "owner/repo")

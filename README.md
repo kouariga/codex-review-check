@@ -1,6 +1,6 @@
 # Codex Review Check
 
-Observe an existing automatic Codex Cloud review and publish `codex-cloud-review` on the
+Observe an existing Codex Cloud review and publish `codex-cloud-review` on the
 exact PR head. The adapter never requests a review, changes application code,
 resolves discussions, or merges PRs. Initial deployment is report-only.
 
@@ -47,8 +47,9 @@ Every 30 seconds, for at most 20 minutes, observe trusted Codex metadata:
 - The same clean evidence on two observations at least 30 seconds apart.
 
 Existing thumbs-up and old-head summaries never supply fresh acceptance.
-An already-finished review first seen after completion cannot be retroactively
-accepted. Rebase/force-push/new head starts separate state. Missing, ambiguous,
+A new observation cannot retroactively accept an already-finished review.
+The bounded recovery of an earlier uninitialized observation is described below.
+Rebase/force-push/new head starts separate state. Missing, ambiguous,
 failed, or unavailable evidence does not pass; no automatic review retry is sent.
 Resolving a current-head finding does not erase it from this conservative gate.
 A new head and fresh review is the normal correction path. Inline findings are
@@ -56,17 +57,48 @@ attributed to their original reviewed commit, not a later re-anchored location.
 Trusted priority-badge findings posted as plain issue comments have no reliable
 reviewed SHA and block conservatively, including after a new push, until a
 maintainer resolves that ambiguous evidence. The adapter does not delete comments.
-Manually requested reviews are outside this adapter's acceptance contract:
-comment reactions do not provide a reliable current-head binding. Only observed
-automatic trigger labels (`PR opened`, `New commits`, `Draft marked ready`) are
-accepted. Manual or unknown trigger labels block; no fallback request is posted.
+Manual Code Review is accepted when the trusted summary and a trusted
+`Codex Review: Didn't find any major issues.` comment each resolve to the exact
+current head. The comment must contain exactly one explicit reviewed commit.
+A reaction alone cannot approve a manual review. Unknown triggers block.
+
+Manual acceptance requires a new completion-comment ID and a fresh trusted
+thumbs-up. The completion comment must precede the summary completion time,
+which must strictly precede the reaction. Equal-second completion and reaction
+timestamps are ambiguous and cannot supply acceptance. All evidence must follow the observation's
+original start and must not have a future timestamp. Missing or malformed times,
+multiple eligible completion comments, findings, and head or base changes block.
+The observer confirms the same comment digest, summary, and reaction IDs and
+timestamps twice, at least 30 seconds apart.
+
+An existing observation that could not initialize can recover a manual review
+completed after that observation started. Recovery preserves the original start
+when renewing the 20-minute deadline. For legacy failed checks that lack a stored
+origin, recovery walks consecutive GitHub Actions observation records in descending
+check-ID order. Each record must be uninitialized, failed, and match the exact head,
+external ID, state version, and base identity. Start times must be finite, nonnegative,
+not in the future, and nonincreasing while walking backward. An initialized, successful,
+mismatched, malformed, or nonmonotonic record stops the walk. A stored origin is
+preserved and never replaced by historical starts. This recovers an original start
+lost by legacy retries without crossing another review lifecycle.
+It cannot accept a review completed before
+observation began. Observing any running or failed review ends recovery and
+records any available manual completion-comment IDs as its baseline. Subsequent manual
+evidence must follow the first observation of that active review state. A changed
+summary or status advances this boundary; identical active polls do not. Completion
+resets the active-state identity so a later restart advances the boundary again. Older initialized
+state without these IDs also records a baseline before accepting manual evidence.
+This prevents an earlier completion comment from approving an observed same-head
+restart. Unobserved overlapping same-head reviews cannot be fully distinguished
+without an upstream lifecycle ID; multiple eligible comments fail closed.
 
 State lives in the latest owned check output. Code Review must be present;
 Security Review alone cannot approve the check. Per-PR job concurrency, after trusted-event filtering, serializes
 observations; ordinary comments do not enter that queue. A restart resumes an incomplete run. A new authorized invocation creates a new
 run when renewing a completed lifecycle, preserving the original reaction baseline
 and clearing candidate confirmation. Completed runs remain history; only the
-latest owned run supplies resumable state. Multiple active runs block as ambiguous.
+latest owned run supplies resumable state, except for the bounded legacy origin
+recovery described above. Multiple active runs block as ambiguous.
 Failed or expired attempts get a renewed deadline. Each attempt is
 still bounded to 20 minutes and recovery requires two stable observations. GitHub may coalesce pending runs; the observer reads the latest live head.
 Same-head review restarts invalidate previous success when running evidence is
