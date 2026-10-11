@@ -260,6 +260,63 @@ def publish(api, check_id, state, status, reason):
     api.last_publish = previous
 
 
+def recover_virgin_legacy_state(checks, latest, state, snapshot, head, base, external, now):
+    virgin = {"version": 1, "head": head, "base": base, "baseline": [],
+              "baseline_summary": digest([None, "", None]), "eyes": False,
+              "candidate": None, "candidate_at": None}
+    legacy_keys = set(virgin) | {"started"}
+    bridge_keys = legacy_keys | {"observed_since", "manual_baseline", "manual_recovery"}
+    manual = snapshot.get("manual")
+    if (set(state) not in (legacy_keys, bridge_keys) or not manual
+            or not snapshot["completed"] or snapshot["eyes"] or snapshot["failed"]
+            or snapshot["findings"] or snapshot["head"] != head or snapshot["base"] != base):
+        return state
+    records = sorted(checks, key=lambda row: row["id"], reverse=True)
+    origin = now
+    previous_id = None
+    recovered = None
+    bridge = state if set(state) == bridge_keys else None
+    for check in records:
+        try:
+            saved = json.loads(check["output"]["text"])
+            started = saved["started"]
+            identifier = check["id"]
+            if (type(identifier) is not int or identifier <= 0
+                    or (previous_id is not None and identifier >= previous_id)
+                    or check.get("external_id") != external or check.get("head_sha") != head
+                    or type(started) not in (int, float) or not math.isfinite(started)
+                    or not 0 <= started <= origin <= now
+                    or type(saved.get("version")) is not int):
+                break
+            if previous_id is None:
+                if identifier != latest["id"]:
+                    break
+                if bridge is not None:
+                    if check.get("conclusion") not in (None, "failure"):
+                        break
+                    origin, previous_id = started, identifier
+                    continue
+            if check.get("conclusion") != "failure" or digest(saved) != digest(virgin | {"started": started}):
+                break
+            if bridge is not None:
+                expected = saved | {
+                    "started": bridge["started"], "observed_since": started,
+                    "manual_baseline": [c["id"] for c in manual["comments"]],
+                    "manual_recovery": False}
+                if (digest(bridge) != digest(expected) or not manual["comments"]
+                        or any(c["updated"] > bridge["started"] for c in manual["comments"])
+                        or manual["summary_updated"] > bridge["started"]):
+                    break
+                bridge = None
+            recovered = saved
+            origin, previous_id = started, identifier
+        except (KeyError, TypeError, ValueError):
+            break
+    if recovered is None or origin >= state.get("observed_since", state["started"]):
+        return state
+    return state | {"observed_since": origin, "manual_baseline": [], "manual_recovery": False}
+
+
 def legacy_observation_origin(checks, latest, state, head, base, external, now):
     origin = state["started"]
     if "observed_since" in state or state.get("initialized") is not False:
@@ -311,6 +368,18 @@ def run(api, number, clock=time.time, sleep=time.sleep):
         state = json.loads(check["output"]["text"])
         if state["version"] != 1 or state["head"] != head:
             raise ValueError("Invalid saved observation")
+        if (check["conclusion"] in (None, "failure") and "initialized" not in state
+                and state.get("baseline") == [] and state.get("eyes") is False
+                and state.get("baseline_summary") == digest([None, "", None])
+                and state.get("candidate") is None and state.get("candidate_at") is None
+                and "manual_since" not in state and "manual_active" not in state):
+            try:
+                state = recover_virgin_legacy_state(
+                    history, check, state, api.snapshot(number), head, base, external, now)
+            except APIBlocked:
+                raise
+            except Exception:
+                pass
         state["observed_since"] = legacy_observation_origin(
             history, check, state, head, base, external, now)
         # A new authorized invocation can recover a failed/expired attempt.

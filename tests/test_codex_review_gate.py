@@ -425,6 +425,105 @@ class ManualFixtureTests(unittest.TestCase):
             gate.run(api, 1, lambda: now[0], lambda seconds: now.__setitem__(0, now[0] + seconds))
         return api, now[0]
 
+    def virgin_history(self, bridge=False):
+        snapshot, origin, history = self.retry_history()
+        for record in history:
+            previous = json.loads(record["output"]["text"])
+            record["output"]["text"] = json.dumps({
+                "version": 1, "head": snapshot["head"], "base": snapshot["base"],
+                "started": previous["started"], "baseline": [],
+                "baseline_summary": gate.digest([None, "", None]), "eyes": False,
+                "candidate": None, "candidate_at": None})
+        if bridge:
+            state = json.loads(history[0]["output"]["text"])
+            promoted = state | {"started": origin + 6000, "observed_since": state["started"],
+                                "manual_baseline": [c["id"] for c in snapshot["manual"]["comments"]],
+                                "manual_recovery": False}
+            history.insert(0, history[0] | {"id": 4, "output": {"text": json.dumps(promoted)}})
+        return snapshot, origin, history
+
+    def test_virgin_legacy_observation_recovers_after_initialized_retries(self):
+        for bridge in (False, True):
+            with self.subTest(bridge=bridge):
+                snapshot, origin, history = self.virgin_history(bridge)
+                api, ended = self.run_history(snapshot, origin, history)
+                self.assertEqual(api.check["conclusion"], "success")
+                restored = json.loads(api.check["output"]["text"])
+                self.assertEqual(restored["observed_since"], origin)
+                self.assertEqual(restored["baseline"], [])
+                self.assertFalse(restored["manual_recovery"])
+                self.assertEqual(ended, origin + 7230)
+
+    def test_virgin_recovery_stops_at_lifecycle_and_identity_boundaries(self):
+        changes = {"baseline": ["10"], "baseline_summary": "prior-completion", "eyes": True,
+                   "candidate": "accepted", "candidate_at": 1, "initialized": True,
+                   "manual_since": 1, "manual_active": "running", "unknown": None,
+                   "observed_since": 1, "version": True, "started": float("inf"),
+                   "base": {"ref": "other", "sha": "d" * 40}, "head": "b" * 40}
+        for bridge in (False, True):
+            for key, value in changes.items():
+                with self.subTest(bridge=bridge, key=key):
+                    snapshot, origin, history = self.virgin_history(bridge)
+                    boundary = history[-1]
+                    state = json.loads(boundary["output"]["text"])
+                    state[key] = value
+                    boundary["output"]["text"] = json.dumps(state)
+                    api, _ = self.run_history(snapshot, origin, history)
+                    self.assertEqual(api.check["conclusion"], "failure")
+                    self.assertNotIn("success", [write.get("conclusion") for write in api.writes])
+
+    def test_virgin_recovery_does_not_cross_invalid_check_records(self):
+        for change in ("success", "external", "head", "malformed", "duplicate_id", "future", "null"):
+            with self.subTest(change=change):
+                snapshot, origin, history = self.virgin_history(True)
+                boundary = history[-1]
+                if change == "success": boundary["conclusion"] = "success"
+                elif change == "external": boundary["external_id"] += "other"
+                elif change == "head": boundary["head_sha"] = "b" * 40
+                elif change == "malformed": boundary["output"]["text"] = "invalid"
+                elif change == "duplicate_id": boundary["id"] = history[-2]["id"]
+                elif change == "null": boundary["output"]["text"] = "null"
+                elif change == "future":
+                    state = json.loads(boundary["output"]["text"])
+                    state["started"] = origin + 9000
+                    boundary["output"]["text"] = json.dumps(state)
+                api, _ = self.run_history(snapshot, origin, history)
+                self.assertEqual(api.check["conclusion"], "failure")
+
+    def test_only_exact_mechanical_migration_can_replace_stored_origin(self):
+        for change in ("origin", "baseline", "recovery", "new_field", "active", "cycle", "candidate", "late_comment"):
+            with self.subTest(change=change):
+                snapshot, origin, history = self.virgin_history(True)
+                bridge = json.loads(history[0]["output"]["text"])
+                if change == "origin": bridge["observed_since"] -= 1
+                elif change == "baseline": bridge["manual_baseline"] = []
+                elif change == "recovery": bridge["manual_recovery"] = True
+                elif change == "new_field": bridge["future_version_field"] = None
+                elif change == "active": bridge["manual_active"] = "running"
+                elif change == "cycle": bridge["manual_since"] = origin + 3000
+                elif change == "candidate": bridge["candidate"] = "accepted"
+                elif change == "late_comment": bridge["started"] = origin + 100
+                history[0]["output"]["text"] = json.dumps(bridge)
+                api, _ = self.run_history(snapshot, origin, history)
+                self.assertEqual(api.check["conclusion"], "failure")
+                restored = json.loads(api.check["output"]["text"])
+                self.assertEqual(restored["observed_since"], bridge["observed_since"])
+
+    def test_virgin_recovery_still_rejects_stale_or_ambiguous_evidence(self):
+        for change in ("old_comment", "ambiguous", "equal_reaction_time", "finding", "running", "failed"):
+            with self.subTest(change=change):
+                snapshot, origin, history = self.virgin_history(True)
+                if change == "old_comment": snapshot["manual"]["comments"][0]["created"] = origin - 1
+                elif change == "ambiguous":
+                    snapshot["manual"]["comments"].append(snapshot["manual"]["comments"][0] | {"id": 999})
+                elif change == "equal_reaction_time":
+                    snapshot["manual"]["thumbs"] = dict.fromkeys(snapshot["thumbs"], snapshot["manual"]["completed_at"])
+                elif change == "finding": snapshot["findings"] = [123]
+                elif change == "running": snapshot["completed"] = False
+                elif change == "failed": snapshot["failed"] = True
+                api, _ = self.run_history(snapshot, origin, history)
+                self.assertEqual(api.check["conclusion"], "failure")
+
     def test_legacy_failed_retry_chain_recovers_original_origin(self):
         snapshot, origin, history = self.retry_history()
         api, ended = self.run_history(snapshot, origin, history)
