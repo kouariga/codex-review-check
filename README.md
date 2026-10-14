@@ -39,7 +39,7 @@ Every 30 seconds, for at most 20 minutes, observe trusted Codex metadata:
 - Summary author ID `199175422`, GitHub App ID `1144995`. Reactions use the
   same immutable author ID; GitHub can report their `user.type` as `User`.
 - All observed review rows completed and their commit IDs resolved to the
-  current full head SHA; no current-head findings.
+  current full head SHA; no unresolved Codex review threads.
 - The same target branch and base revision throughout observation. Retargeting
   or base advancement invalidates persisted acceptance on the next observation.
 - A thumbs-up reaction ID absent from the initial baseline and no active eyes.
@@ -51,9 +51,18 @@ A new observation cannot retroactively accept an already-finished review.
 The bounded recovery of an earlier legacy observation is described below.
 Rebase/force-push/new head starts separate state. Missing, ambiguous,
 failed, or unavailable evidence does not pass; no automatic review retry is sent.
-Resolving a current-head finding does not erase it from this conservative gate.
-A new head and fresh review is the normal correction path. Inline findings are
-attributed to their original reviewed commit, not a later re-anchored location.
+Inline findings use GitHub's authoritative thread resolution state. Every thread
+page is read through GraphQL and joined to REST comments by the root comment ID;
+REST author IDs remain the bot identity check. Unresolved Codex threads block even
+when outdated or attached to an older head. Missing thread mappings, partial API
+responses, and incomplete pagination cannot produce acceptance.
+
+Resolving threads alone is not approval. Earlier aggregate review messages,
+including changes-requested reviews, can be superseded only by a fresh trusted
+manual clean completion on the current head. The earlier review must have associated
+inline findings, all their threads must be resolved, and its submission must
+strictly precede the clean completion comment's creation. Unthreaded review findings
+or missing timestamps remain blockers. A new finding after clean completion blocks.
 Trusted priority-badge findings posted as plain issue comments have no reliable
 reviewed SHA and block conservatively, including after a new push, until a
 maintainer resolves that ambiguous evidence. The adapter does not delete comments.
@@ -67,7 +76,9 @@ thumbs-up. The completion comment must precede the summary completion time,
 which must strictly precede the reaction. Equal-second completion and reaction
 timestamps are ambiguous and cannot supply acceptance. All evidence must follow the observation's
 original start and must not have a future timestamp. Missing or malformed times,
-multiple eligible completion comments, findings, and head or base changes block.
+findings, and head or base changes block. When more than one new clean completion
+exists, only the latest by creation time is eligible; equal latest creation times
+are ambiguous. An invalid newest completion cannot fall back to an older one.
 The observer confirms the same comment digest, summary, and reaction IDs and
 timestamps twice, at least 30 seconds apart.
 

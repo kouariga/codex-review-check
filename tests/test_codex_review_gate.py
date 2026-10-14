@@ -100,6 +100,7 @@ class SnapshotTests(unittest.TestCase):
                 raise OSError("API unavailable")
             return copy.deepcopy(pr if path.startswith("pulls/") else {"sha": head})
         api.repo_call = call
+        api.review_threads = lambda number: {c.get("in_reply_to_id") or c["id"]: False for c in inline or []}
         api.pages = lambda path: (reactions or []) if path.endswith("reactions") else (
             inline or [] if path == "pulls/1/comments" else [] if path.endswith("reviews") else [comment])
         return api
@@ -137,11 +138,11 @@ class SnapshotTests(unittest.TestCase):
                    "user": {"id": gate.BOT_ID, "type": "Bot"}}
         self.assertEqual(self.api(inline=[finding]).snapshot(1)["findings"], [10])
 
-    def test_reanchored_old_finding_does_not_block_new_head(self):
+    def test_reanchored_old_unresolved_finding_blocks_new_head(self):
         finding = {"id": 10, "commit_id": "a" * 40,
                    "original_commit_id": "b" * 40,
                    "user": {"id": gate.BOT_ID, "type": "Bot"}}
-        self.assertEqual(self.api(inline=[finding]).snapshot(1)["findings"], [])
+        self.assertEqual(self.api(inline=[finding]).snapshot(1)["findings"], [10])
         finding.update(commit_id="b" * 40, original_commit_id="a" * 40)
         self.assertEqual(self.api(inline=[finding]).snapshot(1)["findings"], [10])
 
@@ -208,6 +209,7 @@ class ManualFixtureTests(unittest.TestCase):
                 raise ValueError("Unknown or ambiguous commit")
             return {"sha": head}
         api.repo_call = call
+        api.review_threads = lambda number: {}
         api.pages = lambda path: copy.deepcopy(
             fixture["reactions"] if path.endswith("reactions") else
             fixture["comments"] if path.startswith("issues/") else [])
@@ -616,6 +618,157 @@ class HTTPTests(unittest.TestCase):
                 with self.assertRaises(gate.APIBlocked):
                     api.call("test")
                 self.assertEqual(get.call_count, 1)
+
+
+class ResolvedFindingTests(unittest.TestCase):
+    fixture = ManualFixtureTests.fixture
+    api = ManualFixtureTests.api
+
+    def finding_api(self, resolved=True, old=False, review=True):
+        fixture = self.fixture()
+        api = self.api(fixture)
+        original = api.pages
+        head = fixture["pr"]["head"]["sha"]
+        finding = {"id": 71, "user": {"id": gate.BOT_ID},
+                   "original_commit_id": "b" * 40 if old else head,
+                   "pull_request_review_id": 81}
+        review_row = {"id": 81, "user": {"id": gate.BOT_ID}, "commit_id": head,
+                      "state": "COMMENTED", "body": "Review suggestions", "submitted_at": "2026-10-10T14:32:00Z"}
+        api.pages = lambda path: ([finding] if path == "pulls/1/comments" else
+                                [review_row] if path == "pulls/1/reviews" and review else original(path))
+        api.review_threads = lambda number: {71: resolved}
+        return api, fixture, review_row
+
+    def verdict(self, api, fixture):
+        snapshot = api.snapshot(1)
+        origin = fixture["state"]["started"]
+        state = gate.initialize(snapshot, origin + 3600, observed_since=origin)
+        gate.observe(state, snapshot, origin + 3600)
+        return gate.observe(state, snapshot, origin + 3630)[0]
+
+    def test_resolved_thread_and_earlier_aggregate_accept_fresh_clean(self):
+        api, fixture, _ = self.finding_api()
+        self.assertEqual(self.verdict(api, fixture), "success")
+
+    def test_unresolved_old_head_remains_blocking(self):
+        api, fixture, _ = self.finding_api(resolved=False, old=True, review=False)
+        self.assertNotEqual(self.verdict(api, fixture), "success")
+
+    def test_later_or_missing_aggregate_time_cannot_be_superseded(self):
+        for submitted in (None, "2026-10-10T14:33:32Z", "2026-10-10T14:33:33Z"):
+            api, fixture, row = self.finding_api()
+            row["submitted_at"] = submitted
+            self.assertNotEqual(self.verdict(api, fixture), "success")
+
+    def test_unthreaded_review_cannot_be_superseded(self):
+        api, fixture, row = self.finding_api()
+        row["id"] = 82
+        self.assertNotEqual(self.verdict(api, fixture), "success")
+
+    def test_missing_thread_is_incomplete_evidence(self):
+        api, _, _ = self.finding_api()
+        api.review_threads = lambda number: {}
+        with self.assertRaises(ValueError):
+            api.snapshot(1)
+
+    def test_latest_clean_completion_supersedes_older_clean(self):
+        api, fixture, _ = self.finding_api()
+        previous = copy.deepcopy(fixture["comments"][1])
+        previous.update(id=3, created_at="2026-10-10T14:31:00Z", updated_at="2026-10-10T14:31:00Z")
+        fixture["comments"].append(previous)
+        self.assertEqual(self.verdict(api, fixture), "success")
+
+
+    def test_unresolved_current_head_blocks_even_later_clean(self):
+        api, fixture, _ = self.finding_api(resolved=False)
+        self.assertNotEqual(self.verdict(api, fixture), "success")
+
+    def test_resolved_thread_without_fresh_acceptance_stays_pending(self):
+        api, fixture, _ = self.finding_api()
+        snapshot = api.snapshot(1)
+        now = fixture["state"]["started"] + 3600
+        state = gate.initialize(snapshot, now)
+        gate.observe(state, snapshot, now)
+        self.assertNotEqual(gate.observe(state, snapshot, now + 30)[0], "success")
+
+    def test_latest_completion_must_not_fall_back_to_older_valid_one(self):
+        api, fixture, _ = self.finding_api()
+        latest = copy.deepcopy(fixture["comments"][1])
+        latest.update(id=3, created_at="2026-10-10T14:33:33Z", updated_at="2026-10-10T14:34:00Z")
+        fixture["comments"].append(latest)
+        self.assertNotEqual(self.verdict(api, fixture), "success")
+
+    def test_tied_latest_completions_are_ambiguous(self):
+        api, fixture, _ = self.finding_api()
+        fixture["comments"].append(fixture["comments"][1] | {"id": 3})
+        self.assertNotEqual(self.verdict(api, fixture), "success")
+
+    def test_changes_requested_requires_resolved_threads_and_clean_review(self):
+        api, fixture, row = self.finding_api()
+        row["state"] = "CHANGES_REQUESTED"
+        self.assertEqual(self.verdict(api, fixture), "success")
+        api.review_threads = lambda number: {71: False}
+        self.assertNotEqual(self.verdict(api, fixture), "success")
+
+    def test_thread_not_in_rest_evidence_is_incomplete(self):
+        api, _, _ = self.finding_api()
+        api.review_threads = lambda number: {71: True, 72: False}
+        with self.assertRaises(ValueError):
+            api.snapshot(1)
+
+    def test_rest_reply_uses_root_resolution(self):
+        api, fixture, _ = self.finding_api()
+        original = api.pages
+        def pages(path):
+            rows = original(path)
+            if path == "pulls/1/comments":
+                rows.append(rows[0] | {"id": 72, "in_reply_to_id": 71})
+            return rows
+        api.pages = pages
+        self.assertEqual(self.verdict(api, fixture), "success")
+
+
+class ReviewThreadTests(unittest.TestCase):
+    def page(self, root=71, resolved=False, next_page=False, cursor=None):
+        return {"data": {"repository": {"pullRequest": {"reviewThreads": {
+            "nodes": [{"id": "thread-" + str(root), "isResolved": resolved,
+                       "comments": {"nodes": [{"databaseId": root}]}}],
+            "pageInfo": {"hasNextPage": next_page, "endCursor": cursor}}}}}}
+
+    def test_all_thread_pages_are_read(self):
+        api = gate.GitHub("never-used", "owner/repo")
+        pages = [self.page(resolved=True, next_page=True, cursor="next"), self.page(root=72)]
+        calls = []
+        def call(path, data):
+            calls.append((path, data["variables"]["after"]))
+            return pages.pop(0)
+        api.call = call
+        self.assertEqual(api.review_threads(1), {71: True, 72: False})
+        self.assertEqual(calls, [("graphql", None), ("graphql", "next")])
+
+    def test_graphql_errors_and_malformed_pages_fail_closed(self):
+        valid = self.page()
+        variants = [valid | {"errors": [{"message": "partial"}]}, {"data": None}]
+        for field, value in (("isResolved", None), ("id", None)):
+            page = self.page()
+            page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0][field] = value
+            variants.append(page)
+        page = self.page()
+        page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]["comments"]["nodes"] = []
+        variants.append(page)
+        variants.append(self.page(next_page=True))
+        for response in variants:
+            with self.subTest(response=response):
+                api = gate.GitHub("never-used", "owner/repo")
+                api.call = lambda *args: response
+                with self.assertRaises((ValueError, TypeError, KeyError)):
+                    api.review_threads(1)
+
+    def test_duplicate_pages_and_cursor_cycles_fail_closed(self):
+        api = gate.GitHub("never-used", "owner/repo")
+        api.call = lambda *args: self.page(next_page=True, cursor="same")
+        with self.assertRaises(ValueError):
+            api.review_threads(1)
 
 
 class FakeGitHub:

@@ -114,25 +114,35 @@ jobs:
                   origin = max(state.get("observed_since", state["started"]),
                                state.get("manual_since", state.get("observed_since", state["started"])))
                   comments = [c for c in manual["comments"]
-                              if c["id"] not in state.get("manual_baseline", [])
-                              and origin < c["created"] <= c["updated"] <= manual["completed_at"]
-                              <= manual["summary_updated"] <= now]
+                              if c["id"] not in state.get("manual_baseline", []) and origin < c["created"]]
+                  if comments:
+                      latest = max(c["created"] for c in comments)
+                      comments = [c for c in comments if c["created"] == latest]
+                  valid_completion = (len(comments) == 1
+                                      and comments[0]["created"] <= comments[0]["updated"] <= manual["completed_at"]
+                                      <= manual["summary_updated"] <= now)
                   eligible = sorted(r for r, created in manual["thumbs"].items()
                                     if origin < manual["completed_at"] < created <= now
                                     and (state.get("manual_recovery") or r in fresh))
-                  if len(comments) == 1 and eligible:
+                  if valid_completion and eligible:
                       manual_proof = [comments[0], {r: manual["thumbs"][r] for r in eligible},
                                       manual["completed_at"], manual["summary_updated"]]
                   fresh = eligible if manual_proof else []
                   changed_summary = bool(manual_proof)
-              clean = (snapshot["completed"] and not snapshot["findings"]
+              findings = list(snapshot["findings"])
+              for review in snapshot.get("review_findings", []):
+                  if not (manual_proof and review["resolved_threads"]
+                          and review["submitted"] is not None
+                          and review["submitted"] < manual_proof[0]["created"]):
+                      findings.append(review["id"])
+              clean = (snapshot["completed"] and not findings
                        and not snapshot["eyes"] and fresh
                        and (state["eyes"] or changed_summary))
               if not clean or snapshot["failed"]:
                   state["candidate"] = state["candidate_at"] = None
                   reason = "Waiting for fresh trusted reaction and completed current-head review"
-                  if snapshot["findings"]:
-                      reason = "Current-head Codex findings remain; waiting for a clean review"
+                  if findings:
+                      reason = "Codex findings remain; waiting for resolution and a fresh clean review"
                   if snapshot["failed"]:
                       return "failure", "Codex review failed; no automatic retry is requested"
                   return "pending", reason
@@ -194,6 +204,46 @@ jobs:
                           return result
                   raise ValueError("Pagination limit reached; evidence is incomplete")
 
+              def review_threads(self, number):
+                  owner, name = self.repo.split("/")
+                  query = """query($owner:String!,$name:String!,$number:Int!,$after:String) {
+                    repository(owner:$owner,name:$name) { pullRequest(number:$number) {
+                      reviewThreads(first:100,after:$after) {
+                        nodes { id isResolved comments(first:1) { nodes { databaseId } } }
+                        pageInfo { hasNextPage endCursor }
+                      }
+                    } }
+                  }"""
+                  roots, cursors, thread_ids = {}, set(), set()
+                  cursor = None
+                  for _ in range(100):
+                      response = self.call("graphql", {"query": query, "variables": {
+                          "owner": owner, "name": name, "number": number, "after": cursor}})
+                      if response.get("errors"):
+                          raise ValueError("GraphQL review thread evidence unavailable")
+                      connection = response["data"]["repository"]["pullRequest"]["reviewThreads"]
+                      nodes, page = connection["nodes"], connection["pageInfo"]
+                      if not isinstance(nodes, list) or type(page["hasNextPage"]) is not bool:
+                          raise ValueError("Malformed review thread page")
+                      for thread in nodes:
+                          comments = thread["comments"]["nodes"]
+                          if (not isinstance(thread["id"], str) or not thread["id"]
+                                  or thread["id"] in thread_ids or type(thread["isResolved"]) is not bool
+                                  or not isinstance(comments, list) or len(comments) != 1):
+                              raise ValueError("Malformed review thread")
+                          identifier = comments[0]["databaseId"]
+                          if type(identifier) is not int or identifier <= 0 or identifier in roots:
+                              raise ValueError("Ambiguous review thread root")
+                          thread_ids.add(thread["id"])
+                          roots[identifier] = thread["isResolved"]
+                      if not page["hasNextPage"]:
+                          return roots
+                      cursor = page["endCursor"]
+                      if not isinstance(cursor, str) or not cursor or cursor in cursors or not nodes:
+                          raise ValueError("Incomplete review thread pagination")
+                      cursors.add(cursor)
+                  raise ValueError("Review thread pagination limit reached")
+
               def snapshot(self, number):
                   pr = self.repo_call(f"pulls/{number}")
                   head = pr["head"]["sha"]
@@ -230,12 +280,31 @@ jobs:
                   reactions = [r for r in reactions if bot(r)]
                   inline = self.pages(f"pulls/{number}/comments")
                   reviews = self.pages(f"pulls/{number}/reviews")
-                  findings = [c["id"] for c in inline if bot(c)
-                              and (c.get("original_commit_id") or c.get("commit_id")) == head]
-                  findings += [r["id"] for r in reviews if bot(r) and r.get("commit_id") == head
-                               and (r["state"] == "CHANGES_REQUESTED"
-                                    or (r.get("body", "").strip() and r["state"] == "COMMENTED"
-                                        and "Didn't find any major issues" not in r["body"]))]
+                  threads = self.review_threads(number)
+                  if not set(threads).issubset({c["id"] for c in inline}):
+                      raise ValueError("Review threads missing from inline evidence")
+                  codex_inline = [c for c in inline if bot(c)]
+                  for comment in codex_inline:
+                      if (comment.get("in_reply_to_id") or comment["id"]) not in threads:
+                          raise ValueError("Codex comment missing from review threads")
+                  findings = [c["id"] for c in codex_inline
+                              if not threads[c.get("in_reply_to_id") or c["id"]]]
+                  review_findings = []
+                  for review in reviews:
+                      if not bot(review) or review.get("commit_id") != head:
+                          continue
+                      if not (review["state"] == "CHANGES_REQUESTED"
+                              or (review["state"] == "COMMENTED" and review.get("body", "").strip()
+                                  and "Didn't find any major issues" not in review["body"])):
+                          continue
+                      associated = [c for c in codex_inline if c.get("pull_request_review_id") == review["id"]]
+                      try:
+                          submitted = timestamp(review.get("submitted_at"))
+                      except ValueError:
+                          submitted = None
+                      review_findings.append({"id": review["id"], "submitted": submitted,
+                                              "resolved_threads": bool(associated) and all(
+                                                  threads[c.get("in_reply_to_id") or c["id"]] for c in associated)})
                   # Plain finding comments have no authoritative reviewed SHA. Treat their
                   # known priority badges as ambiguous blockers rather than guessing a head.
                   findings += [c["id"] for c in comments if trusted(c)
@@ -271,7 +340,7 @@ jobs:
                   return {"head": head, "base": base_identity(pr), "eyes": any(r["content"] == "eyes" for r in reactions),
                           "thumbs": sorted(str(r["id"]) for r in reactions if r["content"] == "+1"),
                           "summary": digest([summary.get("id"), body, summary.get("updated_at")]),
-                          "completed": bool(completed), "findings": findings,
+                          "completed": bool(completed), "findings": findings, "review_findings": review_findings,
                           "failed": any("**Failed**" in row for row in rows), "manual": manual_evidence}
 
 
