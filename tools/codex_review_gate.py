@@ -90,8 +90,8 @@ def observe(state, snapshot, now):
             latest = max(c["created"] for c in comments)
             comments = [c for c in comments if c["created"] == latest]
         valid_completion = (len(comments) == 1
-                            and comments[0]["created"] <= comments[0]["updated"] <= manual["completed_at"]
-                            <= manual["summary_updated"] <= now)
+                            and comments[0]["created"] <= comments[0]["updated"] <= manual["completed_at"] <= now
+                            and math.floor(manual["completed_at"]) <= manual["summary_updated"] <= now)
         eligible = sorted(r for r, created in manual["thumbs"].items()
                           if origin < manual["completed_at"] < created <= now
                           and (state.get("manual_recovery") or r in fresh))

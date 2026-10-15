@@ -233,6 +233,24 @@ class ManualFixtureTests(unittest.TestCase):
         self.assertEqual(gate.observe(state, snapshot, now + 30)[0], "pending")
         self.assertEqual(gate.observe(state, snapshot, now + 60)[0], "pending")
 
+    def test_fractional_completion_accepts_same_second_summary_update(self):
+        fixture = self.fixture()
+        snapshot = self.api(fixture).snapshot(1)
+        snapshot["manual"]["summary_updated"] = int(snapshot["manual"]["completed_at"])
+        origin = fixture["state"]["started"]
+        state = gate.initialize(snapshot, origin + 3600, observed_since=origin)
+        self.assertEqual(gate.observe(state, snapshot, origin + 3600)[0], "pending")
+        self.assertEqual(gate.observe(state, snapshot, origin + 3630)[0], "success")
+
+    def test_fractional_completion_rejects_summary_from_previous_second(self):
+        fixture = self.fixture()
+        snapshot = self.api(fixture).snapshot(1)
+        snapshot["manual"]["summary_updated"] = int(snapshot["manual"]["completed_at"]) - 1
+        origin = fixture["state"]["started"]
+        state = gate.initialize(snapshot, origin + 3600, observed_since=origin)
+        self.assertEqual(gate.observe(state, snapshot, origin + 3600)[0], "pending")
+        self.assertEqual(gate.observe(state, snapshot, origin + 3630)[0], "pending")
+
     def test_recovery_rejects_untrusted_wrong_stale_or_ambiguous_evidence(self):
         def duplicate(f):
             f["comments"].append(f["comments"][1] | {"id": 99})
