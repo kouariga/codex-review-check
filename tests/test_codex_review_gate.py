@@ -194,6 +194,80 @@ class SnapshotTests(unittest.TestCase):
         self.assertFalse(self.api(rows=rows).snapshot(1)["completed"])
 
 
+class StructuredReviewTests(unittest.TestCase):
+    def fixture(self):
+        review = {"commit_sha": "a" * 40, "has_any_findings": True,
+                  "has_unresolved_findings": False, "status": "completed"}
+        return {"code_review": review, "security_review": dict.fromkeys(review)}
+
+    def api(self, value=None, *, marker=None, status="Completed", inline=None):
+        value = self.fixture() if value is None else value
+        marker = ("<!-- codex-review-state:v1 " + json.dumps(value) + " -->"
+                  if marker is None else marker)
+        rows = ("| 📝 **Code Review** | **" + status + "** "
+                '<relative-time datetime="2026-10-16T03:16:04.451181Z">done</relative-time>'
+                " | `aaaaaaa` | New commits |")
+        api = SnapshotTests().api(rows=rows, inline=inline)
+        original = api.pages
+        def pages(path):
+            result = original(path)
+            if path == "issues/1/comments":
+                result[0]["body"] = gate.MARKER + "\n" + marker + "\n" + rows
+                result[0]["updated_at"] = "2026-10-16T03:16:06Z"
+            return result
+        api.pages = pages
+        return api
+
+    def test_structured_resolved_flags_without_reaction_never_approve(self):
+        snapshot = self.api().snapshot(1)
+        now = gate.timestamp("2026-10-16T03:17:00Z")
+        state = gate.initialize(snapshot, now)
+        self.assertEqual(gate.observe(state, snapshot, now)[0], "pending")
+        self.assertEqual(gate.observe(state, snapshot, now + 30)[0], "pending")
+        self.assertNotIn("structured_since", state)
+
+    def test_invalid_structured_marker_cannot_fall_back_to_legacy_reaction(self):
+        fixture = self.fixture()
+        variants = []
+        for key, value in (("commit_sha", "b" * 40), ("commit_sha", "a" * 7),
+                           ("has_any_findings", 1), ("has_unresolved_findings", None),
+                           ("extra", False), ("status", "unknown")):
+            changed = copy.deepcopy(fixture)
+            changed["code_review"][key] = value
+            variants.append(changed)
+        variants += [{"security_review": fixture["security_review"]},
+                     fixture | {"extra": {}},
+                     fixture | {"code_review": dict.fromkeys(fixture["code_review"])},
+                     fixture | {"security_review": fixture["code_review"]}]
+        for value in variants:
+            with self.subTest(value=value), self.assertRaises((ValueError, TypeError)):
+                self.api(value).snapshot(1)
+        marker = "<!-- codex-review-state:v1 " + json.dumps(fixture) + " -->"
+        for invalid in (marker + marker, marker.replace(":v1", ":v2"),
+                        '<!-- codex-review-state:v1 {"code_review":{},"code_review":{}} -->'):
+            with self.subTest(marker=invalid), self.assertRaises(ValueError):
+                self.api(marker=invalid).snapshot(1)
+
+    def test_human_and_machine_status_must_agree(self):
+        for status in ("Running", "Failed"):
+            with self.assertRaises(ValueError):
+                self.api(status=status).snapshot(1)
+
+    def test_untrusted_summary_cannot_supply_structured_proof(self):
+        for field, value in (("user", {"id": 123}), ("performed_via_github_app", {"id": 123})):
+            api = self.api()
+            original = api.pages
+            def pages(path, original=original):
+                result = original(path)
+                if path == "issues/1/comments":
+                    result[0][field] = value
+                return result
+            api.pages = pages
+            snapshot = api.snapshot(1)
+            self.assertIsNone(snapshot["structured"])
+            self.assertFalse(snapshot["completed"])
+
+
 class ManualFixtureTests(unittest.TestCase):
     def fixture(self, number=1):
         return json.loads((ROOT / f"tests/fixtures/manual-{number}.json").read_text())
@@ -651,7 +725,8 @@ class ResolvedFindingTests(unittest.TestCase):
                    "original_commit_id": "b" * 40 if old else head,
                    "pull_request_review_id": 81}
         review_row = {"id": 81, "user": {"id": gate.BOT_ID}, "commit_id": head,
-                      "state": "COMMENTED", "body": "Review suggestions", "submitted_at": "2026-10-10T14:32:00Z"}
+                      "state": "COMMENTED", "body": gate.FINDING_REVIEW_WRAPPER.replace("{commit}", head),
+                      "submitted_at": "2026-10-10T14:32:00Z"}
         api.pages = lambda path: ([finding] if path == "pulls/1/comments" else
                                 [review_row] if path == "pulls/1/reviews" and review else original(path))
         api.review_threads = lambda number: {71: resolved}

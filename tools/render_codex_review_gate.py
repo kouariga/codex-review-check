@@ -19,8 +19,15 @@ jobs:
       (github.event_name == 'pull_request_target' && !github.event.pull_request.draft) ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
-       github.event.comment.user.id == 199175422 &&
-       github.event.comment.performed_via_github_app.id == 1144995)
+       ((github.event.comment.user.id == 199175422 &&
+         github.event.comment.performed_via_github_app.id == 1144995) ||
+        startsWith(github.event.comment.body, 'Codex review:') ||
+        startsWith(github.event.changes.body.from, 'Codex review:'))) ||
+      (github.event_name == 'pull_request_review_comment' &&
+       ((github.event.comment.user.id == 199175422 &&
+         github.event.comment.performed_via_github_app.id == 1144995) ||
+        startsWith(github.event.comment.body, 'Codex review:') ||
+        startsWith(github.event.changes.body.from, 'Codex review:')))
     concurrency:
       group: codex-review-check-${{ github.event.pull_request.number || github.event.issue.number || fromJSON(github.event.inputs.pr || '0') }}
       cancel-in-progress: false

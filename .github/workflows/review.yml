@@ -13,8 +13,15 @@ jobs:
       (github.event_name == 'pull_request_target' && !github.event.pull_request.draft) ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
-       github.event.comment.user.id == 199175422 &&
-       github.event.comment.performed_via_github_app.id == 1144995)
+       ((github.event.comment.user.id == 199175422 &&
+         github.event.comment.performed_via_github_app.id == 1144995) ||
+        startsWith(github.event.comment.body, 'Codex review:') ||
+        startsWith(github.event.changes.body.from, 'Codex review:'))) ||
+      (github.event_name == 'pull_request_review_comment' &&
+       ((github.event.comment.user.id == 199175422 &&
+         github.event.comment.performed_via_github_app.id == 1144995) ||
+        startsWith(github.event.comment.body, 'Codex review:') ||
+        startsWith(github.event.changes.body.from, 'Codex review:')))
     concurrency:
       group: codex-review-check-${{ github.event.pull_request.number || github.event.issue.number || fromJSON(github.event.inputs.pr || '0') }}
       cancel-in-progress: false
@@ -47,6 +54,7 @@ jobs:
           INTERVAL = 30
           TIMEOUT = 1200
           MARKER = "<!-- codex-pull-request-review-summary -->"
+          DECISION_PREFIX = "Codex review:"
 
 
           def bot(value):
@@ -62,6 +70,16 @@ jobs:
               return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
+          def review_evidence(value):
+              fields = ("id", "body", "created_at", "updated_at", "submitted_at", "state",
+                        "commit_id", "original_commit_id", "in_reply_to_id", "pull_request_review_id",
+                        "path", "line", "original_line", "start_line", "original_start_line",
+                        "side", "start_side", "diff_hunk", "subject_type")
+              return {**{field: value.get(field) for field in fields},
+                      "user": {"id": (value.get("user") or {}).get("id")},
+                      "performed_via_github_app": {"id": (value.get("performed_via_github_app") or {}).get("id")}}
+
+
           def base_identity(pr):
               return {"ref": pr["base"]["ref"], "sha": pr["base"]["sha"]}
 
@@ -71,6 +89,153 @@ jobs:
                       r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", value):
                   raise ValueError("Missing or malformed evidence timestamp")
               return datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
+          FINDING_REVIEW_WRAPPER = """<!-- codex-review-receipt:v1 -->
+
+
+          ### 💡 Codex Review
+
+          Here are some automated review suggestions for this pull request.
+
+          **Reviewed commit:** `{commit}`
+
+
+          <details> <summary>ℹ️ About Codex in GitHub</summary>
+          <br/>
+
+          [Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you
+          - Open a pull request for review
+          - Mark a draft as ready
+          - Comment "@codex review".
+
+          If Codex has suggestions, it will comment; otherwise it will react with 👍.
+
+
+
+
+          Codex can also answer questions or update the PR. Try commenting "@codex address that feedback".
+
+          </details>"""
+
+
+          def is_finding_review_wrapper(body):
+              normalized = re.sub(r"(\*\*Reviewed commit:\*\* `)[0-9a-f]{7,40}(`)", r"\1{commit}\2", body)
+              return normalized.split() == FINDING_REVIEW_WRAPPER.split()
+
+
+          def is_clean_review_body(body):
+              return body.strip() in {"Didn't find any major issues.", "Codex Review: Didn't find any major issues."}
+
+
+          def unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError("Duplicate structured review field")
+                  result[key] = value
+              return result
+
+
+
+          def decision_targets(body, root=None):
+              if not body.startswith(DECISION_PREFIX):
+                  return set()
+              if root is not None:
+                  return {"inline:" + str(root)}
+              targets = re.findall(r"^Finding: ((?:issue|review):[1-9][0-9]*)$", body, re.MULTILINE)
+              return set(targets)
+
+
+          def parse_decision(body):
+              lines = body.splitlines()
+              outcomes = {"Codex review: fixed": "fixed", "Codex review: won't-fix": "wont_fix",
+                          "Codex review: wont-fix": "wont_fix"}
+              if not lines or lines[0] not in outcomes:
+                  raise ValueError("Unknown disposition")
+              fields, current = {}, None
+              for line in lines[1:]:
+                  match = re.fullmatch(r"(Head|Base|Finding|Reason|Evidence):\s*(.*)", line)
+                  if match:
+                      current, value = match.groups()
+                      if current in fields:
+                          raise ValueError("Duplicate disposition field")
+                      fields[current] = value
+                  elif not line.strip():
+                      continue
+                  elif current in ("Reason", "Evidence"):
+                      fields[current] += "\n" + line
+                  else:
+                      raise ValueError("Unknown disposition field")
+              if (not {"Head", "Base", "Reason", "Evidence"}.issubset(fields)
+                      or any(not fields[key].strip() for key in ("Reason", "Evidence"))
+                      or not re.fullmatch(r"[0-9a-f]{40}", fields["Head"])
+                      or not re.fullmatch(r".+@[0-9a-f]{40}", fields["Base"])):
+                  raise ValueError("Incomplete disposition")
+              return {"outcome": outcomes[lines[0]], **fields}
+
+
+          def advance_floors(state, additions):
+              if not additions:
+                  return
+              floors = state.setdefault("disposition_floors", {})
+              for key, identifier in additions.items():
+                  floors[key] = max(floors.get(key, 0), identifier)
+
+          def structured_review(summary, rows, head):
+              body = summary.get("body", "")
+              if "codex-review-state:" not in body:
+                  return None
+              markers = re.findall(r"<!-- codex-review-state:v1 (.*?) -->", body)
+              if len(markers) != 1 or body.count("codex-review-state:") != 1:
+                  raise ValueError("Ambiguous structured review marker")
+
+
+              value = json.loads(markers[0], object_pairs_hook=unique_object)
+              names = {"code_review": "**Code Review**", "security_review": "**Security Review**"}
+              if not isinstance(value, dict) or set(value) != set(names):
+                  raise ValueError("Unknown structured review fields")
+              fields = {"commit_sha", "has_any_findings", "has_unresolved_findings", "status"}
+              statuses = {"completed": "Completed", "running": "Running", "queued": "Queued",
+                          "pending": "Pending", "failed": "Failed"}
+              completions, reviews, active, failed, unresolved = [], {}, False, False, False
+              for kind, label in names.items():
+                  review = value[kind]
+                  matching = [row.split("|") for row in rows if label in row.split("|")[1]]
+                  if not isinstance(review, dict) or set(review) != fields:
+                      raise ValueError("Unknown structured review shape")
+                  if all(item is None for item in review.values()):
+                      if kind == "code_review" or matching:
+                          raise ValueError("Missing structured review")
+                      continue
+                  status = review["status"]
+                  findings_valid = all(type(review[field]) is bool or
+                                       (status != "completed" and review[field] is None)
+                                       for field in ("has_any_findings", "has_unresolved_findings"))
+                  if (not isinstance(review["commit_sha"], str)
+                          or not re.fullmatch(r"[0-9a-f]{40}", review["commit_sha"])
+                          or review["commit_sha"] != head or status not in statuses
+                          or not findings_valid
+                          or (review["has_unresolved_findings"] and not review["has_any_findings"])
+                          or len(matching) != 1
+                          or re.findall(r"\*\*([^*]+)\*\*", matching[0][2]) != [statuses[status]]):
+                      raise ValueError("Contradictory structured review")
+                  completed_at = None
+                  if status == "completed":
+                      times = re.findall(r'<relative-time datetime="([^"<>]+)">', matching[0][2])
+                      if len(times) != 1:
+                          raise ValueError("Missing structured completion timestamp")
+                      completed_at = timestamp(times[0])
+                      completions.append(completed_at)
+                  reviews[kind] = {"status": status, "completed_at": completed_at, "digest": digest(review)}
+                  active = active or status != "completed"
+                  failed = failed or status == "failed"
+                  unresolved = unresolved or review["has_unresolved_findings"]
+              return {"digest": digest(value), "reviews": reviews, "completed_at": min(completions) if completions else None,
+                      "latest_completed_at": max(completions) if completions else None,
+                      "summary_updated": timestamp(summary.get("updated_at")),
+                      "completed": not active, "failed": failed, "unresolved": unresolved,
+                      "has_findings": any(r["has_any_findings"] for r in value.values())}
 
 
           def initialize(snapshot, now, observed_since=None):
@@ -85,6 +250,7 @@ jobs:
 
           def observe(state, snapshot, now):
               """Return (status, reason), mutating only this head's persisted observation."""
+              state.pop("proof", None)
               if snapshot["head"] != state["head"]:
                   return "stale", "PR head changed; this observation cannot pass the new head"
               if snapshot["base"] != state["base"]:
@@ -96,8 +262,8 @@ jobs:
               changed_summary = snapshot["summary"] != state["baseline_summary"]
               manual = snapshot.get("manual")
               manual_proof = None
-              if not snapshot["completed"] or snapshot["eyes"] or snapshot["failed"]:
-                  active = digest([snapshot["summary"], snapshot["completed"],
+              if not snapshot.get("review_completed", snapshot["completed"]) or snapshot["eyes"] or snapshot["failed"]:
+                  active = digest([snapshot["summary"], snapshot.get("review_completed", snapshot["completed"]),
                                    snapshot["eyes"], snapshot["failed"]])
                   if state.get("manual_active") != active:
                       state["manual_since"] = now
@@ -135,25 +301,84 @@ jobs:
                           and review["submitted"] is not None
                           and review["submitted"] < manual_proof[0]["created"]):
                       findings.append(review["id"])
+              for item in snapshot.get("inventory", []):
+                  if "root" not in item:
+                      findings.append(item["key"])
+                      continue
+                  root = item["root"]
+                  try:
+                      created = timestamp(root.get("created_at"))
+                  except ValueError:
+                      created = None
+                  associated = next((r for r in snapshot.get("review_findings", [])
+                                     if r["id"] == root.get("pull_request_review_id")), None)
+                  superseded = (manual_proof and item["resolved"] and associated
+                                and associated["resolved_threads"] and associated["submitted"] is not None
+                                and associated["submitted"] < manual_proof[0]["created"]
+                                and (created is None or created < manual_proof[0]["created"]))
+                  reviewed_head = root.get("original_commit_id") or root.get("commit_id")
+                  if not superseded and (not reviewed_head or reviewed_head == snapshot["head"]
+                                         or created is None or snapshot.get("completed_at") is None
+                                         or created >= math.floor(snapshot.get("earliest_completed_at", snapshot["completed_at"]))):
+                      findings.append(item["key"])
               clean = (snapshot["completed"] and not findings
                        and not snapshot["eyes"] and fresh
                        and (state["eyes"] or changed_summary))
-              if not clean or snapshot["failed"]:
+              structured = snapshot.get("structured")
+              lifecycle_valid = (snapshot.get("review_completed", snapshot["completed"]) and not snapshot["eyes"] and not snapshot["failed"]
+                                 and (structured is None or (structured["completed"] and not structured["unresolved"]
+                                     and structured["latest_completed_at"] is not None
+                                     and structured["latest_completed_at"] <= now
+                                     and math.floor(structured["latest_completed_at"]) <= structured["summary_updated"] <= now)))
+              if structured is not None:
+                  clean = clean and (bool(manual_proof) or not structured["has_findings"])
+              if manual is None and "reaction_times" in snapshot:
+                  boundary = max(state.get("observed_since", state["started"]),
+                                 state.get("manual_since", state.get("observed_since", state["started"])),
+                                 snapshot.get("completed_at") or now,
+                                 (structured or {}).get("summary_updated", 0))
+                  fresh = [identifier for identifier in fresh
+                           if boundary < snapshot["reaction_times"][identifier] <= now]
+                  clean = clean and bool(fresh)
+              proof = None
+              if lifecycle_valid and clean:
+                  proof = {"kind": "clean_codex", "digest": digest([snapshot["summary"], fresh, manual_proof])}
+              dispositions = snapshot.get("dispositions", {})
+              advance_floors(state, {key: value["id"] for key, value in dispositions.items()})
+              keys = {item["key"] for item in snapshot.get("inventory", [])}
+              verified = bool(keys) and keys == set(dispositions) and all(
+                  value["valid"] and value["id"] == state["disposition_floors"].get(key)
+                  and state.get("manual_since", float("-inf")) < value["created"] <= now
+                  for key, value in dispositions.items())
+              if proof is None and lifecycle_valid and not snapshot.get("unresolved_threads", False) and verified:
+                  replies = [{"finding": key, "id": dispositions[key]["id"],
+                              "author": dispositions[key]["author"], "digest": dispositions[key]["digest"]}
+                             for key in sorted(dispositions)]
+                  proof = {"kind": "verified_dispositions", "replies": replies, "digest": digest(replies)}
+              if proof is None or not lifecycle_valid:
                   state["candidate"] = state["candidate_at"] = None
                   reason = "Waiting for fresh trusted reaction and completed current-head review"
                   if findings:
                       reason = "Codex findings remain; waiting for resolution and a fresh clean review"
+                  if snapshot.get("review_completed", snapshot["completed"]) and snapshot.get("inventory") and not snapshot.get("unresolved_threads", False):
+                      reason = "Review completed; waiting for verified feedback handling or clean Codex approval"
+                  if dispositions and not verified:
+                      reason = "Every finding needs a valid current fixed or won’t-fix decision"
+                  if not snapshot.get("review_completed", snapshot["completed"]) or snapshot["eyes"]:
+                      reason = "Codex review in progress; acceptance is pending"
                   if snapshot["failed"]:
                       return "failure", "Codex review failed; no automatic retry is requested"
                   return "pending", reason
               evidence = [snapshot["head"], snapshot["base"], snapshot["summary"], fresh]
-              candidate = digest(evidence + [manual_proof] if manual is not None else evidence)
+              candidate = digest(evidence + [proof, snapshot.get("review_digest"), snapshot.get("inventory_digest")])
+              state["proof"] = proof
               if state["candidate"] != candidate:
                   state["candidate"], state["candidate_at"] = candidate, now
-                  return "pending", "Clean evidence observed; confirming again after 30 seconds"
+                  return "pending", "Acceptance proof observed; confirming again after 30 seconds"
               if now - state["candidate_at"] < INTERVAL:
                   return "pending", "Waiting for the second stable observation"
-              return "success", "Fresh Codex acceptance confirmed twice on the same head"
+              return "success", ("Clean Codex approval confirmed on current head" if proof["kind"] == "clean_codex"
+                                 else "Feedback handling verified by maintainer attestation")
 
 
           class APIBlocked(RuntimeError):
@@ -244,6 +469,66 @@ jobs:
                       cursors.add(cursor)
                   raise ValueError("Review thread pagination limit reached")
 
+              def privileged(self, user):
+                  if (not isinstance(user, dict) or user.get("type") != "User"
+                          or type(user.get("id")) is not int or not isinstance(user.get("login"), str)
+                          or not re.fullmatch(r"[A-Za-z0-9-]+", user["login"])):
+                      return False
+                  try:
+                      result = self.repo_call("collaborators/" + user["login"] + "/permission")
+                  except urllib.error.HTTPError as error:
+                      if error.code == 404:
+                          return False
+                      raise
+                  return ((result.get("user") or {}).get("id") == user["id"]
+                          and result.get("permission") in ("write", "maintain", "admin"))
+
+              def finding_dispositions(self, comments, inline, head, base, inventory,
+                                       completion_times, summary_updated, reviews):
+                  candidates = {}
+                  permissions = {}
+                  keys = {item["key"] for item in inventory}
+                  for comment, is_inline in [(c, True) for c in inline] + [(c, False) for c in comments]:
+                      if is_inline and not comment.get("in_reply_to_id"):
+                          continue
+                      targets = decision_targets(comment.get("body", ""), comment.get("in_reply_to_id") if is_inline else None) & keys
+                      if not targets:
+                          continue
+                      user = comment.get("user") or {}
+                      identity = (user.get("id"), user.get("login"), user.get("type"))
+                      if identity not in permissions:
+                          permissions[identity] = self.privileged(user)
+                      if permissions[identity]:
+                          for key in targets:
+                              candidates.setdefault(key, []).append(comment)
+                  result = {}
+                  for item in inventory:
+                      key = item["key"]
+                      if key not in candidates:
+                          continue
+                      newest = max(candidates[key], key=lambda c: c["id"])
+                      decision = {"id": newest["id"], "author": newest["user"]["id"], "valid": False,
+                                  "created": timestamp(newest.get("created_at")),
+                                  "digest": digest(review_evidence(newest))}
+                      result[key] = decision
+                      try:
+                          value = parse_decision(newest["body"])
+                          evidence = ([item["root"]] + [r for r in item["replies"]
+                                      if not r.get("body", "").startswith(DECISION_PREFIX)]
+                                      if "root" in item else [item.get("comment") or item["review"]])
+                          evidence += [review for review in reviews if bot(review)]
+                          changed = [max(timestamp(row[field]) for field in ("updated_at", "submitted_at", "created_at")
+                                         if row.get(field)) for row in evidence]
+                          decision["valid"] = (value["Head"] == head
+                              and value["Base"] == base["ref"] + "@" + base["sha"]
+                              and ("Finding" not in value if "root" in item else value.get("Finding") == key)
+                              and newest["created_at"] == newest["updated_at"]
+                              and bool(completion_times) and all(t is not None for t in completion_times)
+                              and decision["created"] > max(changed + completion_times + [timestamp(summary_updated)]))
+                      except (KeyError, TypeError, ValueError):
+                          pass
+                  return result
+
               def snapshot(self, number):
                   pr = self.repo_call(f"pulls/{number}")
                   head = pr["head"]["sha"]
@@ -276,6 +561,9 @@ jobs:
                           raise ValueError("Missing reviewed commit")
                       resolved = self.repo_call("commits/" + match[1])["sha"]
                       completed = completed and resolved == head and "**Completed**" in cells[2]
+                  structured = structured_review(summary, rows, head)
+                  if structured is not None:
+                      completed = completed and structured["completed"]
                   reactions = self.pages(f"issues/{number}/reactions")
                   reactions = [r for r in reactions if bot(r)]
                   inline = self.pages(f"pulls/{number}/comments")
@@ -295,7 +583,7 @@ jobs:
                           continue
                       if not (review["state"] == "CHANGES_REQUESTED"
                               or (review["state"] == "COMMENTED" and review.get("body", "").strip()
-                                  and "Didn't find any major issues" not in review["body"])):
+                                  and not is_clean_review_body(review["body"]))):
                           continue
                       associated = [c for c in codex_inline if c.get("pull_request_review_id") == review["id"]]
                       try:
@@ -310,6 +598,7 @@ jobs:
                   findings += [c["id"] for c in comments if trusted(c)
                                and not c["body"].startswith(MARKER)
                                and re.search(r"\bP[0-3] Badge\b", c["body"])]
+                  review_completed = bool(completed)
                   manual_evidence = None
                   if manual:
                       completions = []
@@ -322,7 +611,7 @@ jobs:
                           if len(commits) != 1 or comment["body"].count("**Reviewed commit:**") != 1:
                               raise ValueError("Ambiguous manual reviewed commit")
                           if self.repo_call("commits/" + commits[0])["sha"] == head:
-                              completions.append({"id": comment["id"], "digest": digest(comment),
+                              completions.append({"id": comment["id"], "digest": digest(review_evidence(comment)),
                                                   "created": timestamp(comment.get("created_at")),
                                                   "updated": timestamp(comment.get("updated_at"))})
                       if completed and any(value is None for value in completion_times):
@@ -333,6 +622,31 @@ jobs:
                                          "thumbs": {str(r["id"]): timestamp(r.get("created_at"))
                                                     for r in reactions if r["content"] == "+1"}}
                       completed = completed and bool(completions)
+                  inventory = []
+                  root_ids = {c.get("in_reply_to_id") or c["id"] for c in codex_inline}
+                  for identifier in sorted(root_ids):
+                      root = next(c for c in inline if c["id"] == identifier)
+                      replies = sorted((c for c in inline if c.get("in_reply_to_id") == identifier), key=lambda c: c["id"])
+                      inventory.append({"key": "inline:" + str(identifier), "root": review_evidence(root),
+                                        "resolved": threads[identifier], "replies": [review_evidence(c) for c in replies]})
+                  for comment in comments:
+                      if trusted(comment) and not comment["body"].startswith(MARKER) and re.search(r"\bP[0-3] Badge\b", comment["body"]):
+                          inventory.append({"key": "issue:" + str(comment["id"]), "comment": review_evidence(comment)})
+                  for review in reviews:
+                      if not bot(review):
+                          continue
+                      substantive = (review["state"] == "CHANGES_REQUESTED" or
+                                     (review["state"] == "COMMENTED" and review.get("body", "").strip()
+                                      and not is_clean_review_body(review["body"])))
+                      if substantive and not (is_finding_review_wrapper(review.get("body", ""))
+                                              and any(c.get("pull_request_review_id") == review["id"] for c in codex_inline)):
+                          inventory.append({"key": "review:" + str(review["id"]), "review": review_evidence(review)})
+                  inventory.sort(key=lambda item: item["key"])
+                  inventory_digest = digest(inventory)
+                  review_digest = digest([review_evidence(summary), [review_evidence(r) for r in
+                                          sorted((r for r in reviews if bot(r)), key=lambda r: r["id"])]])
+                  dispositions = self.finding_dispositions(comments, inline, head, base_identity(pr),
+                                                            inventory, completion_times, summary.get("updated_at"), reviews)
                   after = self.repo_call(f"pulls/{number}")
                   if (after["head"]["sha"] != head or base_identity(after) != base_identity(pr)
                           or after["state"] != "open" or after["draft"]):
@@ -340,14 +654,23 @@ jobs:
                   return {"head": head, "base": base_identity(pr), "eyes": any(r["content"] == "eyes" for r in reactions),
                           "thumbs": sorted(str(r["id"]) for r in reactions if r["content"] == "+1"),
                           "summary": digest([summary.get("id"), body, summary.get("updated_at")]),
-                          "completed": bool(completed), "findings": findings, "review_findings": review_findings,
-                          "failed": any("**Failed**" in row for row in rows), "manual": manual_evidence}
+                          "completed": bool(completed), "review_completed": review_completed, "findings": findings, "review_findings": review_findings,
+                          "failed": any("**Failed**" in row for row in rows), "manual": manual_evidence, "structured": structured,
+                          "inventory": inventory, "inventory_digest": inventory_digest, "review_digest": review_digest,
+                          "unresolved_threads": any(not threads[root] for root in root_ids),
+                          "dispositions": dispositions,
+                          **({"reaction_times": {str(r["id"]): timestamp(r.get("created_at"))
+                                                 for r in reactions if r["content"] == "+1"},
+                              "completed_at": max(completion_times), "earliest_completed_at": min(completion_times)}
+                             if completion_times and all(t is not None for t in completion_times) else {})}
 
 
           def publish(api, check_id, state, status, reason):
               payload = {"status": "completed" if status in ("success", "failure", "stale") else "in_progress",
                          "output": {"title": reason, "summary": "Report-only rollout. Not a required check.",
                                     "text": json.dumps(state, sort_keys=True)}}
+              if (state.get("proof") or {}).get("kind") == "verified_dispositions":
+                  payload["output"]["summary"] += " Feedback handling is maintainer-attested. This is not clean Codex approval."
               if payload["status"] == "completed":
                   payload["conclusion"] = "success" if status == "success" else "failure"
               previous = getattr(api, "last_publish", {})
@@ -464,6 +787,8 @@ jobs:
               if owned:
                   check = max(owned, key=lambda c: c["id"])
                   state = json.loads(check["output"]["text"])
+                  original_proof = state.get("proof")
+                  advance_floors(state, getattr(api, "disposition_floors", {}))
                   if state["version"] != 1 or state["head"] != head:
                       raise ValueError("Invalid saved observation")
                   if (check["conclusion"] in (None, "failure") and "initialized" not in state
@@ -491,22 +816,27 @@ jobs:
                       state = {"version": 1, "head": head, "base": base,
                                "started": now, "initialized": False}
                   elif check["conclusion"] == "success":
+                      renewed = dict(state, started=now, candidate_at=now - INTERVAL)
                       try:
                           snapshot = api.snapshot(number)
-                          renewed = dict(state, started=now, candidate_at=now - INTERVAL)
                           status, reason = observe(renewed, snapshot, now)
-                          if status == "success":
+                          if status == "success" and original_proof == renewed.get("proof"):
                               return
-                          state = initialize(snapshot, now)
+                          state = initialize(snapshot, now) | {
+                              key: renewed[key] for key in ("disposition_floors", "manual_since", "manual_active")
+                              if key in renewed}
+                          state["head"], state["base"] = head, base
                       except APIBlocked:
                           raise
                       except Exception:
-                          state["started"] = now
+                          state = renewed
+                          state.pop("proof", None)
                           state["candidate"] = state["candidate_at"] = None
                   if check["conclusion"] is None:
                       check_id = check["id"]
               else:
                   state = {"version": 1, "head": head, "base": base, "started": now, "initialized": False}
+              advance_floors(state, getattr(api, "disposition_floors", {}))
               if check_id is None:
                   check = api.repo_call("check-runs", {"name": CHECK, "head_sha": head,
                                         "external_id": external, "status": "in_progress",
@@ -517,11 +847,13 @@ jobs:
                   try:
                       snapshot = api.snapshot(number)
                       if snapshot["head"] != head or snapshot["base"] != base:
+                          state.pop("proof", None)
                           status, reason = "stale", "PR head or base changed; observation stopped"
                       else:
                           if state.get("initialized") is False:
                               state = initialize(snapshot, state["started"],
-                                                 observed_since=state.get("observed_since", state["started"]))
+                                                 observed_since=state.get("observed_since", state["started"])) | {
+                                                     "disposition_floors": state.get("disposition_floors", {})}
                           status, reason = observe(state, snapshot, clock())
                       publish(api, check_id, state, status, reason)
                       print(status + ": " + reason, flush=True)
@@ -531,6 +863,7 @@ jobs:
                       raise
                   except Exception as error:
                       # Do not log response bodies, credentials, or untrusted PR content.
+                      state.pop("proof", None)
                       state["candidate"] = state["candidate_at"] = None
                       reason = "Evidence unavailable: " + type(error).__name__
                       status = "failure" if clock() - state["started"] >= TIMEOUT else "pending"
@@ -542,7 +875,7 @@ jobs:
 
 
           def main():
-              if os.environ["GITHUB_EVENT_NAME"] not in ("pull_request_target", "issue_comment", "workflow_dispatch"):
+              if os.environ["GITHUB_EVENT_NAME"] not in ("pull_request_target", "issue_comment", "pull_request_review_comment", "workflow_dispatch"):
                   raise ValueError("Unsupported caller event")
               api = GitHub(os.environ["GITHUB_TOKEN"], os.environ["GITHUB_REPOSITORY"])
               with open(os.environ["GITHUB_EVENT_PATH"]) as event_file:
@@ -552,9 +885,18 @@ jobs:
                            or event.get("inputs", {}).get("pr", 0))
               if number <= 0:
                   raise ValueError("Missing PR number")
-              if os.environ["GITHUB_EVENT_NAME"] == "issue_comment":
-                  if not event["issue"].get("pull_request") or not trusted(event["comment"]):
+              if os.environ["GITHUB_EVENT_NAME"] in ("issue_comment", "pull_request_review_comment"):
+                  if os.environ["GITHUB_EVENT_NAME"] == "issue_comment" and not event["issue"].get("pull_request"):
                       return
+                  comment = event["comment"]
+                  if not trusted(comment):
+                      previous = event.get("changes", {}).get("body", {}).get("from", "")
+                      bodies = [comment.get("body", ""), previous]
+                      if (not any(body.startswith(DECISION_PREFIX) for body in bodies)
+                              or not api.privileged(event.get("sender")) or not api.privileged(comment.get("user"))):
+                          return
+                      api.disposition_floors = {key: comment["id"] for body in bodies
+                                                for key in decision_targets(body, comment.get("in_reply_to_id"))}
               run(api, number)
 
 
