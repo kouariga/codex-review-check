@@ -34,6 +34,16 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
+def review_evidence(value):
+    fields = ("id", "body", "created_at", "updated_at", "submitted_at", "state",
+              "commit_id", "original_commit_id", "in_reply_to_id", "pull_request_review_id",
+              "path", "line", "original_line", "start_line", "original_start_line",
+              "side", "start_side", "diff_hunk", "subject_type")
+    return {**{field: value.get(field) for field in fields},
+            "user": {"id": (value.get("user") or {}).get("id")},
+            "performed_via_github_app": {"id": (value.get("performed_via_github_app") or {}).get("id")}}
+
+
 def base_identity(pr):
     return {"ref": pr["base"]["ref"], "sha": pr["base"]["sha"]}
 
@@ -395,7 +405,7 @@ class GitHub:
             return None
         newest = max(candidates, key=lambda c: (timestamp(c.get("created_at")), c["id"]))
         result = {"id": newest["id"], "author": newest["user"]["id"], "valid": False,
-                  "created": timestamp(newest.get("created_at")), "digest": digest(newest)}
+                  "created": timestamp(newest.get("created_at")), "digest": digest(review_evidence(newest))}
         try:
             body = newest["body"]
             if body.count(DISPOSITIONS) != 1:
@@ -512,7 +522,7 @@ class GitHub:
                 if len(commits) != 1 or comment["body"].count("**Reviewed commit:**") != 1:
                     raise ValueError("Ambiguous manual reviewed commit")
                 if self.repo_call("commits/" + commits[0])["sha"] == head:
-                    completions.append({"id": comment["id"], "digest": digest(comment),
+                    completions.append({"id": comment["id"], "digest": digest(review_evidence(comment)),
                                         "created": timestamp(comment.get("created_at")),
                                         "updated": timestamp(comment.get("updated_at"))})
             if completed and any(value is None for value in completion_times):
@@ -528,11 +538,11 @@ class GitHub:
         for identifier in sorted(root_ids):
             root = next(c for c in inline if c["id"] == identifier)
             replies = sorted((c for c in inline if c.get("in_reply_to_id") == identifier), key=lambda c: c["id"])
-            inventory.append({"key": "inline:" + str(identifier), "root": root,
-                              "resolved": threads[identifier], "replies": replies})
+            inventory.append({"key": "inline:" + str(identifier), "root": review_evidence(root),
+                              "resolved": threads[identifier], "replies": [review_evidence(c) for c in replies]})
         for comment in comments:
             if trusted(comment) and not comment["body"].startswith(MARKER) and re.search(r"\bP[0-3] Badge\b", comment["body"]):
-                inventory.append({"key": "issue:" + str(comment["id"]), "comment": comment})
+                inventory.append({"key": "issue:" + str(comment["id"]), "comment": review_evidence(comment)})
         for review in reviews:
             if not bot(review):
                 continue
@@ -541,10 +551,11 @@ class GitHub:
                             and not is_clean_review_body(review["body"])))
             if substantive and not (is_finding_review_wrapper(review.get("body", ""))
                                     and any(c.get("pull_request_review_id") == review["id"] for c in codex_inline)):
-                inventory.append({"key": "review:" + str(review["id"]), "review": review})
+                inventory.append({"key": "review:" + str(review["id"]), "review": review_evidence(review)})
         inventory.sort(key=lambda item: item["key"])
         inventory_digest = digest(inventory)
-        review_digest = digest([summary, sorted((r for r in reviews if bot(r)), key=lambda r: r["id"])])
+        review_digest = digest([review_evidence(summary), [review_evidence(r) for r in
+                                sorted((r for r in reviews if bot(r)), key=lambda r: r["id"])]])
         receipt = self.disposition_receipt(number, comments, head, base_identity(pr),
                                            review_digest, inventory_digest, inventory, completion_times,
                                            summary.get("updated_at"))

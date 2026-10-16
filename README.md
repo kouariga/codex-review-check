@@ -146,6 +146,20 @@ findings. Recognized boilerplate reviews with inline roots are bound in the revi
 without requiring a duplicate disposition. The review digest binds the trusted
 summary identity, body, update time, and bot review submissions.
 
+Comment and review fingerprints use a canonical evidence projection. It includes
+`id`, `body`, `created_at`, `updated_at`, `submitted_at`, `state`, `commit_id`,
+`original_commit_id`, `in_reply_to_id`, `pull_request_review_id`, `path`, `line`,
+`original_line`, `start_line`, `original_start_line`, `side`, `start_side`,
+`diff_hunk`, `subject_type`, and immutable user and performed-app IDs. Missing
+fields are normalized to null. The same projection binds inventory rows, review
+submissions, the summary, clean completion comments, and the receipt identity.
+Thread resolution remains part of the inventory fingerprint. Profile metadata,
+login names, URLs, reaction counters, and viewer-dependent `author_association`
+are excluded. A snapshot collected with a user's token therefore produces the
+same evidence fingerprints as the workflow's token for the same review content.
+The read-only `snapshot` command exports this canonical inventory. Identity and
+collaborator permission checks still use the original API responses.
+
 The receipt author must have account type `User`. The collaborator permission
 endpoint must currently grant write, maintain, or admin and return the same
 immutable user ID. Login spelling and author association cannot authorize a

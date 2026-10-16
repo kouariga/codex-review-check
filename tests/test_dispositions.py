@@ -199,6 +199,64 @@ class DispositionTests(unittest.TestCase):
         self.assertEqual(state['proof']['author'], 42)
         self.assertEqual(state['proof']['receipt'], 101)
 
+    def test_receipt_survives_token_view_metadata_changes(self):
+        self.receipt()
+        before = self.api.snapshot(1)
+        state = gate.initialize(before, 120)
+        self.assertEqual(gate.observe(state, before, 120)[0], 'pending')
+        for row in self.comments + self.inline + self.reviews:
+            row['author_association'] = 'MEMBER'
+            row['reactions'] = {'total_count': 12, '+1': 10}
+            row['html_url'] = 'https://example.test/viewer-specific'
+            row['user'].update(login='renamed', avatar_url='new-avatar',
+                               user_view_type='private', site_admin=True)
+            if row.get('performed_via_github_app'):
+                row['performed_via_github_app'].update(slug='renamed-app', description='New profile')
+        after = self.api.snapshot(1)
+        self.assertEqual(after['inventory'], before['inventory'])
+        self.assertEqual(after['inventory_digest'], before['inventory_digest'])
+        self.assertEqual(after['review_digest'], before['review_digest'])
+        self.assertEqual(after['disposition_receipt'], before['disposition_receipt'])
+        self.assertEqual(gate.observe(state, after, 150),
+                         ('success', 'Feedback handling verified by maintainer attestation'))
+
+    def test_every_semantic_comment_field_invalidates_bound_inventory(self):
+        self.receipt()
+        fields = ('id', 'body', 'created_at', 'updated_at', 'submitted_at', 'state',
+                  'commit_id', 'original_commit_id', 'in_reply_to_id', 'pull_request_review_id',
+                  'path', 'line', 'original_line', 'start_line', 'original_start_line',
+                  'side', 'start_side', 'diff_hunk', 'subject_type')
+        for field in fields:
+            with self.subTest(field=field):
+                original = copy.deepcopy(self.inline[1])
+                self.inline[1][field] = 999 if field == 'id' else 'changed'
+                self.assertFalse(self.api.snapshot(1)['disposition_receipt']['valid'])
+                self.inline[1] = original
+        for field in ('user', 'performed_via_github_app'):
+            with self.subTest(field=field):
+                original = copy.deepcopy(self.inline[1])
+                self.inline[1][field] = {'id': 999}
+                self.assertFalse(self.api.snapshot(1)['disposition_receipt']['valid'])
+                self.inline[1] = original
+
+    def test_summary_and_review_semantics_remain_bound(self):
+        self.receipt()
+        for row, field, changed in [(self.comments[0], 'id', 999),
+                                    (self.comments[0], 'updated_at', iso(101)),
+                                    (self.reviews[0], 'submitted_at', iso(51)),
+                                    (self.reviews[0], 'commit_id', 'c' * 40),
+                                    (self.reviews[0], 'state', 'DISMISSED')]:
+            with self.subTest(field=field):
+                original = row[field]
+                row[field] = changed
+                self.assertFalse(self.api.snapshot(1)['disposition_receipt']['valid'])
+                row[field] = original
+
+    def test_missing_and_null_semantic_fields_have_same_projection(self):
+        self.assertEqual(gate.review_evidence({'id': 1}),
+                         gate.review_evidence({'id': 1, 'path': None, 'user': None,
+                                               'performed_via_github_app': None}))
+
     def test_justified_wont_fix_is_explicit_attestation(self):
         self.receipt(outcome='wont_fix')
         self.assertEqual(self.verdict()[2][0], 'success')
