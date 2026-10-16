@@ -18,7 +18,7 @@ CHECK = "codex-cloud-review"
 INTERVAL = 30
 TIMEOUT = 1200
 MARKER = "<!-- codex-pull-request-review-summary -->"
-DISPOSITIONS = "<!-- codex-review-dispositions:v1 "
+DECISION_PREFIX = "Codex review:"
 
 
 def bot(value):
@@ -100,6 +100,51 @@ def unique_object(pairs):
         result[key] = value
     return result
 
+
+
+def decision_targets(body, root=None):
+    if not body.startswith(DECISION_PREFIX):
+        return set()
+    if root is not None:
+        return {"inline:" + str(root)}
+    targets = re.findall(r"^Finding: ((?:issue|review):[1-9][0-9]*)$", body, re.MULTILINE)
+    return set(targets)
+
+
+def parse_decision(body):
+    lines = body.splitlines()
+    outcomes = {"Codex review: fixed": "fixed", "Codex review: won't-fix": "wont_fix",
+                "Codex review: wont-fix": "wont_fix"}
+    if not lines or lines[0] not in outcomes:
+        raise ValueError("Unknown disposition")
+    fields, current = {}, None
+    for line in lines[1:]:
+        match = re.fullmatch(r"(Head|Base|Finding|Reason|Evidence):\s*(.*)", line)
+        if match:
+            current, value = match.groups()
+            if current in fields:
+                raise ValueError("Duplicate disposition field")
+            fields[current] = value
+        elif not line.strip():
+            continue
+        elif current in ("Reason", "Evidence"):
+            fields[current] += "\n" + line
+        else:
+            raise ValueError("Unknown disposition field")
+    if (not {"Head", "Base", "Reason", "Evidence"}.issubset(fields)
+            or any(not fields[key].strip() for key in ("Reason", "Evidence"))
+            or not re.fullmatch(r"[0-9a-f]{40}", fields["Head"])
+            or not re.fullmatch(r".+@[0-9a-f]{40}", fields["Base"])):
+        raise ValueError("Incomplete disposition")
+    return {"outcome": outcomes[lines[0]], **fields}
+
+
+def advance_floors(state, additions):
+    if not additions:
+        return
+    floors = state.setdefault("disposition_floors", {})
+    for key, identifier in additions.items():
+        floors[key] = max(floors.get(key, 0), identifier)
 
 def structured_review(summary, rows, head):
     body = summary.get("body", "")
@@ -262,13 +307,18 @@ def observe(state, snapshot, now):
     proof = None
     if lifecycle_valid and clean:
         proof = {"kind": "clean_codex", "digest": digest([snapshot["summary"], fresh, manual_proof])}
-    receipt = snapshot.get("disposition_receipt")
-    state["receipt_floor"] = max(state.get("receipt_floor", 0), receipt["id"] if receipt else 0)
-    if proof is None and lifecycle_valid and not snapshot.get("unresolved_threads", False) and receipt:
-        if (receipt["valid"] and receipt["id"] == state["receipt_floor"]
-                and state.get("manual_since", float("-inf")) < receipt["created"] <= now):
-            proof = {"kind": "verified_dispositions", "receipt": receipt["id"],
-                     "author": receipt["author"], "digest": receipt["digest"]}
+    dispositions = snapshot.get("dispositions", {})
+    advance_floors(state, {key: value["id"] for key, value in dispositions.items()})
+    keys = {item["key"] for item in snapshot.get("inventory", [])}
+    verified = bool(keys) and keys == set(dispositions) and all(
+        value["valid"] and value["id"] == state["disposition_floors"].get(key)
+        and state.get("manual_since", float("-inf")) < value["created"] <= now
+        for key, value in dispositions.items())
+    if proof is None and lifecycle_valid and not snapshot.get("unresolved_threads", False) and verified:
+        replies = [{"finding": key, "id": dispositions[key]["id"],
+                    "author": dispositions[key]["author"], "digest": dispositions[key]["digest"]}
+                   for key in sorted(dispositions)]
+        proof = {"kind": "verified_dispositions", "replies": replies, "digest": digest(replies)}
     if proof is None or not lifecycle_valid:
         state["candidate"] = state["candidate_at"] = None
         reason = "Waiting for fresh trusted reaction and completed current-head review"
@@ -276,8 +326,8 @@ def observe(state, snapshot, now):
             reason = "Codex findings remain; waiting for resolution and a fresh clean review"
         if snapshot.get("review_completed", snapshot["completed"]) and snapshot.get("inventory") and not snapshot.get("unresolved_threads", False):
             reason = "Review completed; waiting for verified feedback handling or clean Codex approval"
-        if receipt and not receipt["valid"]:
-            reason = "Latest feedback verification receipt is invalid; waiting for current evidence"
+        if dispositions and not verified:
+            reason = "Every finding needs a valid current fixed or won’t-fix decision"
         if not snapshot.get("review_completed", snapshot["completed"]) or snapshot["eyes"]:
             reason = "Codex review in progress; acceptance is pending"
         if snapshot["failed"]:
@@ -397,47 +447,50 @@ class GitHub:
         return ((result.get("user") or {}).get("id") == user["id"]
                 and result.get("permission") in ("write", "maintain", "admin"))
 
-    def disposition_receipt(self, number, comments, head, base, review, inventory_digest,
-                            inventory, completion_times, summary_updated):
-        candidates = [c for c in comments if c.get("body", "").startswith(DISPOSITIONS)
-                      and self.privileged(c.get("user"))]
-        if not candidates:
-            return None
-        newest = max(candidates, key=lambda c: (timestamp(c.get("created_at")), c["id"]))
-        result = {"id": newest["id"], "author": newest["user"]["id"], "valid": False,
-                  "created": timestamp(newest.get("created_at")), "digest": digest(review_evidence(newest))}
-        try:
-            body = newest["body"]
-            if body.count(DISPOSITIONS) != 1:
-                return result
-            end = body.index(" -->", len(DISPOSITIONS))
-            value = json.loads(body[len(DISPOSITIONS):end], object_pairs_hook=unique_object)
-            fields = {"version", "repository", "pr", "head", "base", "review", "inventory", "dispositions"}
-            if (not isinstance(value, dict) or set(value) != fields
-                    or type(value["version"]) is not int or value["version"] != 1
-                    or value["repository"] != self.repo or type(value["pr"]) is not int or value["pr"] != number
-                    or value["head"] != head or value["base"] != base or value["review"] != review
-                    or value["inventory"] != inventory_digest
-                    or newest["created_at"] != newest["updated_at"]
-                    or not completion_times or any(t is None for t in completion_times)
-                    or result["created"] <= max(max(completion_times), timestamp(summary_updated))):
-                return result
-            dispositions = value["dispositions"]
-            if not isinstance(dispositions, list) or not dispositions:
-                return result
-            keys = []
-            for item in dispositions:
-                if (not isinstance(item, dict) or set(item) != {"finding", "outcome", "rationale", "evidence"}
-                        or not isinstance(item["finding"], str)
-                        or item["outcome"] not in ("fixed", "wont_fix")
-                        or not isinstance(item["rationale"], str) or not item["rationale"].strip()
-                        or not isinstance(item["evidence"], list) or not item["evidence"]
-                        or any(not isinstance(e, str) or not e.strip() for e in item["evidence"])):
-                    return result
-                keys.append(item["finding"])
-            result["valid"] = len(keys) == len(set(keys)) and set(keys) == {i["key"] for i in inventory}
-        except (KeyError, TypeError, ValueError):
-            pass
+    def finding_dispositions(self, comments, inline, head, base, inventory,
+                             completion_times, summary_updated, reviews):
+        candidates = {}
+        permissions = {}
+        keys = {item["key"] for item in inventory}
+        for comment, is_inline in [(c, True) for c in inline] + [(c, False) for c in comments]:
+            if is_inline and not comment.get("in_reply_to_id"):
+                continue
+            targets = decision_targets(comment.get("body", ""), comment.get("in_reply_to_id") if is_inline else None) & keys
+            if not targets:
+                continue
+            user = comment.get("user") or {}
+            identity = (user.get("id"), user.get("login"), user.get("type"))
+            if identity not in permissions:
+                permissions[identity] = self.privileged(user)
+            if permissions[identity]:
+                for key in targets:
+                    candidates.setdefault(key, []).append(comment)
+        result = {}
+        for item in inventory:
+            key = item["key"]
+            if key not in candidates:
+                continue
+            newest = max(candidates[key], key=lambda c: c["id"])
+            decision = {"id": newest["id"], "author": newest["user"]["id"], "valid": False,
+                        "created": timestamp(newest.get("created_at")),
+                        "digest": digest(review_evidence(newest))}
+            result[key] = decision
+            try:
+                value = parse_decision(newest["body"])
+                evidence = ([item["root"]] + [r for r in item["replies"]
+                            if not r.get("body", "").startswith(DECISION_PREFIX)]
+                            if "root" in item else [item.get("comment") or item["review"]])
+                evidence += [review for review in reviews if bot(review)]
+                changed = [max(timestamp(row[field]) for field in ("updated_at", "submitted_at", "created_at")
+                               if row.get(field)) for row in evidence]
+                decision["valid"] = (value["Head"] == head
+                    and value["Base"] == base["ref"] + "@" + base["sha"]
+                    and ("Finding" not in value if "root" in item else value.get("Finding") == key)
+                    and newest["created_at"] == newest["updated_at"]
+                    and bool(completion_times) and all(t is not None for t in completion_times)
+                    and decision["created"] > max(changed + completion_times + [timestamp(summary_updated)]))
+            except (KeyError, TypeError, ValueError):
+                pass
         return result
 
     def snapshot(self, number):
@@ -556,9 +609,8 @@ class GitHub:
         inventory_digest = digest(inventory)
         review_digest = digest([review_evidence(summary), [review_evidence(r) for r in
                                 sorted((r for r in reviews if bot(r)), key=lambda r: r["id"])]])
-        receipt = self.disposition_receipt(number, comments, head, base_identity(pr),
-                                           review_digest, inventory_digest, inventory, completion_times,
-                                           summary.get("updated_at"))
+        dispositions = self.finding_dispositions(comments, inline, head, base_identity(pr),
+                                                  inventory, completion_times, summary.get("updated_at"), reviews)
         after = self.repo_call(f"pulls/{number}")
         if (after["head"]["sha"] != head or base_identity(after) != base_identity(pr)
                 or after["state"] != "open" or after["draft"]):
@@ -570,7 +622,7 @@ class GitHub:
                 "failed": any("**Failed**" in row for row in rows), "manual": manual_evidence, "structured": structured,
                 "inventory": inventory, "inventory_digest": inventory_digest, "review_digest": review_digest,
                 "unresolved_threads": any(not threads[root] for root in root_ids),
-                "disposition_receipt": receipt,
+                "dispositions": dispositions,
                 **({"reaction_times": {str(r["id"]): timestamp(r.get("created_at"))
                                        for r in reactions if r["content"] == "+1"},
                     "completed_at": max(completion_times), "earliest_completed_at": min(completion_times)}
@@ -700,8 +752,7 @@ def run(api, number, clock=time.time, sleep=time.sleep):
         check = max(owned, key=lambda c: c["id"])
         state = json.loads(check["output"]["text"])
         original_proof = state.get("proof")
-        if getattr(api, "receipt_floor", 0):
-            state["receipt_floor"] = max(state.get("receipt_floor", 0), api.receipt_floor)
+        advance_floors(state, getattr(api, "disposition_floors", {}))
         if state["version"] != 1 or state["head"] != head:
             raise ValueError("Invalid saved observation")
         if (check["conclusion"] in (None, "failure") and "initialized" not in state
@@ -736,7 +787,7 @@ def run(api, number, clock=time.time, sleep=time.sleep):
                 if status == "success" and original_proof == renewed.get("proof"):
                     return
                 state = initialize(snapshot, now) | {
-                    key: renewed[key] for key in ("receipt_floor", "manual_since", "manual_active")
+                    key: renewed[key] for key in ("disposition_floors", "manual_since", "manual_active")
                     if key in renewed}
                 state["head"], state["base"] = head, base
             except APIBlocked:
@@ -749,7 +800,7 @@ def run(api, number, clock=time.time, sleep=time.sleep):
             check_id = check["id"]
     else:
         state = {"version": 1, "head": head, "base": base, "started": now, "initialized": False}
-    state["receipt_floor"] = max(state.get("receipt_floor", 0), getattr(api, "receipt_floor", 0))
+    advance_floors(state, getattr(api, "disposition_floors", {}))
     if check_id is None:
         check = api.repo_call("check-runs", {"name": CHECK, "head_sha": head,
                               "external_id": external, "status": "in_progress",
@@ -766,7 +817,7 @@ def run(api, number, clock=time.time, sleep=time.sleep):
                 if state.get("initialized") is False:
                     state = initialize(snapshot, state["started"],
                                        observed_since=state.get("observed_since", state["started"])) | {
-                                           "receipt_floor": state.get("receipt_floor", 0)}
+                                           "disposition_floors": state.get("disposition_floors", {})}
                 status, reason = observe(state, snapshot, clock())
             publish(api, check_id, state, status, reason)
             print(status + ": " + reason, flush=True)
@@ -788,7 +839,7 @@ def run(api, number, clock=time.time, sleep=time.sleep):
 
 
 def main():
-    if os.environ["GITHUB_EVENT_NAME"] not in ("pull_request_target", "issue_comment", "workflow_dispatch"):
+    if os.environ["GITHUB_EVENT_NAME"] not in ("pull_request_target", "issue_comment", "pull_request_review_comment", "workflow_dispatch"):
         raise ValueError("Unsupported caller event")
     api = GitHub(os.environ["GITHUB_TOKEN"], os.environ["GITHUB_REPOSITORY"])
     with open(os.environ["GITHUB_EVENT_PATH"]) as event_file:
@@ -798,15 +849,18 @@ def main():
                  or event.get("inputs", {}).get("pr", 0))
     if number <= 0:
         raise ValueError("Missing PR number")
-    if os.environ["GITHUB_EVENT_NAME"] == "issue_comment":
-        if not event["issue"].get("pull_request"):
+    if os.environ["GITHUB_EVENT_NAME"] in ("issue_comment", "pull_request_review_comment"):
+        if os.environ["GITHUB_EVENT_NAME"] == "issue_comment" and not event["issue"].get("pull_request"):
             return
-        if not trusted(event["comment"]):
+        comment = event["comment"]
+        if not trusted(comment):
             previous = event.get("changes", {}).get("body", {}).get("from", "")
-            if (not (event["comment"].get("body", "").startswith(DISPOSITIONS) or previous.startswith(DISPOSITIONS))
-                    or not api.privileged(event.get("sender"))):
+            bodies = [comment.get("body", ""), previous]
+            if (not any(body.startswith(DECISION_PREFIX) for body in bodies)
+                    or not api.privileged(event.get("sender")) or not api.privileged(comment.get("user"))):
                 return
-            api.receipt_floor = event["comment"]["id"]
+            api.disposition_floors = {key: comment["id"] for body in bodies
+                                      for key in decision_targets(body, comment.get("in_reply_to_id"))}
     run(api, number)
 
 
