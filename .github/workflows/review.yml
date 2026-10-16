@@ -73,6 +73,68 @@ jobs:
               return datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
 
 
+          def structured_review(summary, rows, head):
+              body = summary.get("body", "")
+              if "codex-review-state:" not in body:
+                  return None
+              markers = re.findall(r"<!-- codex-review-state:v1 (.*?) -->", body)
+              if len(markers) != 1 or body.count("codex-review-state:") != 1:
+                  raise ValueError("Ambiguous structured review marker")
+
+              def unique_object(pairs):
+                  result = {}
+                  for key, value in pairs:
+                      if key in result:
+                          raise ValueError("Duplicate structured review field")
+                      result[key] = value
+                  return result
+
+              value = json.loads(markers[0], object_pairs_hook=unique_object)
+              names = {"code_review": "**Code Review**", "security_review": "**Security Review**"}
+              if not isinstance(value, dict) or set(value) != set(names):
+                  raise ValueError("Unknown structured review fields")
+              fields = {"commit_sha", "has_any_findings", "has_unresolved_findings", "status"}
+              statuses = {"completed": "Completed", "running": "Running", "queued": "Queued",
+                          "pending": "Pending", "failed": "Failed"}
+              completions, reviews, active, failed, unresolved = [], {}, False, False, False
+              for kind, label in names.items():
+                  review = value[kind]
+                  matching = [row.split("|") for row in rows if label in row.split("|")[1]]
+                  if not isinstance(review, dict) or set(review) != fields:
+                      raise ValueError("Unknown structured review shape")
+                  if all(item is None for item in review.values()):
+                      if kind == "code_review" or matching:
+                          raise ValueError("Missing structured review")
+                      continue
+                  status = review["status"]
+                  findings_valid = all(type(review[field]) is bool or
+                                       (status != "completed" and review[field] is None)
+                                       for field in ("has_any_findings", "has_unresolved_findings"))
+                  if (not isinstance(review["commit_sha"], str)
+                          or not re.fullmatch(r"[0-9a-f]{40}", review["commit_sha"])
+                          or review["commit_sha"] != head or status not in statuses
+                          or not findings_valid
+                          or (review["has_unresolved_findings"] and not review["has_any_findings"])
+                          or len(matching) != 1
+                          or re.findall(r"\*\*([^*]+)\*\*", matching[0][2]) != [statuses[status]]):
+                      raise ValueError("Contradictory structured review")
+                  completed_at = None
+                  if status == "completed":
+                      times = re.findall(r'<relative-time datetime="([^"<>]+)">', matching[0][2])
+                      if len(times) != 1:
+                          raise ValueError("Missing structured completion timestamp")
+                      completed_at = timestamp(times[0])
+                      completions.append(completed_at)
+                  reviews[kind] = {"status": status, "completed_at": completed_at, "digest": digest(review)}
+                  active = active or status != "completed"
+                  failed = failed or status == "failed"
+                  unresolved = unresolved or review["has_unresolved_findings"]
+              return {"digest": digest(value), "reviews": reviews, "completed_at": min(completions) if completions else None,
+                      "latest_completed_at": max(completions) if completions else None,
+                      "summary_updated": timestamp(summary.get("updated_at")),
+                      "completed": not active, "failed": failed, "unresolved": unresolved}
+
+
           def initialize(snapshot, now, observed_since=None):
               return {"version": 1, "head": snapshot["head"], "base": snapshot["base"], "started": now,
                       "baseline": snapshot["thumbs"], "baseline_summary": snapshot["summary"],
@@ -96,18 +158,50 @@ jobs:
               changed_summary = snapshot["summary"] != state["baseline_summary"]
               manual = snapshot.get("manual")
               manual_proof = None
+              structured = snapshot.get("structured")
+              structured_proof = None
+              if structured is not None and "structured_since" not in state:
+                  origin = max(state.get("observed_since", state["started"]),
+                               state.get("manual_since", state.get("observed_since", state["started"])))
+                  state["structured_since"] = dict.fromkeys(("code_review", "security_review"), origin)
+                  state["structured_active"] = {}
+              if "structured_since" in state:
+                  if snapshot["eyes"] and not state.get("structured_eyes", False):
+                      state["structured_since"] = dict.fromkeys(state["structured_since"], now)
+                  state["structured_eyes"] = snapshot["eyes"]
+              if structured is not None:
+                  for kind, review in structured["reviews"].items():
+                      if review["status"] != "completed":
+                          if state["structured_active"].get(kind) != review["digest"]:
+                              state["structured_since"][kind] = now
+                              state["structured_active"][kind] = review["digest"]
+                      else:
+                          state["structured_active"].pop(kind, None)
               if not snapshot["completed"] or snapshot["eyes"] or snapshot["failed"]:
                   active = digest([snapshot["summary"], snapshot["completed"],
                                    snapshot["eyes"], snapshot["failed"]])
                   if state.get("manual_active") != active:
                       state["manual_since"] = now
                       state["manual_active"] = active
+                      if structured is None and "structured_since" in state:
+                          state["structured_since"] = dict.fromkeys(state["structured_since"], now)
                   state["manual_recovery"] = False
                   if manual is not None:
                       state["manual_baseline"] = [c["id"] for c in manual["comments"]]
               elif "manual_active" in state:
                   del state["manual_active"]
-              if manual is not None:
+              if structured is not None:
+                  completed_at = structured["completed_at"]
+                  if (structured["completed"] and not structured["unresolved"]
+                          and not state["structured_active"]
+                          and all(review["status"] == "completed"
+                                  and state["structured_since"][kind] < review["completed_at"] <= now
+                                  for kind, review in structured["reviews"].items())
+                          and completed_at is not None and completed_at <= now
+                          and completed_at <= structured["latest_completed_at"] <= now
+                          and math.floor(structured["latest_completed_at"]) <= structured["summary_updated"] <= now):
+                      structured_proof = structured
+              if manual is not None and structured is None:
                   if "manual_baseline" not in state:
                       state["manual_baseline"] = [c["id"] for c in manual["comments"]]
                       state["manual_recovery"] = False
@@ -131,23 +225,28 @@ jobs:
                   changed_summary = bool(manual_proof)
               findings = list(snapshot["findings"])
               for review in snapshot.get("review_findings", []):
-                  if not (manual_proof and review["resolved_threads"]
+                  superseded_at = (structured_proof["completed_at"] if structured_proof
+                                   else manual_proof[0]["created"] if manual_proof else None)
+                  if not (superseded_at is not None and review["resolved_threads"]
                           and review["submitted"] is not None
-                          and review["submitted"] < manual_proof[0]["created"]):
+                          and review["submitted"] < superseded_at):
                       findings.append(review["id"])
               clean = (snapshot["completed"] and not findings
-                       and not snapshot["eyes"] and fresh
-                       and (state["eyes"] or changed_summary))
+                       and not snapshot["eyes"]
+                       and (bool(structured_proof) if structured is not None
+                            else bool(fresh) and (state["eyes"] or changed_summary)))
               if not clean or snapshot["failed"]:
                   state["candidate"] = state["candidate_at"] = None
-                  reason = "Waiting for fresh trusted reaction and completed current-head review"
+                  reason = ("Waiting for fresh completed structured review evidence" if structured is not None
+                            else "Waiting for fresh trusted reaction and completed current-head review")
                   if findings:
                       reason = "Codex findings remain; waiting for resolution and a fresh clean review"
                   if snapshot["failed"]:
                       return "failure", "Codex review failed; no automatic retry is requested"
                   return "pending", reason
               evidence = [snapshot["head"], snapshot["base"], snapshot["summary"], fresh]
-              candidate = digest(evidence + [manual_proof] if manual is not None else evidence)
+              candidate = digest(evidence + [structured_proof] if structured is not None else
+                                 evidence + [manual_proof] if manual is not None else evidence)
               if state["candidate"] != candidate:
                   state["candidate"], state["candidate_at"] = candidate, now
                   return "pending", "Clean evidence observed; confirming again after 30 seconds"
@@ -276,6 +375,9 @@ jobs:
                           raise ValueError("Missing reviewed commit")
                       resolved = self.repo_call("commits/" + match[1])["sha"]
                       completed = completed and resolved == head and "**Completed**" in cells[2]
+                  structured = structured_review(summary, rows, head)
+                  if structured is not None:
+                      completed = completed and structured["completed"]
                   reactions = self.pages(f"issues/{number}/reactions")
                   reactions = [r for r in reactions if bot(r)]
                   inline = self.pages(f"pulls/{number}/comments")
@@ -311,7 +413,7 @@ jobs:
                                and not c["body"].startswith(MARKER)
                                and re.search(r"\bP[0-3] Badge\b", c["body"])]
                   manual_evidence = None
-                  if manual:
+                  if manual and structured is None:
                       completions = []
                       for comment in comments:
                           if not trusted(comment) or not comment["body"].startswith(
@@ -341,7 +443,7 @@ jobs:
                           "thumbs": sorted(str(r["id"]) for r in reactions if r["content"] == "+1"),
                           "summary": digest([summary.get("id"), body, summary.get("updated_at")]),
                           "completed": bool(completed), "findings": findings, "review_findings": review_findings,
-                          "failed": any("**Failed**" in row for row in rows), "manual": manual_evidence}
+                          "failed": any("**Failed**" in row for row in rows), "manual": manual_evidence, "structured": structured}
 
 
           def publish(api, check_id, state, status, reason):

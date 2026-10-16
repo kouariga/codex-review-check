@@ -42,8 +42,10 @@ Every 30 seconds, for at most 20 minutes, observe trusted Codex metadata:
   current full head SHA; no unresolved Codex review threads.
 - The same target branch and base revision throughout observation. Retargeting
   or base advancement invalidates persisted acceptance on the next observation.
-- A thumbs-up reaction ID absent from the initial baseline and no active eyes.
-- Eyes observed during this lifecycle, or a changed summary if eyes was missed.
+- A thumbs-up reaction ID absent from the initial baseline, or the structured
+  completion proof described below, and no active eyes.
+- For reaction acceptance, eyes observed during this lifecycle, or a changed
+  summary if eyes was missed.
 - The same clean evidence on two observations at least 30 seconds apart.
 
 Existing thumbs-up and old-head summaries never supply fresh acceptance.
@@ -59,9 +61,10 @@ responses, and incomplete pagination cannot produce acceptance.
 
 Resolving threads alone is not approval. Earlier aggregate review messages,
 including changes-requested reviews, can be superseded only by a fresh trusted
-manual clean completion on the current head. The earlier review must have associated
-inline findings, all their threads must be resolved, and its submission must
-strictly precede the clean completion comment's creation. Unthreaded review findings
+manual clean completion or structured completion proof on the current head.
+The earlier review must have associated inline findings and all their threads
+must be resolved. Its submission must strictly precede the manual completion
+comment's creation or the earliest structured review completion. Unthreaded review findings
 or missing timestamps remain blockers. A new finding after clean completion blocks.
 Trusted priority-badge findings posted as plain issue comments have no reliable
 reviewed SHA and block conservatively, including after a new push, until a
@@ -81,6 +84,43 @@ exists, only the latest by creation time is eligible; equal latest creation time
 are ambiguous. An invalid newest completion cannot fall back to an older one.
 The observer confirms the same comment digest, summary, and reaction IDs and
 timestamps twice, at least 30 seconds apart.
+
+A trusted summary can alternatively supply `codex-review-state:v1` metadata.
+This handles reviews that found issues whose threads were later resolved, for
+which Codex may publish a completed summary without posting a thumbs-up.
+Exactly one marker must contain exactly the `code_review` and `security_review`
+objects. Each object has `commit_sha`, `has_any_findings`,
+`has_unresolved_findings`, and `status`. Code Review is required. Security Review
+can have all four fields null only when its human summary row is absent.
+Advertised reviews must have a full current-head SHA, known statuses, and matching
+human summary rows. Completed reviews require boolean finding fields. Active or
+failed reviews may have null finding fields and still invalidate prior acceptance.
+`has_any_findings` can be true
+when `has_unresolved_findings` is false. Malformed, duplicate, unknown, or
+contradictory structured metadata blocks acceptance and cannot fall back to
+reaction evidence.
+
+Structured acceptance requires every advertised review to be completed with no
+unresolved findings. Every completion must strictly follow the preserved original
+observation start and that review's own subsequently observed running or failed
+review boundary. Code and security review boundaries are independent, so one
+review can finish while the other is still running. Repeated identical active
+observations do not move a boundary. A new eyes reaction phase advances both
+boundaries because it does not identify which review restarted. Boundaries persist
+when observation resumes. An active legacy summary without per-review metadata
+also advances both boundaries once per observed phase.
+Every completion must precede the summary update, allowing its whole-second
+precision, and neither timestamp may be in the future. An unresolved finding in
+an already-completed review blocks acceptance without recording a running-review
+restart. Failed attempts retain the original observation origin when renewed.
+A new observer still cannot accept a completion that predates observation.
+
+The same structured digest, summary, head, and base must be observed twice at
+least 30 seconds apart. All independent thread, plain-comment, and unthreaded
+review blockers still apply. An earlier aggregate review can be superseded only
+when all its associated threads are resolved and its submission strictly precedes
+the earliest advertised structured completion. This conservative boundary also
+prevents a later security review from approving older code-review evidence.
 
 An existing observation that could not initialize can recover a manual review
 completed after that observation started. Recovery preserves the original start
