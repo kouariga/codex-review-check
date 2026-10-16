@@ -218,33 +218,13 @@ class StructuredReviewTests(unittest.TestCase):
         api.pages = pages
         return api
 
-    def test_completed_review_with_resolved_findings_and_no_reaction_passes_twice(self):
+    def test_structured_resolved_flags_without_reaction_never_approve(self):
         snapshot = self.api().snapshot(1)
-        origin = gate.timestamp("2026-10-16T03:13:00Z")
         now = gate.timestamp("2026-10-16T03:17:00Z")
-        state = gate.initialize(snapshot, now, observed_since=origin)
-        state["manual_since"] = origin + 60
+        state = gate.initialize(snapshot, now)
         self.assertEqual(gate.observe(state, snapshot, now)[0], "pending")
-        self.assertEqual(gate.observe(state, snapshot, now + 29)[0], "pending")
-        self.assertEqual(gate.observe(state, snapshot, now + 30)[0], "success")
-
-    def test_legacy_restart_invalidates_prior_structured_completion(self):
-        clean = self.api().snapshot(1)
-        now = gate.timestamp("2026-10-16T03:17:00Z")
-        for failed in (False, True):
-            with self.subTest(failed=failed):
-                state = gate.initialize(clean, now, observed_since=now - 600)
-                gate.observe(state, clean, now)
-                legacy = clean | {"structured": None, "completed": False,
-                                  "failed": failed, "summary": "legacy-restart"}
-                gate.observe(state, legacy, now + 30)
-                boundary = dict(state["structured_since"])
-                gate.observe(state, legacy, now + 40)
-                self.assertEqual(state["structured_since"], boundary)
-                restored = json.loads(json.dumps(state))
-                self.assertEqual(gate.observe(restored, clean, now + 60)[0], "pending")
-                self.assertEqual(gate.observe(restored, clean, now + 90)[0], "pending")
-                self.assertIsNone(restored["candidate"])
+        self.assertEqual(gate.observe(state, snapshot, now + 30)[0], "pending")
+        self.assertNotIn("structured_since", state)
 
     def test_invalid_structured_marker_cannot_fall_back_to_legacy_reaction(self):
         fixture = self.fixture()
@@ -272,208 +252,6 @@ class StructuredReviewTests(unittest.TestCase):
         for status in ("Running", "Failed"):
             with self.assertRaises(ValueError):
                 self.api(status=status).snapshot(1)
-
-    def test_unresolved_threads_and_unscoped_findings_still_block(self):
-        snapshot = self.api(inline=[{"id": 5, "user": {"id": gate.BOT_ID}}]).snapshot(1)
-        now = gate.timestamp("2026-10-16T03:17:00Z")
-        state = gate.initialize(snapshot, now, observed_since=now - 600)
-        self.assertEqual(gate.observe(state, snapshot, now)[0], "pending")
-        self.assertIsNone(state["candidate"])
-
-    def test_structured_running_failed_or_unresolved_invalidates_candidate(self):
-        clean = self.api().snapshot(1)
-        now = gate.timestamp("2026-10-16T03:17:00Z")
-        for status, unresolved in (("running", False), ("failed", False), ("completed", True)):
-            value = self.fixture()
-            value["code_review"].update(status=status, has_unresolved_findings=unresolved)
-            snapshot = self.api(value, status=status.title()).snapshot(1)
-            state = gate.initialize(clean, now, observed_since=now - 600)
-            gate.observe(state, clean, now)
-            result = gate.observe(state, snapshot, now + 30)[0]
-            self.assertEqual(result, "failure" if status == "failed" else "pending")
-            self.assertIsNone(state["candidate"])
-            self.assertEqual(gate.observe(state, clean, now + 60)[0], "pending")
-            if status != "completed":
-                self.assertIsNone(state["candidate"])
-
-    def test_running_review_with_null_findings_blocks_prior_completion(self):
-        value = self.fixture()
-        value["code_review"].update(status="running", has_any_findings=None,
-                                    has_unresolved_findings=None)
-        running = self.api(value, status="Running").snapshot(1)
-        clean = self.api().snapshot(1)
-        now = gate.timestamp("2026-10-16T03:17:00Z")
-        state = gate.initialize(clean, now, observed_since=now - 600)
-        gate.observe(state, clean, now)
-        self.assertEqual(gate.observe(state, running, now + 30)[0], "pending")
-        self.assertEqual(state["manual_since"], now + 30)
-        gate.observe(state, clean, now + 60)
-        self.assertEqual(gate.observe(state, clean, now + 90)[0], "pending")
-        self.assertIsNone(state["candidate"])
-
-    def test_old_future_or_inconsistent_timestamp_never_accepts(self):
-        snapshot = self.api().snapshot(1)
-        now = gate.timestamp("2026-10-16T03:17:00Z")
-        for origin in (now, snapshot["structured"]["completed_at"]):
-            state = gate.initialize(snapshot, now, observed_since=origin)
-            gate.observe(state, snapshot, now)
-            self.assertEqual(gate.observe(state, snapshot, now + 30)[0], "pending")
-        for changes in ({"completed_at": now + 60}, {"summary_updated": now + 60},
-                        {"summary_updated": snapshot["structured"]["completed_at"] - 1}):
-            changed = snapshot | {"structured": snapshot["structured"] | changes}
-            state = gate.initialize(snapshot, now, observed_since=now - 600)
-            self.assertEqual(gate.observe(state, changed, now)[0], "pending")
-            self.assertIsNone(state["candidate"])
-
-    def test_changed_proof_resets_and_resumed_confirmation_preserves_origin(self):
-        snapshot = self.api().snapshot(1)
-        now = gate.timestamp("2026-10-16T03:17:00Z")
-        state = gate.initialize(snapshot, now, observed_since=now - 600)
-        gate.observe(state, snapshot, now)
-        changed = snapshot | {"structured": snapshot["structured"] | {"digest": "other"}}
-        self.assertEqual(gate.observe(state, changed, now + 30)[0], "pending")
-        restored = json.loads(json.dumps(state))
-        restored["started"] = now + 40
-        self.assertEqual(gate.observe(restored, changed, now + 60)[0], "success")
-        self.assertEqual(restored["observed_since"], now - 600)
-
-    def test_aggregate_supersession_requires_resolved_thread_and_older_submission(self):
-        clean = self.api().snapshot(1)
-        now = gate.timestamp("2026-10-16T03:17:00Z")
-        completion = clean["structured"]["completed_at"]
-        for resolved, submitted, expected in ((True, completion - 1, "success"),
-                                               (False, completion - 1, "pending"),
-                                               (True, completion, "pending"),
-                                               (True, None, "pending")):
-            snapshot = clean | {"review_findings": [{"id": 10, "resolved_threads": resolved,
-                                                       "submitted": submitted}]}
-            state = gate.initialize(snapshot, now, observed_since=now - 600)
-            gate.observe(state, snapshot, now)
-            self.assertEqual(gate.observe(state, snapshot, now + 30)[0], expected)
-
-    def test_completed_findings_do_not_advance_restart_boundary(self):
-        value = self.fixture()
-        value["code_review"]["has_unresolved_findings"] = True
-        blocked = self.api(value).snapshot(1)
-        clean = self.api().snapshot(1)
-        now = gate.timestamp("2026-10-16T03:17:00Z")
-        state = gate.initialize(blocked, now, observed_since=now - 600)
-        gate.observe(state, blocked, now)
-        self.assertNotIn("manual_since", state)
-        self.assertEqual(gate.observe(state, clean, now + 30)[0], "pending")
-        self.assertEqual(gate.observe(state, clean, now + 60)[0], "success")
-
-    def test_all_advertised_completions_must_follow_origin(self):
-        api = self.api()
-        original = api.pages
-        def pages(path):
-            result = original(path)
-            if path == "issues/1/comments":
-                comment = result[0]
-                value = self.fixture()
-                value["security_review"] = value["code_review"].copy()
-                comment["body"] = comment["body"].replace(
-                    json.dumps(self.fixture()), json.dumps(value))
-                comment["body"] += ('\n| **Security Review** | **Completed** '
-                    '<relative-time datetime="2026-10-16T03:16:05Z">done</relative-time>'
-                    ' | `aaaaaaa` | New commits |')
-            return result
-        api.pages = pages
-        snapshot = api.snapshot(1)
-        self.assertEqual(snapshot["structured"]["completed_at"],
-                         gate.timestamp("2026-10-16T03:16:04.451181Z"))
-        now = gate.timestamp("2026-10-16T03:17:00Z")
-        state = gate.initialize(snapshot, now, observed_since=gate.timestamp("2026-10-16T03:16:05Z"))
-        gate.observe(state, snapshot, now)
-        self.assertEqual(gate.observe(state, snapshot, now + 30)[0], "pending")
-
-    def paired_snapshot(self, code_status, code_time, security_status, security_time, *, eyes=False):
-        value = self.fixture()
-        value["security_review"] = value["code_review"].copy()
-        rows = []
-        for kind, status, completed_at in (("code_review", code_status, code_time),
-                                           ("security_review", security_status, security_time)):
-            value[kind]["status"] = status
-            label = "Code Review" if kind == "code_review" else "Security Review"
-            completion = (f'<relative-time datetime="{completed_at}">done</relative-time>'
-                          if completed_at else "")
-            rows.append(f"| **{label}** | **{status.title()}** {completion} | `aaaaaaa` | New commits |")
-        api = self.api()
-        original = api.pages
-        def pages(path):
-            result = original(path)
-            if path == "issues/1/comments":
-                result[0]["body"] = (gate.MARKER + "\n<!-- codex-review-state:v1 "
-                                      + json.dumps(value) + " -->\n" + "\n".join(rows))
-                result[0]["updated_at"] = "2026-10-16T03:20:00Z"
-            return result
-        api.pages = pages
-        return api.snapshot(1) | {"eyes": eyes}
-
-    def test_staggered_completions_preserve_independent_boundaries_after_resume(self):
-        origin = gate.timestamp("2026-10-16T03:16:00Z")
-        for eyes in (False, True):
-            running = self.paired_snapshot("running", None, "running", None, eyes=eyes)
-            state = gate.initialize(running, origin, observed_since=origin - 60)
-            gate.observe(state, running, origin)
-            partial = self.paired_snapshot("completed", "2026-10-16T03:16:20Z",
-                                           "running", None, eyes=eyes)
-            gate.observe(state, partial, origin + 30)
-            gate.observe(state, partial, origin + 40)
-            self.assertEqual(state["structured_since"],
-                             {"code_review": origin, "security_review": origin})
-            resumed = json.loads(json.dumps(state))
-            complete = self.paired_snapshot("completed", "2026-10-16T03:16:20Z",
-                                            "completed", "2026-10-16T03:16:50Z")
-            self.assertEqual(gate.observe(resumed, complete, origin + 240)[0], "pending")
-            self.assertEqual(gate.observe(resumed, complete, origin + 270)[0], "success")
-
-    def test_each_review_restart_blocks_its_own_stale_completion(self):
-        origin = gate.timestamp("2026-10-16T03:16:00Z")
-        old = "2026-10-16T03:16:20Z"
-        later = "2026-10-16T03:16:50Z"
-        for kind in ("code_review", "security_review"):
-            clean = self.paired_snapshot("completed", old, "completed", old)
-            state = gate.initialize(clean, origin, observed_since=origin)
-            gate.observe(state, clean, origin + 25)
-            running = self.paired_snapshot("running" if kind == "code_review" else "completed",
-                                           None if kind == "code_review" else old,
-                                           "running" if kind == "security_review" else "completed",
-                                           None if kind == "security_review" else old)
-            gate.observe(state, running, origin + 30)
-            gate.observe(state, running, origin + 40)
-            self.assertEqual(state["structured_since"][kind], origin + 30)
-            complete = self.paired_snapshot("completed", old if kind == "code_review" else later,
-                                            "completed", old if kind == "security_review" else later)
-            gate.observe(state, complete, origin + 240)
-            self.assertEqual(gate.observe(state, complete, origin + 270)[0], "pending")
-            self.assertIsNone(state["candidate"])
-
-    def test_disappearing_active_security_review_cannot_approve_code_completion(self):
-        origin = gate.timestamp("2026-10-16T03:16:00Z")
-        for status in ("running", "failed"):
-            active = self.paired_snapshot("completed", "2026-10-16T03:16:20Z", status, None)
-            state = gate.initialize(active, origin, observed_since=origin)
-            gate.observe(state, active, origin + 30)
-            code_only = self.api().snapshot(1)
-            gate.observe(state, code_only, origin + 240)
-            self.assertEqual(gate.observe(state, code_only, origin + 270)[0], "pending")
-            self.assertIsNone(state["candidate"])
-
-    def test_new_eyes_phase_invalidates_both_completions_after_eyes_disappears(self):
-        origin = gate.timestamp("2026-10-16T03:16:00Z")
-        clean = self.paired_snapshot("completed", "2026-10-16T03:16:20Z",
-                                     "completed", "2026-10-16T03:16:20Z")
-        state = gate.initialize(clean, origin, observed_since=origin)
-        gate.observe(state, clean, origin + 25)
-        gate.observe(state, clean | {"eyes": True}, origin + 30)
-        gate.observe(state, clean | {"eyes": True}, origin + 40)
-        self.assertEqual(state["structured_since"],
-                         {"code_review": origin + 30, "security_review": origin + 30})
-        resumed = json.loads(json.dumps(state))
-        gate.observe(resumed, clean, origin + 240)
-        self.assertEqual(gate.observe(resumed, clean, origin + 270)[0], "pending")
-        self.assertIsNone(resumed["candidate"])
 
     def test_untrusted_summary_cannot_supply_structured_proof(self):
         for field, value in (("user", {"id": 123}), ("performed_via_github_app", {"id": 123})):
@@ -947,7 +725,8 @@ class ResolvedFindingTests(unittest.TestCase):
                    "original_commit_id": "b" * 40 if old else head,
                    "pull_request_review_id": 81}
         review_row = {"id": 81, "user": {"id": gate.BOT_ID}, "commit_id": head,
-                      "state": "COMMENTED", "body": "Review suggestions", "submitted_at": "2026-10-10T14:32:00Z"}
+                      "state": "COMMENTED", "body": gate.FINDING_REVIEW_WRAPPER.replace("{commit}", head),
+                      "submitted_at": "2026-10-10T14:32:00Z"}
         api.pages = lambda path: ([finding] if path == "pulls/1/comments" else
                                 [review_row] if path == "pulls/1/reviews" and review else original(path))
         api.review_threads = lambda number: {71: resolved}

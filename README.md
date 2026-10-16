@@ -42,14 +42,15 @@ Every 30 seconds, for at most 20 minutes, observe trusted Codex metadata:
   current full head SHA; no unresolved Codex review threads.
 - The same target branch and base revision throughout observation. Retargeting
   or base advancement invalidates persisted acceptance on the next observation.
-- A thumbs-up reaction ID absent from the initial baseline, or the structured
-  completion proof described below, and no active eyes.
+- Either fresh clean Codex approval or a privileged verification receipt, as
+  distinguished below. Neither path accepts active eyes or an unfinished review.
 - For reaction acceptance, eyes observed during this lifecycle, or a changed
   summary if eyes was missed.
 - The same clean evidence on two observations at least 30 seconds apart.
 
 Existing thumbs-up and old-head summaries never supply fresh acceptance.
-A new observation cannot retroactively accept an already-finished review.
+A new observation cannot retroactively accept an already-finished clean review.
+A verification receipt has its own durable, exact-diff evidence binding.
 The bounded recovery of an earlier legacy observation is described below.
 Rebase/force-push/new head starts separate state. Missing, ambiguous,
 failed, or unavailable evidence does not pass; no automatic review retry is sent.
@@ -61,11 +62,14 @@ responses, and incomplete pagination cannot produce acceptance.
 
 Resolving threads alone is not approval. Earlier aggregate review messages,
 including changes-requested reviews, can be superseded only by a fresh trusted
-manual clean completion or structured completion proof on the current head.
+manual clean completion on the current head.
 The earlier review must have associated inline findings and all their threads
 must be resolved. Its submission must strictly precede the manual completion
-comment's creation or the earliest structured review completion. Unthreaded review findings
+comment's creation. Unthreaded review findings
 or missing timestamps remain blockers. A new finding after clean completion blocks.
+Resolved old-head findings must predate the earliest review completion's
+whole-second timestamp. Same-second ordering is ambiguous. A later security
+review cannot approve a code finding that arrived after Code Review completed.
 Trusted priority-badge findings posted as plain issue comments have no reliable
 reviewed SHA and block conservatively, including after a new push, until a
 maintainer resolves that ambiguous evidence. The adapter does not delete comments.
@@ -85,42 +89,95 @@ are ambiguous. An invalid newest completion cannot fall back to an older one.
 The observer confirms the same comment digest, summary, and reaction IDs and
 timestamps twice, at least 30 seconds apart.
 
-A trusted summary can alternatively supply `codex-review-state:v1` metadata.
-This handles reviews that found issues whose threads were later resolved, for
-which Codex may publish a completed summary without posting a thumbs-up.
-Exactly one marker must contain exactly the `code_review` and `security_review`
-objects. Each object has `commit_sha`, `has_any_findings`,
-`has_unresolved_findings`, and `status`. Code Review is required. Security Review
-can have all four fields null only when its human summary row is absent.
-Advertised reviews must have a full current-head SHA, known statuses, and matching
-human summary rows. Completed reviews require boolean finding fields. Active or
-failed reviews may have null finding fields and still invalidate prior acceptance.
-`has_any_findings` can be true
-when `has_unresolved_findings` is false. Malformed, duplicate, unknown, or
-contradictory structured metadata blocks acceptance and cannot fall back to
-reaction evidence.
+Structured `codex-review-state:v1` metadata constrains lifecycle consistency. It
+never supplies approval. The marker must contain exactly `code_review` and
+`security_review` objects with `commit_sha`, `has_any_findings`,
+`has_unresolved_findings`, and `status`. Code Review is required. An absent Security
+Review has all four fields null. Advertised reviews must match the current full
+head and human summary rows. Malformed, duplicate, contradictory, active, failed,
+or unresolved metadata cannot fall back to apparently clean reaction evidence.
+Automatic clean approval requires no reported current-head findings, even when
+those threads are resolved and structured metadata says there are no findings.
+Inline roots use their original commit identity before any reanchored commit.
+Resolved old-head roots can precede a clean current-head review, but roots created
+at or after completion, or without a known commit or creation time, block automatic
+approval. Standalone unthreaded findings remain blockers regardless of head.
+A later explicit manual clean review can supersede earlier associated resolved
+findings under the chronology above.
+Manual evidence is parsed even when structured metadata is present.
 
-Structured acceptance requires every advertised review to be completed with no
-unresolved findings. Every completion must strictly follow the preserved original
-observation start and that review's own subsequently observed running or failed
-review boundary. Code and security review boundaries are independent, so one
-review can finish while the other is still running. Repeated identical active
-observations do not move a boundary. A new eyes reaction phase advances both
-boundaries because it does not identify which review restarted. Boundaries persist
-when observation resumes. An active legacy summary without per-review metadata
-also advances both boundaries once per observed phase.
-Every completion must precede the summary update, allowing its whole-second
-precision, and neither timestamp may be in the future. An unresolved finding in
-an already-completed review blocks acceptance without recording a running-review
-restart. Failed attempts retain the original observation origin when renewed.
-A new observer still cannot accept a completion that predates observation.
+When review completion timestamps are available, an automatic clean thumbs-up
+must postdate the current completion, structured summary update, original observer
+start, and any observed restart. A late API observation of an old reaction does
+not make that reaction fresh. Older summaries without timestamps retain the
+legacy reaction-ID and changed-summary checks. Reactions are read from the PR
+root description, not from inline feedback.
 
-The same structured digest, summary, head, and base must be observed twice at
-least 30 seconds apart. All independent thread, plain-comment, and unthreaded
-review blockers still apply. An earlier aggregate review can be superseded only
-when all its associated threads are resolved and its submission strictly precedes
-the earliest advertised structured completion. This conservative boundary also
-prevents a later security review from approving older code-review evidence.
+A separate proof kind, `verified_dispositions`, accepts accountable handling of
+feedback. It does not mean Codex gave a clean review. A repository writer,
+maintainer, or administrator publishes an unedited PR issue comment beginning
+with `<!-- codex-review-dispositions:v1 `, followed by JSON and ` -->`. An audit
+explanation can follow the marker. JSON has exactly these fields.
+
+```json
+{
+  "version": 1,
+  "repository": "owner/repo",
+  "pr": 123,
+  "head": "<current full SHA>",
+  "base": {"ref": "main", "sha": "<current full base SHA>"},
+  "review": "<snapshot review_digest>",
+  "inventory": "<snapshot inventory_digest>",
+  "dispositions": [
+    {"finding": "inline:456", "outcome": "fixed", "rationale": "Verified explanation", "evidence": ["Evidence URL or command result"]}
+  ]
+}
+```
+
+Each inventory key appears exactly once. `fixed` and `wont_fix` both require a
+nonempty rationale and nonempty evidence list. The read-only `snapshot` exposes
+canonical inventory rows and both digests. Only the exact known Codex boilerplate
+wrapper is deduplicated against its inline findings. Additional or unknown
+review-body text needs a separate disposition, even when inline findings also
+exist. Inventory includes old and current
+head findings, resolved and unresolved inline roots, their replies and authoritative
+resolution state, priority-badge issue findings, and substantive unthreaded review
+findings. Recognized boilerplate reviews with inline roots are bound in the review digest
+without requiring a duplicate disposition. The review digest binds the trusted
+summary identity, body, update time, and bot review submissions.
+
+The receipt author must have account type `User`. The collaborator permission
+endpoint must currently grant write, maintain, or admin and return the same
+immutable user ID. Login spelling and author association cannot authorize a
+receipt. This validates authority and evidence bindings. It does not prove that
+a human personally inspected the code or that an attested semantic judgment is
+correct. A maintainer can delegate an audit and publish its attributable result.
+
+The receipt must be unedited, strictly newer than review completion and summary
+update, and not in the future. It can predate observer startup because its full
+head, base, review, and inventory bindings are revalidated. All Codex inline
+threads must be resolved and no review may be running, failed, or unresolved.
+The same proof is checked twice at least 30 seconds apart. A changed finding,
+reply, resolution, review cycle, head, or base invalidates it. A new observed
+review cycle requires a later receipt. Resolved flags alone remain insufficient.
+
+Only the latest privileged candidate is eligible. Malformed or edited newest
+receipts cannot fall back to an older one. The observer persists the largest
+privileged receipt ID seen, and authorized marker edit/deletion events advance
+that boundary. Removing a newer receipt cannot resurrect an older receipt.
+Renewing a successful check preserves newly observed receipt and review-restart
+boundaries while clearing candidate confirmation and rebaselining reactions.
+Unprivileged marker spam is ignored, including collaborator-permission 404s for
+noncollaborators. Other permission API errors cannot authorize.
+A new receipt after that boundary is needed to recover. Old successful checks
+without an explicit proof kind cannot be renewed as though they had this proof.
+
+Successful check titles distinguish `Clean Codex approval confirmed on current
+head` from `Feedback handling verified by maintainer attestation`. The latter's
+summary explicitly says it is not clean Codex approval. Check output persists
+the proof kind, receipt identity, author ID, and proof digest. Switching proof
+kinds starts another two-observation confirmation. When both paths qualify,
+clean Codex approval takes precedence over the maintainer receipt.
 
 An existing observation that could not initialize can recover a manual review
 completed after that observation started. Recovery preserves the original start
@@ -160,8 +217,11 @@ restart. Unobserved overlapping same-head reviews cannot be fully distinguished
 without an upstream lifecycle ID; multiple eligible comments fail closed.
 
 State lives in the latest owned check output. Code Review must be present;
-Security Review alone cannot approve the check. Per-PR job concurrency, after trusted-event filtering, serializes
-observations; ordinary comments do not enter that queue. A restart resumes an incomplete run. A new authorized invocation creates a new
+Security Review alone cannot approve the check. Per-PR job concurrency, after narrow event filtering, serializes
+observations. Ordinary comments do not enter that queue. Receipt creation, edits,
+and deletions qualify only when the event sender currently has repository write
+authority, checked before any check write. Marker removal uses the previous
+comment body supplied with an edit event. A restart resumes an incomplete run. A new authorized invocation creates a new
 run when renewing a completed lifecycle, preserving the original reaction baseline
 and clearing candidate confirmation. Completed runs remain history; only the
 latest owned run supplies resumable state, except for the bounded legacy origin
@@ -200,7 +260,7 @@ version mismatches between the workflow and adapter. Do not edit generated code.
 
 ```sh
 python3 tools/render_codex_review_gate.py .github/workflows/review.yml
-python3 -m unittest discover -s tests -p 'test_codex_review_gate.py' -v
+python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 Tests cover freshness, head changes, failed/unavailable evidence, restart,
@@ -228,3 +288,8 @@ There is no release daemon, App backend, or new credential to operate.
 
 See GitHub's [reusable workflows](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows)
 and [caller permissions/context](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations).
+
+This observer validates during authorized workflow invocations. It is not a
+continuous monitor after a run ends. Receipt marker events invalidate stored
+proof when delivered, and later invocations revalidate live evidence. The shared
+`v1` release is unchanged until its owner explicitly adopts a reviewed release.
