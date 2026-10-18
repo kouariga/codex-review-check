@@ -45,12 +45,14 @@ class DispositionTests(unittest.TestCase):
                          'submitted_at': iso(50)}]
         self.comments.append({'id': 21, 'user': {'id': gate.BOT_ID},
                               'performed_via_github_app': {'id': gate.CODEX_APP_ID},
-                              'body': 'P2 Badge plain finding', 'updated_at': iso(50)})
+                              'body': 'P2 Badge plain finding', 'created_at': iso(50), 'updated_at': iso(50)})
         self.permission = {'permission': 'write', 'user': {'id': 42}}
         self.reactions = []
         self.api.repo_call = self.call
         self.api.pages = self.pages
         self.api.review_threads = lambda number: copy.deepcopy(self.resolved)
+        self.review_updated = {}
+        self.api.review_updates = lambda number: {r["id"]: self.review_updated.get(r["id"], r["submitted_at"]) for r in self.reviews}
         self.refresh_summary()
 
     def refresh_summary(self, status='Completed', completion=90):
@@ -422,6 +424,26 @@ class DispositionTests(unittest.TestCase):
                     self.assertEqual(gate.observe(state, snapshot, 150)[0], 'pending')
                     evidence.clear()
                     evidence.update(original)
+
+    def test_unknown_flags_require_authoritative_review_update_chronology(self):
+        self.metadata['code_review'].update(has_any_findings=None, has_unresolved_findings=None)
+        self.refresh_summary()
+        receipt = json.loads((ROOT / 'tests/fixtures/modern-clean.json').read_text())['comments'][1]
+        receipt.update(created_at=iso(88), updated_at=iso(88))
+        self.comments.append(receipt)
+        self.decisions()
+        for update in (iso(88), iso(89)):
+            self.review_updated[33] = update
+            snapshot = self.api.snapshot(1)
+            state = gate.initialize(snapshot, 120, observed_since=80)
+            gate.observe(state, snapshot, 120)
+            self.assertEqual(gate.observe(state, snapshot, 150)[0], 'pending')
+        self.review_updated[33] = None
+        with self.assertRaises(ValueError):
+            self.api.snapshot(1)
+        self.api.review_updates = lambda number: {}
+        with self.assertRaises(KeyError):
+            self.api.snapshot(1)
 
     def event(self, name, comment, previous=None, action='created'):
         import tempfile

@@ -116,6 +116,18 @@ manual completion. It cannot supply clean approval without a fresh trusted
 thumbs-up. When any historical findings exist, every finding still needs a valid
 current disposition and every inline thread must be resolved. That path can
 produce only `verified_dispositions`, which does not require a thumbs-up.
+Active structured review identity includes the status cell's start time, reviewed
+commit, and trigger. A changed cycle excludes earlier receipts. An ordinary
+summary update timestamp change during the same running cycle preserves a newly
+arrived receipt. The newest eligible modern receipt must name the current head;
+a newer wrong-head receipt blocks fallback to an older current-head receipt.
+
+Finding comments require both creation and update timestamps. Substantive review
+chronology requires submission and update timestamps. GitHub REST reviews omit
+the update timestamp, so unknown-flags observations enrich Codex review rows from
+the paginated GraphQL reviews connection, joining by database ID. Missing,
+malformed, ambiguous, or unavailable chronology blocks acceptance.
+
 The receipt must strictly follow every finding's creation or latest update and
 its associated substantive review submission or update. Missing timestamps and
 same-second ordering cannot establish that chronology. Its proof binds the

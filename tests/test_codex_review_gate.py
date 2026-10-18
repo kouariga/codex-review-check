@@ -324,6 +324,56 @@ class ModernReceiptTests(unittest.TestCase):
         for now in (origin + 180, origin + 210):
             self.assertEqual(gate.observe(state, complete, now)[0], "pending")
 
+    def test_active_same_head_new_cycle_excludes_previous_cycle_receipt(self):
+        fixture = self.with_reaction()
+        complete = self.snapshot(fixture)
+        summary = fixture["comments"][0]
+        summary["body"] = summary["body"].replace('"status":"completed"', '"status":"running"').replace("**Completed**", "**Running**")
+        receipt = fixture["comments"].pop()
+        fixture["reactions"] = []
+        origin = gate.timestamp("2026-10-18T03:54:00Z")
+        running = self.snapshot(fixture)
+        state = gate.initialize(running, origin)
+        gate.observe(state, running, origin + 30)
+        fixture["comments"].append(receipt)
+        for change in ("trigger", "start_time"):
+            with self.subTest(change=change):
+                changed = copy.deepcopy(fixture)
+                body = changed["comments"][0]["body"]
+                changed["comments"][0]["body"] = body.replace(
+                    "Manual request", "New commits") if change == "trigger" else body.replace(
+                    "03:55:34.465182Z", "03:55:35.465182Z")
+                restored = copy.deepcopy(state)
+                gate.observe(restored, self.snapshot(changed), origin + 96)
+                gate.observe(restored, complete, origin + 120)
+                self.assertEqual(gate.observe(restored, complete, origin + 150)[0], "pending")
+
+    def test_newer_wrong_head_receipt_blocks_old_current_head_receipt(self):
+        fixture = self.with_reaction()
+        newest = copy.deepcopy(fixture["comments"][1])
+        newest.update(id=3, created_at="2026-10-18T03:55:33Z", updated_at="2026-10-18T03:55:33Z")
+        newest["body"] = newest["body"].replace("`aaaaaaaaaa`", "`bbbbbbbbbb`")
+        fixture["comments"].append(newest)
+        api = ManualFixtureTests().api(fixture)
+        original = api.repo_call
+        api.repo_call = lambda path: {"sha": "b" * 40} if path == "commits/bbbbbbbbbb" else original(path)
+        self.assertEqual(self.result(api.snapshot(1))[0], "pending")
+        for created in ("2026-10-18T03:55:32Z", "2026-10-18T03:55:31Z"):
+            newest.update(created_at=created, updated_at=created)
+            fixture["comments"][-1] = newest
+            self.assertEqual(self.result(api.snapshot(1))[0],
+                             "pending" if created.endswith("32Z") else "success")
+
+    def test_unknown_flags_require_complete_finding_chronology(self):
+        for field in ("created_at", "updated_at"):
+            fixture = self.with_reaction()
+            finding = copy.deepcopy(fixture["comments"][1])
+            finding.update(id=3, body="P2 Badge finding", created_at="2026-10-18T03:50:00Z", updated_at="2026-10-18T03:50:00Z")
+            del finding[field]
+            fixture["comments"].append(finding)
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.snapshot(fixture)
+
     def test_trusted_prose_can_mention_receipt_marker(self):
         fixture = self.with_reaction()
         fixture["comments"].append(fixture["comments"][1] | {
@@ -466,6 +516,33 @@ class ModernReceiptTests(unittest.TestCase):
                                     "has_any_findings": True, "has_unresolved_findings": False}
         fixture["comments"][0]["body"] = body.replace(marker, json.dumps(value)) + '\n| **Security Review** | **Completed** <relative-time datetime="2026-10-18T03:55:34Z">done</relative-time> | `aaaaaaa` | Manual request |'
         self.assertEqual(self.result(self.snapshot(fixture))[0], "pending")
+
+
+class ReviewChronologyTests(unittest.TestCase):
+    def page(self, nodes, more=False, cursor=None):
+        return {"data": {"repository": {"pullRequest": {"reviews": {
+            "nodes": nodes, "pageInfo": {"hasNextPage": more, "endCursor": cursor}}}}}}
+
+    def test_review_updates_join_by_id_across_pages(self):
+        api = gate.GitHub("unused", "owner/repo")
+        pages = [self.page([{"databaseId": 2, "updatedAt": "2026-10-18T03:50:00Z"}], True, "next"),
+                 self.page([{"databaseId": 1, "updatedAt": "2026-10-18T03:51:00Z"}])]
+        api.call = mock.Mock(side_effect=pages)
+        self.assertEqual(api.review_updates(1), {2: "2026-10-18T03:50:00Z", 1: "2026-10-18T03:51:00Z"})
+        self.assertEqual(api.call.call_args_list[1].args[1]["variables"]["after"], "next")
+
+    def test_incomplete_review_updates_block(self):
+        row = {"databaseId": 1, "updatedAt": "2026-10-18T03:50:00Z"}
+        for pages in ([{"errors": [{"message": "denied"}]}],
+                      [self.page([row | {"updatedAt": None}])],
+                      [self.page([row, row])],
+                      [self.page([row], True, None)],
+                      [self.page([row], True, "next"), self.page([row])]):
+            with self.subTest(pages=pages):
+                api = gate.GitHub("unused", "owner/repo")
+                api.call = mock.Mock(side_effect=pages)
+                with self.assertRaises(ValueError):
+                    api.review_updates(1)
 
 
 class ManualFixtureTests(unittest.TestCase):

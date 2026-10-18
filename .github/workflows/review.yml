@@ -239,11 +239,11 @@ jobs:
                           raise ValueError("Missing structured completion timestamp")
                       completed_at = timestamp(times[0])
                       completions.append(completed_at)
-                  reviews[kind] = {"status": status, "completed_at": completed_at, "digest": digest(review)}
+                  reviews[kind] = {"status": status, "completed_at": completed_at, "digest": digest([review, matching[0][2:5]])}
                   active = active or status != "completed"
                   failed = failed or status == "failed"
                   unresolved = unresolved or review["has_unresolved_findings"] is True
-              return {"digest": digest(value), "reviews": reviews, "completed_at": min(completions) if completions else None,
+              return {"digest": digest(reviews), "reviews": reviews, "completed_at": min(completions) if completions else None,
                       "latest_completed_at": max(completions) if completions else None,
                       "summary_updated": timestamp(summary.get("updated_at")),
                       "completed": not active, "failed": failed, "unresolved": unresolved,
@@ -300,6 +300,7 @@ jobs:
                       latest = max(c["created"] for c in comments)
                       comments = [c for c in comments if c["created"] == latest]
                   valid_completion = (len(comments) == 1
+                                      and comments[0].get("current_head", True)
                                       and manual.get("finding_boundary", float("-inf")) < comments[0]["created"]
                                       and comments[0]["created"] <= comments[0]["updated"] <= manual["completed_at"] <= now
                                       and math.floor(manual["completed_at"]) <= manual["summary_updated"] <= now)
@@ -494,6 +495,41 @@ jobs:
                       cursors.add(cursor)
                   raise ValueError("Review thread pagination limit reached")
 
+              def review_updates(self, number):
+                  owner, name = self.repo.split("/")
+                  query = """query($owner:String!,$name:String!,$number:Int!,$after:String) {
+                    repository(owner:$owner,name:$name) { pullRequest(number:$number) {
+                      reviews(first:100,after:$after) {
+                        nodes { databaseId updatedAt }
+                        pageInfo { hasNextPage endCursor }
+                      }
+                    } }
+                  }"""
+                  updates, cursors = {}, set()
+                  cursor = None
+                  for _ in range(100):
+                      response = self.call("graphql", {"query": query, "variables": {
+                          "owner": owner, "name": name, "number": number, "after": cursor}})
+                      if response.get("errors"):
+                          raise ValueError("GraphQL review chronology unavailable")
+                      connection = response["data"]["repository"]["pullRequest"]["reviews"]
+                      nodes, page = connection["nodes"], connection["pageInfo"]
+                      if not isinstance(nodes, list) or type(page["hasNextPage"]) is not bool:
+                          raise ValueError("Malformed review chronology page")
+                      for review in nodes:
+                          identifier = review["databaseId"]
+                          if type(identifier) is not int or identifier <= 0 or identifier in updates:
+                              raise ValueError("Ambiguous review chronology")
+                          timestamp(review.get("updatedAt"))
+                          updates[identifier] = review["updatedAt"]
+                      if not page["hasNextPage"]:
+                          return updates
+                      cursor = page["endCursor"]
+                      if not isinstance(cursor, str) or not cursor or cursor in cursors or not nodes:
+                          raise ValueError("Incomplete review chronology pagination")
+                      cursors.add(cursor)
+                  raise ValueError("Review chronology pagination limit reached")
+
               def privileged(self, user):
                   if (not isinstance(user, dict) or user.get("type") != "User"
                           or type(user.get("id")) is not int or not isinstance(user.get("login"), str)
@@ -594,6 +630,11 @@ jobs:
                   reactions = [r for r in reactions if bot(r)]
                   inline = self.pages(f"pulls/{number}/comments")
                   reviews = self.pages(f"pulls/{number}/reviews")
+                  if unknown_findings and any(bot(review) for review in reviews):
+                      updates = self.review_updates(number)
+                      for review in reviews:
+                          if bot(review):
+                              review["updated_at"] = updates[review["id"]]
                   threads = self.review_threads(number)
                   if not set(threads).issubset({c["id"] for c in inline}):
                       raise ValueError("Review threads missing from inline evidence")
@@ -644,8 +685,10 @@ jobs:
                                                comment_body, re.MULTILINE)
                           if len(commits) != 1 or comment_body.count("**Reviewed commit:**") != 1:
                               raise ValueError("Ambiguous manual reviewed commit")
-                          if self.repo_call("commits/" + commits[0])["sha"] == head:
+                          current_head = self.repo_call("commits/" + commits[0])["sha"] == head
+                          if current_head or modern:
                               completions.append({"id": comment["id"], "digest": digest(review_evidence(comment)),
+                                                  "current_head": current_head,
                                                   "created": timestamp(comment.get("created_at")),
                                                   "updated": timestamp(comment.get("updated_at"))})
                       if completed and any(value is None for value in completion_times):
@@ -682,8 +725,9 @@ jobs:
                                     (review["state"] == "COMMENTED" and review.get("body", "").strip()
                                      and not is_clean_review_body(review["body"])))]
                       manual_evidence["finding_boundary"] = max(
-                          (max(timestamp(row[field]) for field in ("updated_at", "submitted_at", "created_at")
-                               if row.get(field)) for row in evidence), default=float("-inf"))
+                          (max(timestamp(row.get(field)) for field in
+                               (("submitted_at", "updated_at") if row.get("state") is not None else ("created_at", "updated_at")))
+                           for row in evidence), default=float("-inf"))
                   inventory.sort(key=lambda item: item["key"])
                   inventory_digest = digest(inventory)
                   review_digest = digest([review_evidence(summary), [review_evidence(r) for r in
