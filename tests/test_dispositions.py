@@ -3,7 +3,7 @@ import json
 import unittest
 from unittest import mock
 
-from test_codex_review_gate import gate, sample, FakeGitHub
+from test_codex_review_gate import gate, sample, FakeGitHub, ROOT
 import contextlib
 import io
 import urllib.error
@@ -45,12 +45,14 @@ class DispositionTests(unittest.TestCase):
                          'submitted_at': iso(50)}]
         self.comments.append({'id': 21, 'user': {'id': gate.BOT_ID},
                               'performed_via_github_app': {'id': gate.CODEX_APP_ID},
-                              'body': 'P2 Badge plain finding', 'updated_at': iso(50)})
+                              'body': 'P2 Badge plain finding', 'created_at': iso(50), 'updated_at': iso(50)})
         self.permission = {'permission': 'write', 'user': {'id': 42}}
         self.reactions = []
         self.api.repo_call = self.call
         self.api.pages = self.pages
         self.api.review_threads = lambda number: copy.deepcopy(self.resolved)
+        self.review_updated = {}
+        self.api.review_updates = lambda number: {r["id"]: self.review_updated.get(r["id"], r["submitted_at"]) for r in self.reviews}
         self.refresh_summary()
 
     def refresh_summary(self, status='Completed', completion=90):
@@ -361,6 +363,87 @@ class DispositionTests(unittest.TestCase):
         self.assertFalse(snapshot['completed'])
         self.assertTrue(snapshot['review_completed'])
         self.assertEqual(self.verdict(snapshot)[2][0], 'success')
+
+    def test_unknown_completed_flags_need_fresh_receipt_and_every_disposition_without_reaction(self):
+        self.metadata['code_review'].update(has_any_findings=None, has_unresolved_findings=None)
+        self.refresh_summary()
+        receipt = json.loads((ROOT / 'tests/fixtures/modern-clean.json').read_text())['comments'][1]
+        receipt.update(created_at=iso(88), updated_at=iso(88))
+        self.comments.append(receipt)
+        decisions = self.decisions()
+        snapshot = self.api.snapshot(1)
+        state = gate.initialize(snapshot, 120, observed_since=80)
+        self.assertEqual(gate.observe(state, snapshot, 120)[0], 'pending')
+        self.assertEqual(gate.observe(state, snapshot, 150)[0], 'success')
+        self.assertEqual(state['proof']['kind'], 'verified_dispositions')
+        self.assertEqual(len(state['proof']['replies']), 4)
+        self.assertIn('receipt', state['proof'])
+        for change in ('missing', 'head', 'base', 'outsider', 'stale', 'unresolved', 'receipt'):
+            with self.subTest(change=change):
+                saved_inline, saved_comments = copy.deepcopy(self.inline), copy.deepcopy(self.comments)
+                if change == 'missing':
+                    self.inline.remove(decisions[0])
+                elif change in ('head', 'base', 'stale'):
+                    decision = next(c for c in self.inline if c['id'] == decisions[0]['id'])
+                    if change == 'head':
+                        decision['body'] = decision['body'].replace('Head: ' + 'a' * 40, 'Head: ' + 'c' * 40)
+                    elif change == 'base':
+                        decision['body'] = decision['body'].replace('Base: main@', 'Base: other@')
+                    else:
+                        decision['created_at'] = decision['updated_at'] = iso(89)
+                elif change == 'outsider':
+                    self.permission = {'permission': 'read', 'user': {'id': 42}}
+                elif change == 'unresolved':
+                    self.resolved[11] = False
+                else:
+                    self.comments.remove(receipt)
+                changed = self.api.snapshot(1)
+                state = gate.initialize(changed, 120, observed_since=80)
+                self.assertEqual(gate.observe(state, changed, 120)[0], 'pending')
+                self.assertEqual(gate.observe(state, changed, 150)[0], 'pending')
+                self.inline, self.comments = saved_inline, saved_comments
+                self.permission = {'permission': 'write', 'user': {'id': 42}}
+                self.resolved[11] = True
+
+    def test_unknown_flags_receipt_must_follow_every_finding(self):
+        self.metadata['code_review'].update(has_any_findings=None, has_unresolved_findings=None)
+        self.refresh_summary()
+        receipt = json.loads((ROOT / 'tests/fixtures/modern-clean.json').read_text())['comments'][1]
+        receipt.update(created_at=iso(88), updated_at=iso(88))
+        self.comments.append(receipt)
+        for evidence in (self.inline[0], self.inline[2], self.comments[1], self.reviews[0], self.reviews[1], self.reviews[2]):
+            for time in (88, 89):
+                with self.subTest(evidence=evidence['id'], time=time):
+                    original = copy.deepcopy(evidence)
+                    field = 'submitted_at' if evidence in self.reviews else 'updated_at'
+                    evidence[field] = iso(time)
+                    self.decisions()
+                    snapshot = self.api.snapshot(1)
+                    state = gate.initialize(snapshot, 120, observed_since=80)
+                    gate.observe(state, snapshot, 120)
+                    self.assertEqual(gate.observe(state, snapshot, 150)[0], 'pending')
+                    evidence.clear()
+                    evidence.update(original)
+
+    def test_unknown_flags_require_authoritative_review_update_chronology(self):
+        self.metadata['code_review'].update(has_any_findings=None, has_unresolved_findings=None)
+        self.refresh_summary()
+        receipt = json.loads((ROOT / 'tests/fixtures/modern-clean.json').read_text())['comments'][1]
+        receipt.update(created_at=iso(88), updated_at=iso(88))
+        self.comments.append(receipt)
+        self.decisions()
+        for update in (iso(88), iso(89)):
+            self.review_updated[33] = update
+            snapshot = self.api.snapshot(1)
+            state = gate.initialize(snapshot, 120, observed_since=80)
+            gate.observe(state, snapshot, 120)
+            self.assertEqual(gate.observe(state, snapshot, 150)[0], 'pending')
+        self.review_updated[33] = None
+        with self.assertRaises(ValueError):
+            self.api.snapshot(1)
+        self.api.review_updates = lambda number: {}
+        with self.assertRaises(KeyError):
+            self.api.snapshot(1)
 
     def event(self, name, comment, previous=None, action='created'):
         import tempfile

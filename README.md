@@ -106,6 +106,34 @@ A later explicit manual clean review can supersede earlier associated resolved
 findings under the chronology above.
 Manual evidence is parsed even when structured metadata is present.
 
+A completed Code Review may report both finding flags as null. The observer treats
+those flags as unknown and requires a fresh trusted `codex-review-receipt:v1`
+completion on the exact current head. Only the known clean receipt template is
+accepted, including its reviewed commit and boilerplate. Partial null flags,
+unknown completed Security Review flags, and additional receipt text block.
+The receipt follows the same start, restart, timestamp, and ambiguity checks as
+manual completion. It cannot supply clean approval without a fresh trusted
+thumbs-up. When any historical findings exist, every finding still needs a valid
+current disposition and every inline thread must be resolved. That path can
+produce only `verified_dispositions`, which does not require a thumbs-up.
+Active structured review identity includes the status cell's start time, reviewed
+commit, and trigger. A changed cycle excludes earlier receipts. An ordinary
+summary update timestamp change during the same running cycle preserves a newly
+arrived receipt. The newest eligible modern receipt must name the current head;
+a newer wrong-head receipt blocks fallback to an older current-head receipt.
+
+Finding comments require both creation and update timestamps. Substantive review
+chronology requires submission and update timestamps. GitHub REST reviews omit
+the update timestamp, so unknown-flags observations enrich Codex review rows from
+the paginated GraphQL reviews connection, joining by database ID. Missing,
+malformed, ambiguous, or unavailable chronology blocks acceptance.
+
+The receipt must strictly follow every finding's creation or latest update and
+its associated substantive review submission or update. Missing timestamps and
+same-second ordering cannot establish that chronology. Its proof binds the
+receipt digest as well as each decision. A receipt alone
+with no findings and no fresh reaction remains pending.
+
 When review completion timestamps are available, an automatic clean thumbs-up
 must postdate the current completion, structured summary update, original observer
 start, and any observed restart. A late API observation of an old reaction does
@@ -224,7 +252,10 @@ observed a review restart cannot rewind their origins.
 Recovery cannot accept a review completed before observation began. Observing any running or failed review ends recovery and
 records any available manual completion-comment IDs as its baseline. Subsequent manual
 evidence must follow the first observation of that active review state. A changed
-summary or status advances this boundary; identical active polls do not. Completion
+structured review state or legacy summary/status advances this boundary; identical
+active polls and structured-summary timestamp updates alone do not. Receipts
+created after the first active observation remain eligible when seen before
+summary completion. Receipts already present at that observation stay excluded. Completion
 resets the active-state identity so a later restart advances the boundary again. Older initialized
 state without these IDs also records a baseline before accepting manual evidence.
 This prevents an earlier completion comment from approving an observed same-head

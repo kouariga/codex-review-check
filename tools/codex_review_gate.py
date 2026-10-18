@@ -92,6 +92,14 @@ def is_clean_review_body(body):
     return body.strip() in {"Didn't find any major issues.", "Codex Review: Didn't find any major issues."}
 
 
+def is_clean_review_receipt(body):
+    template = FINDING_REVIEW_WRAPPER.replace(
+        "### 💡 Codex Review\n\nHere are some automated review suggestions for this pull request.",
+        "Codex Review: Didn't find any major issues. Keep it up!")
+    normalized = re.sub(r"(\*\*Reviewed commit:\*\* `)[0-9a-f]{7,40}(`)", r"\1{commit}\2", body)
+    return body.startswith("<!-- codex-review-receipt:v1 -->") and normalized.split() == template.split()
+
+
 def unique_object(pairs):
     result = {}
     for key, value in pairs:
@@ -163,6 +171,7 @@ def structured_review(summary, rows, head):
     statuses = {"completed": "Completed", "running": "Running", "queued": "Queued",
                 "pending": "Pending", "failed": "Failed"}
     completions, reviews, active, failed, unresolved = [], {}, False, False, False
+    unknown_findings = False
     for kind, label in names.items():
         review = value[kind]
         matching = [row.split("|") for row in rows if label in row.split("|")[1]]
@@ -173,8 +182,11 @@ def structured_review(summary, rows, head):
                 raise ValueError("Missing structured review")
             continue
         status = review["status"]
+        unknown = (kind == "code_review" and status == "completed"
+                   and review["has_any_findings"] is None and review["has_unresolved_findings"] is None)
+        unknown_findings = unknown_findings or unknown
         findings_valid = all(type(review[field]) is bool or
-                             (status != "completed" and review[field] is None)
+                             ((status != "completed" or unknown) and review[field] is None)
                              for field in ("has_any_findings", "has_unresolved_findings"))
         if (not isinstance(review["commit_sha"], str)
                 or not re.fullmatch(r"[0-9a-f]{40}", review["commit_sha"])
@@ -191,14 +203,15 @@ def structured_review(summary, rows, head):
                 raise ValueError("Missing structured completion timestamp")
             completed_at = timestamp(times[0])
             completions.append(completed_at)
-        reviews[kind] = {"status": status, "completed_at": completed_at, "digest": digest(review)}
+        reviews[kind] = {"status": status, "completed_at": completed_at, "digest": digest([review, matching[0][2:5]])}
         active = active or status != "completed"
         failed = failed or status == "failed"
-        unresolved = unresolved or review["has_unresolved_findings"]
-    return {"digest": digest(value), "reviews": reviews, "completed_at": min(completions) if completions else None,
+        unresolved = unresolved or review["has_unresolved_findings"] is True
+    return {"digest": digest(reviews), "reviews": reviews, "completed_at": min(completions) if completions else None,
             "latest_completed_at": max(completions) if completions else None,
             "summary_updated": timestamp(summary.get("updated_at")),
             "completed": not active, "failed": failed, "unresolved": unresolved,
+            "unknown_findings": unknown_findings,
             "has_findings": any(r["has_any_findings"] for r in value.values())}
 
 
@@ -225,16 +238,18 @@ def observe(state, snapshot, now):
     fresh = sorted(set(snapshot["thumbs"]) - set(state["baseline"]))
     changed_summary = snapshot["summary"] != state["baseline_summary"]
     manual = snapshot.get("manual")
+    receipt_proof = None
     manual_proof = None
     if not snapshot.get("review_completed", snapshot["completed"]) or snapshot["eyes"] or snapshot["failed"]:
-        active = digest([snapshot["summary"], snapshot.get("review_completed", snapshot["completed"]),
+        active = digest([(snapshot.get("structured") or {}).get("digest", snapshot["summary"]),
+                         snapshot.get("review_completed", snapshot["completed"]),
                          snapshot["eyes"], snapshot["failed"]])
         if state.get("manual_active") != active:
             state["manual_since"] = now
             state["manual_active"] = active
+            if manual is not None:
+                state["manual_baseline"] = [c["id"] for c in manual["comments"]]
         state["manual_recovery"] = False
-        if manual is not None:
-            state["manual_baseline"] = [c["id"] for c in manual["comments"]]
     elif "manual_active" in state:
         del state["manual_active"]
     if manual is not None:
@@ -249,8 +264,12 @@ def observe(state, snapshot, now):
             latest = max(c["created"] for c in comments)
             comments = [c for c in comments if c["created"] == latest]
         valid_completion = (len(comments) == 1
+                            and comments[0].get("current_head", True)
+                            and manual.get("finding_boundary", float("-inf")) < comments[0]["created"]
                             and comments[0]["created"] <= comments[0]["updated"] <= manual["completed_at"] <= now
                             and math.floor(manual["completed_at"]) <= manual["summary_updated"] <= now)
+        if valid_completion:
+            receipt_proof = [comments[0], manual["completed_at"], manual["summary_updated"]]
         eligible = sorted(r for r, created in manual["thumbs"].items()
                           if origin < manual["completed_at"] < created <= now
                           and (state.get("manual_recovery") or r in fresh))
@@ -289,13 +308,17 @@ def observe(state, snapshot, now):
              and not snapshot["eyes"] and fresh
              and (state["eyes"] or changed_summary))
     structured = snapshot.get("structured")
+    unknown_findings = bool(structured and structured.get("unknown_findings"))
     lifecycle_valid = (snapshot.get("review_completed", snapshot["completed"]) and not snapshot["eyes"] and not snapshot["failed"]
+                       and (not unknown_findings or receipt_proof is not None)
                        and (structured is None or (structured["completed"] and not structured["unresolved"]
                            and structured["latest_completed_at"] is not None
                            and structured["latest_completed_at"] <= now
                            and math.floor(structured["latest_completed_at"]) <= structured["summary_updated"] <= now)))
     if structured is not None:
         clean = clean and (bool(manual_proof) or not structured["has_findings"])
+    if unknown_findings:
+        clean = clean and bool(manual_proof) and not structured["has_findings"] and not snapshot.get("inventory")
     if manual is None and "reaction_times" in snapshot:
         boundary = max(state.get("observed_since", state["started"]),
                        state.get("manual_since", state.get("observed_since", state["started"])),
@@ -319,6 +342,9 @@ def observe(state, snapshot, now):
                     "author": dispositions[key]["author"], "digest": dispositions[key]["digest"]}
                    for key in sorted(dispositions)]
         proof = {"kind": "verified_dispositions", "replies": replies, "digest": digest(replies)}
+        if unknown_findings:
+            proof["receipt"] = receipt_proof
+            proof["digest"] = digest([replies, receipt_proof])
     if proof is None or not lifecycle_valid:
         state["candidate"] = state["candidate_at"] = None
         reason = "Waiting for fresh trusted reaction and completed current-head review"
@@ -433,6 +459,41 @@ class GitHub:
             cursors.add(cursor)
         raise ValueError("Review thread pagination limit reached")
 
+    def review_updates(self, number):
+        owner, name = self.repo.split("/")
+        query = """query($owner:String!,$name:String!,$number:Int!,$after:String) {
+          repository(owner:$owner,name:$name) { pullRequest(number:$number) {
+            reviews(first:100,after:$after) {
+              nodes { databaseId updatedAt }
+              pageInfo { hasNextPage endCursor }
+            }
+          } }
+        }"""
+        updates, cursors = {}, set()
+        cursor = None
+        for _ in range(100):
+            response = self.call("graphql", {"query": query, "variables": {
+                "owner": owner, "name": name, "number": number, "after": cursor}})
+            if response.get("errors"):
+                raise ValueError("GraphQL review chronology unavailable")
+            connection = response["data"]["repository"]["pullRequest"]["reviews"]
+            nodes, page = connection["nodes"], connection["pageInfo"]
+            if not isinstance(nodes, list) or type(page["hasNextPage"]) is not bool:
+                raise ValueError("Malformed review chronology page")
+            for review in nodes:
+                identifier = review["databaseId"]
+                if type(identifier) is not int or identifier <= 0 or identifier in updates:
+                    raise ValueError("Ambiguous review chronology")
+                timestamp(review.get("updatedAt"))
+                updates[identifier] = review["updatedAt"]
+            if not page["hasNextPage"]:
+                return updates
+            cursor = page["endCursor"]
+            if not isinstance(cursor, str) or not cursor or cursor in cursors or not nodes:
+                raise ValueError("Incomplete review chronology pagination")
+            cursors.add(cursor)
+        raise ValueError("Review chronology pagination limit reached")
+
     def privileged(self, user):
         if (not isinstance(user, dict) or user.get("type") != "User"
                 or type(user.get("id")) is not int or not isinstance(user.get("login"), str)
@@ -526,12 +587,18 @@ class GitHub:
             resolved = self.repo_call("commits/" + match[1])["sha"]
             completed = completed and resolved == head and "**Completed**" in cells[2]
         structured = structured_review(summary, rows, head)
+        unknown_findings = bool(structured and structured["unknown_findings"])
         if structured is not None:
             completed = completed and structured["completed"]
         reactions = self.pages(f"issues/{number}/reactions")
         reactions = [r for r in reactions if bot(r)]
         inline = self.pages(f"pulls/{number}/comments")
         reviews = self.pages(f"pulls/{number}/reviews")
+        if unknown_findings and any(bot(review) for review in reviews):
+            updates = self.review_updates(number)
+            for review in reviews:
+                if bot(review):
+                    review["updated_at"] = updates[review["id"]]
         threads = self.review_threads(number)
         if not set(threads).issubset({c["id"] for c in inline}):
             raise ValueError("Review threads missing from inline evidence")
@@ -564,18 +631,28 @@ class GitHub:
                      and re.search(r"\bP[0-3] Badge\b", c["body"])]
         review_completed = bool(completed)
         manual_evidence = None
-        if manual:
+        if manual or unknown_findings or (structured is not None and not structured["completed"]):
             completions = []
             for comment in comments:
-                if not trusted(comment) or not comment["body"].startswith(
-                        "Codex Review: Didn't find any major issues."):
+                if not trusted(comment):
+                    continue
+                comment_body = comment["body"]
+                modern = comment_body.startswith("<!-- codex-review-receipt:")
+                if modern and not is_clean_review_receipt(comment_body):
+                    raise ValueError("Unknown clean review receipt format")
+                content = comment_body.removeprefix("<!-- codex-review-receipt:v1 -->").lstrip() if modern else comment_body
+                if not content.startswith("Codex Review: Didn't find any major issues."):
+                    continue
+                if unknown_findings and not modern:
                     continue
                 commits = re.findall(r"^\*\*Reviewed commit:\*\* `([0-9a-f]{7,40})`$",
-                                     comment["body"], re.MULTILINE)
-                if len(commits) != 1 or comment["body"].count("**Reviewed commit:**") != 1:
+                                     comment_body, re.MULTILINE)
+                if len(commits) != 1 or comment_body.count("**Reviewed commit:**") != 1:
                     raise ValueError("Ambiguous manual reviewed commit")
-                if self.repo_call("commits/" + commits[0])["sha"] == head:
+                current_head = self.repo_call("commits/" + commits[0])["sha"] == head
+                if current_head or modern:
                     completions.append({"id": comment["id"], "digest": digest(review_evidence(comment)),
+                                        "current_head": current_head,
                                         "created": timestamp(comment.get("created_at")),
                                         "updated": timestamp(comment.get("updated_at"))})
             if completed and any(value is None for value in completion_times):
@@ -605,6 +682,16 @@ class GitHub:
             if substantive and not (is_finding_review_wrapper(review.get("body", ""))
                                     and any(c.get("pull_request_review_id") == review["id"] for c in codex_inline)):
                 inventory.append({"key": "review:" + str(review["id"]), "review": review_evidence(review)})
+        if manual_evidence is not None and unknown_findings:
+            evidence = [item.get("root") or item.get("comment") or item["review"] for item in inventory]
+            evidence += [review for review in reviews if bot(review) and
+                         (review["state"] == "CHANGES_REQUESTED" or
+                          (review["state"] == "COMMENTED" and review.get("body", "").strip()
+                           and not is_clean_review_body(review["body"])))]
+            manual_evidence["finding_boundary"] = max(
+                (max(timestamp(row.get(field)) for field in
+                     (("submitted_at", "updated_at") if row.get("state") is not None else ("created_at", "updated_at")))
+                 for row in evidence), default=float("-inf"))
         inventory.sort(key=lambda item: item["key"])
         inventory_digest = digest(inventory)
         review_digest = digest([review_evidence(summary), [review_evidence(r) for r in
