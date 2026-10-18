@@ -302,6 +302,34 @@ class ModernReceiptTests(unittest.TestCase):
         fixture["comments"][0]["body"] = fixture["comments"][0]["body"].replace("Manual request", "New commits")
         self.assertEqual(self.result(self.snapshot(fixture))[0], "success")
 
+    def test_receipt_arriving_during_running_poll_remains_fresh(self):
+        fixture = self.with_reaction()
+        complete = self.snapshot(fixture)
+        running_fixture = copy.deepcopy(fixture)
+        summary = running_fixture["comments"][0]
+        summary["body"] = summary["body"].replace('"status":"completed"', '"status":"running"').replace("**Completed**", "**Running**")
+        running_fixture["comments"] = [summary]
+        running_fixture["reactions"] = []
+        running = self.snapshot(running_fixture)
+        origin = gate.timestamp("2026-10-18T03:54:00Z")
+        state = gate.initialize(running, origin)
+        gate.observe(state, running, origin + 30)
+        running_fixture["comments"].append(fixture["comments"][1])
+        summary["updated_at"] = "2026-10-18T03:55:33Z"
+        gate.observe(state, self.snapshot(running_fixture), origin + 93)
+        self.assertEqual(gate.observe(state, complete, origin + 120)[0], "pending")
+        self.assertEqual(gate.observe(state, complete, origin + 150)[0], "success")
+        restarted = self.snapshot(running_fixture)
+        gate.observe(state, restarted, origin + 160)
+        for now in (origin + 180, origin + 210):
+            self.assertEqual(gate.observe(state, complete, now)[0], "pending")
+
+    def test_trusted_prose_can_mention_receipt_marker(self):
+        fixture = self.with_reaction()
+        fixture["comments"].append(fixture["comments"][1] | {
+            "id": 3, "body": "The code uses `codex-review-receipt:v1` as a marker."})
+        self.assertEqual(self.result(self.snapshot(fixture))[0], "success")
+
     def test_unknown_flags_cannot_use_reaction_without_modern_receipt(self):
         for change in ("missing", "legacy", "spoof_user", "spoof_app", "wrong_head", "extra_text", "duplicate_marker"):
             with self.subTest(change=change):

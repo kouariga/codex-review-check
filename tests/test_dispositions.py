@@ -403,6 +403,26 @@ class DispositionTests(unittest.TestCase):
                 self.permission = {'permission': 'write', 'user': {'id': 42}}
                 self.resolved[11] = True
 
+    def test_unknown_flags_receipt_must_follow_every_finding(self):
+        self.metadata['code_review'].update(has_any_findings=None, has_unresolved_findings=None)
+        self.refresh_summary()
+        receipt = json.loads((ROOT / 'tests/fixtures/modern-clean.json').read_text())['comments'][1]
+        receipt.update(created_at=iso(88), updated_at=iso(88))
+        self.comments.append(receipt)
+        for evidence in (self.inline[0], self.inline[2], self.comments[1], self.reviews[0], self.reviews[1], self.reviews[2]):
+            for time in (88, 89):
+                with self.subTest(evidence=evidence['id'], time=time):
+                    original = copy.deepcopy(evidence)
+                    field = 'submitted_at' if evidence in self.reviews else 'updated_at'
+                    evidence[field] = iso(time)
+                    self.decisions()
+                    snapshot = self.api.snapshot(1)
+                    state = gate.initialize(snapshot, 120, observed_since=80)
+                    gate.observe(state, snapshot, 120)
+                    self.assertEqual(gate.observe(state, snapshot, 150)[0], 'pending')
+                    evidence.clear()
+                    evidence.update(original)
+
     def event(self, name, comment, previous=None, action='created'):
         import tempfile
         event = {'action': action, 'issue': {'number': 1, 'pull_request': {'url': 'pr'}},
