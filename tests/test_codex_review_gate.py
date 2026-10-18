@@ -268,6 +268,164 @@ class StructuredReviewTests(unittest.TestCase):
             self.assertFalse(snapshot["completed"])
 
 
+class ModernReceiptTests(unittest.TestCase):
+    def fixture(self):
+        return json.loads((ROOT / "tests/fixtures/modern-clean.json").read_text())
+
+    def snapshot(self, fixture):
+        return ManualFixtureTests().api(fixture).snapshot(1)
+
+    def with_reaction(self):
+        fixture = self.fixture()
+        fixture["reactions"] = [{"id": 10, "content": "+1", "created_at": "2026-10-18T03:55:37Z",
+                                 "user": {"id": gate.BOT_ID}}]
+        return fixture
+
+    def state(self, snapshot):
+        origin = gate.timestamp("2026-10-18T03:54:00Z")
+        return gate.initialize(snapshot, origin + 120, observed_since=origin)
+
+    def result(self, snapshot):
+        now = gate.timestamp("2026-10-18T03:56:00Z")
+        state = self.state(snapshot)
+        self.assertEqual(gate.observe(state, snapshot, now)[0], "pending")
+        return gate.observe(state, snapshot, now + 30)[0], state
+
+    def test_modern_unknown_flags_require_fresh_receipt_and_reaction(self):
+        snapshot = self.snapshot(self.with_reaction())
+        self.assertTrue(snapshot["structured"]["unknown_findings"])
+        result, state = self.result(snapshot)
+        self.assertEqual(result, "success")
+        self.assertEqual(state["proof"]["kind"], "clean_codex")
+        self.assertEqual(self.result(self.snapshot(self.fixture()))[0], "pending")
+        fixture = self.with_reaction()
+        fixture["comments"][0]["body"] = fixture["comments"][0]["body"].replace("Manual request", "New commits")
+        self.assertEqual(self.result(self.snapshot(fixture))[0], "success")
+
+    def test_unknown_flags_cannot_use_reaction_without_modern_receipt(self):
+        for change in ("missing", "legacy", "spoof_user", "spoof_app", "wrong_head", "extra_text", "duplicate_marker"):
+            with self.subTest(change=change):
+                fixture = self.with_reaction()
+                receipt = fixture["comments"][1]
+                if change == "missing":
+                    fixture["comments"].pop()
+                elif change == "legacy":
+                    receipt["body"] = receipt["body"].removeprefix("<!-- codex-review-receipt:v1 -->\n\n")
+                elif change == "spoof_user":
+                    receipt["user"]["id"] = 123
+                elif change == "spoof_app":
+                    receipt["performed_via_github_app"]["id"] = 123
+                elif change == "wrong_head":
+                    receipt["body"] = receipt["body"].replace("`aaaaaaaaaa`", "`bbbbbbbbbb`")
+                elif change == "extra_text":
+                    receipt["body"] += "\nA finding remains unresolved."
+                elif change == "duplicate_marker":
+                    receipt["body"] = "<!-- codex-review-receipt:v1 -->\n\n" + receipt["body"]
+                try:
+                    snapshot = self.snapshot(fixture)
+                except ValueError:
+                    continue
+                self.assertEqual(self.result(snapshot)[0], "pending")
+
+    def test_unknown_flags_cannot_use_stale_ambiguous_or_active_evidence(self):
+        for change in ("old_receipt", "old_reaction", "future_reaction", "ambiguous", "eyes", "running", "failed"):
+            with self.subTest(change=change):
+                fixture = self.with_reaction()
+                receipt = fixture["comments"][1]
+                if change == "old_receipt":
+                    receipt["created_at"] = receipt["updated_at"] = "2026-10-18T03:53:59Z"
+                elif change == "old_reaction":
+                    fixture["reactions"][0]["created_at"] = "2026-10-18T03:55:34Z"
+                elif change == "future_reaction":
+                    fixture["reactions"][0]["created_at"] = "2026-10-18T03:57:00Z"
+                elif change == "ambiguous":
+                    fixture["comments"].append(receipt | {"id": 3})
+                elif change == "eyes":
+                    fixture["reactions"].append({"id": 11, "content": "eyes", "user": {"id": gate.BOT_ID}})
+                else:
+                    summary = fixture["comments"][0]
+                    summary["body"] = summary["body"].replace('"status":"completed"', '"status":"' + change + '"')
+                    summary["body"] = summary["body"].replace("**Completed**", "**" + change.title() + "**")
+                snapshot = self.snapshot(fixture)
+                if change == "failed":
+                    now = gate.timestamp("2026-10-18T03:56:00Z")
+                    self.assertEqual(gate.observe(self.state(snapshot), snapshot, now)[0], "failure")
+                else:
+                    self.assertEqual(self.result(snapshot)[0], "pending")
+
+    def test_partial_null_and_unknown_security_findings_are_rejected(self):
+        for flags in ((None, False), (False, None), (True, None), (None, True)):
+            fixture = self.with_reaction()
+            body = fixture["comments"][0]["body"]
+            marker = body.split("<!-- codex-review-state:v1 ")[1].split(" -->")[0]
+            value = json.loads(marker)
+            value["code_review"].update(has_any_findings=flags[0], has_unresolved_findings=flags[1])
+            fixture["comments"][0]["body"] = body.replace(marker, json.dumps(value))
+            with self.subTest(flags=flags), self.assertRaises(ValueError):
+                self.snapshot(fixture)
+        fixture = self.with_reaction()
+        body = fixture["comments"][0]["body"]
+        marker = body.split("<!-- codex-review-state:v1 ")[1].split(" -->")[0]
+        value = json.loads(marker)
+        value["security_review"] = copy.deepcopy(value["code_review"])
+        fixture["comments"][0]["body"] = body.replace(marker, json.dumps(value)) + '\n| **Security Review** | **Completed** <relative-time datetime="2026-10-18T03:55:34Z">done</relative-time> | `aaaaaaa` | Manual request |'
+        with self.assertRaises(ValueError):
+            self.snapshot(fixture)
+
+    def test_unknown_flags_cannot_bypass_historical_dispositions(self):
+        snapshot = self.snapshot(self.fixture())
+        root = {"id": 20, "original_commit_id": "b" * 40, "created_at": "2026-10-18T03:50:00Z"}
+        snapshot["inventory"] = [{"key": "inline:20", "root": root, "resolved": True}]
+        self.assertEqual(self.result(snapshot)[0], "pending")
+        snapshot["dispositions"] = {"inline:20": {"id": 21, "valid": True, "author": 42,
+                                                "created": gate.timestamp("2026-10-18T03:55:40Z"), "digest": "verified"}}
+        result, state = self.result(snapshot)
+        self.assertEqual(result, "success")
+        self.assertEqual(state["proof"]["kind"], "verified_dispositions")
+        now = gate.timestamp("2026-10-18T03:56:00Z")
+        state = self.state(snapshot)
+        gate.observe(state, snapshot, now)
+        snapshot["manual"]["comments"][0]["digest"] = "changed-receipt"
+        self.assertEqual(gate.observe(state, snapshot, now + 30)[0], "pending")
+        snapshot["manual"]["comments"] = []
+        self.assertEqual(self.result(snapshot)[0], "pending")
+
+    def test_invalid_newest_receipt_cannot_fall_back_to_older_clean_receipt(self):
+        for change in ("extra_text", "duplicate_marker", "unknown_marker", "malformed_body"):
+            with self.subTest(change=change):
+                fixture = self.with_reaction()
+                newest = copy.deepcopy(fixture["comments"][1])
+                newest.update(id=3, created_at="2026-10-18T03:55:33Z", updated_at="2026-10-18T03:55:33Z")
+                if change == "extra_text":
+                    newest["body"] += "\nA finding remains unresolved."
+                elif change == "duplicate_marker":
+                    newest["body"] = "<!-- codex-review-receipt:v1 -->\n\n" + newest["body"]
+                elif change == "unknown_marker":
+                    newest["body"] = newest["body"].replace("receipt:v1", "receipt:v2")
+                else:
+                    newest["body"] = newest["body"].replace("Didn't find any major issues.", "A finding remains unresolved.")
+                fixture["comments"].append(newest)
+                with self.assertRaises(ValueError):
+                    self.snapshot(fixture)
+
+    def test_explicit_unresolved_flags_override_modern_clean_receipt(self):
+        fixture = self.with_reaction()
+        body = fixture["comments"][0]["body"]
+        fixture["comments"][0]["body"] = body.replace('"has_any_findings":null,"has_unresolved_findings":null',
+                                                                  '"has_any_findings":true,"has_unresolved_findings":true', 1)
+        self.assertEqual(self.result(self.snapshot(fixture))[0], "pending")
+
+    def test_unknown_code_flags_cannot_hide_reported_security_findings(self):
+        fixture = self.with_reaction()
+        body = fixture["comments"][0]["body"]
+        marker = body.split("<!-- codex-review-state:v1 ")[1].split(" -->")[0]
+        value = json.loads(marker)
+        value["security_review"] = {"commit_sha": "a" * 40, "status": "completed",
+                                    "has_any_findings": True, "has_unresolved_findings": False}
+        fixture["comments"][0]["body"] = body.replace(marker, json.dumps(value)) + '\n| **Security Review** | **Completed** <relative-time datetime="2026-10-18T03:55:34Z">done</relative-time> | `aaaaaaa` | Manual request |'
+        self.assertEqual(self.result(self.snapshot(fixture))[0], "pending")
+
+
 class ManualFixtureTests(unittest.TestCase):
     def fixture(self, number=1):
         return json.loads((ROOT / f"tests/fixtures/manual-{number}.json").read_text())

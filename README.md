@@ -106,6 +106,19 @@ A later explicit manual clean review can supersede earlier associated resolved
 findings under the chronology above.
 Manual evidence is parsed even when structured metadata is present.
 
+A completed Code Review may report both finding flags as null. The observer treats
+those flags as unknown and requires a fresh trusted `codex-review-receipt:v1`
+completion on the exact current head. Only the known clean receipt template is
+accepted, including its reviewed commit and boilerplate. Partial null flags,
+unknown completed Security Review flags, and additional receipt text block.
+The receipt follows the same start, restart, timestamp, and ambiguity checks as
+manual completion. It cannot supply clean approval without a fresh trusted
+thumbs-up. When any historical findings exist, every finding still needs a valid
+current disposition and every inline thread must be resolved. That path can
+produce only `verified_dispositions`, which does not require a thumbs-up.
+Its proof binds the receipt digest as well as each decision. A receipt alone
+with no findings and no fresh reaction remains pending.
+
 When review completion timestamps are available, an automatic clean thumbs-up
 must postdate the current completion, structured summary update, original observer
 start, and any observed restart. A late API observation of an old reaction does
