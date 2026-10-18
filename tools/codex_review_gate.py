@@ -241,14 +241,15 @@ def observe(state, snapshot, now):
     receipt_proof = None
     manual_proof = None
     if not snapshot.get("review_completed", snapshot["completed"]) or snapshot["eyes"] or snapshot["failed"]:
-        active = digest([snapshot["summary"], snapshot.get("review_completed", snapshot["completed"]),
+        active = digest([(snapshot.get("structured") or {}).get("digest", snapshot["summary"]),
+                         snapshot.get("review_completed", snapshot["completed"]),
                          snapshot["eyes"], snapshot["failed"]])
         if state.get("manual_active") != active:
             state["manual_since"] = now
             state["manual_active"] = active
+            if manual is not None:
+                state["manual_baseline"] = [c["id"] for c in manual["comments"]]
         state["manual_recovery"] = False
-        if manual is not None:
-            state["manual_baseline"] = [c["id"] for c in manual["comments"]]
     elif "manual_active" in state:
         del state["manual_active"]
     if manual is not None:
@@ -263,6 +264,7 @@ def observe(state, snapshot, now):
             latest = max(c["created"] for c in comments)
             comments = [c for c in comments if c["created"] == latest]
         valid_completion = (len(comments) == 1
+                            and manual.get("finding_boundary", float("-inf")) < comments[0]["created"]
                             and comments[0]["created"] <= comments[0]["updated"] <= manual["completed_at"] <= now
                             and math.floor(manual["completed_at"]) <= manual["summary_updated"] <= now)
         if valid_completion:
@@ -588,13 +590,13 @@ class GitHub:
                      and re.search(r"\bP[0-3] Badge\b", c["body"])]
         review_completed = bool(completed)
         manual_evidence = None
-        if manual or unknown_findings:
+        if manual or unknown_findings or (structured is not None and not structured["completed"]):
             completions = []
             for comment in comments:
                 if not trusted(comment):
                     continue
                 comment_body = comment["body"]
-                modern = "codex-review-receipt:" in comment_body
+                modern = comment_body.startswith("<!-- codex-review-receipt:")
                 if modern and not is_clean_review_receipt(comment_body):
                     raise ValueError("Unknown clean review receipt format")
                 content = comment_body.removeprefix("<!-- codex-review-receipt:v1 -->").lstrip() if modern else comment_body
@@ -637,6 +639,15 @@ class GitHub:
             if substantive and not (is_finding_review_wrapper(review.get("body", ""))
                                     and any(c.get("pull_request_review_id") == review["id"] for c in codex_inline)):
                 inventory.append({"key": "review:" + str(review["id"]), "review": review_evidence(review)})
+        if manual_evidence is not None and unknown_findings:
+            evidence = [item.get("root") or item.get("comment") or item["review"] for item in inventory]
+            evidence += [review for review in reviews if bot(review) and
+                         (review["state"] == "CHANGES_REQUESTED" or
+                          (review["state"] == "COMMENTED" and review.get("body", "").strip()
+                           and not is_clean_review_body(review["body"])))]
+            manual_evidence["finding_boundary"] = max(
+                (max(timestamp(row[field]) for field in ("updated_at", "submitted_at", "created_at")
+                     if row.get(field)) for row in evidence), default=float("-inf"))
         inventory.sort(key=lambda item: item["key"])
         inventory_digest = digest(inventory)
         review_digest = digest([review_evidence(summary), [review_evidence(r) for r in

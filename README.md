@@ -116,7 +116,10 @@ manual completion. It cannot supply clean approval without a fresh trusted
 thumbs-up. When any historical findings exist, every finding still needs a valid
 current disposition and every inline thread must be resolved. That path can
 produce only `verified_dispositions`, which does not require a thumbs-up.
-Its proof binds the receipt digest as well as each decision. A receipt alone
+The receipt must strictly follow every finding's creation or latest update and
+its associated substantive review submission or update. Missing timestamps and
+same-second ordering cannot establish that chronology. Its proof binds the
+receipt digest as well as each decision. A receipt alone
 with no findings and no fresh reaction remains pending.
 
 When review completion timestamps are available, an automatic clean thumbs-up
@@ -237,7 +240,10 @@ observed a review restart cannot rewind their origins.
 Recovery cannot accept a review completed before observation began. Observing any running or failed review ends recovery and
 records any available manual completion-comment IDs as its baseline. Subsequent manual
 evidence must follow the first observation of that active review state. A changed
-summary or status advances this boundary; identical active polls do not. Completion
+structured review state or legacy summary/status advances this boundary; identical
+active polls and structured-summary timestamp updates alone do not. Receipts
+created after the first active observation remain eligible when seen before
+summary completion. Receipts already present at that observation stay excluded. Completion
 resets the active-state identity so a later restart advances the boundary again. Older initialized
 state without these IDs also records a baseline before accepting manual evidence.
 This prevents an earlier completion comment from approving an observed same-head

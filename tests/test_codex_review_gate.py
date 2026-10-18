@@ -307,7 +307,7 @@ class ModernReceiptTests(unittest.TestCase):
         complete = self.snapshot(fixture)
         running_fixture = copy.deepcopy(fixture)
         summary = running_fixture["comments"][0]
-        summary["body"] = summary["body"].replace('"status":"completed"', '"status":"running"').replace("**Completed**", "**Running**")
+        summary["body"] = summary["body"].replace("Manual request", "New commits").replace('"status":"completed"', '"status":"running"').replace("**Completed**", "**Running**")
         running_fixture["comments"] = [summary]
         running_fixture["reactions"] = []
         running = self.snapshot(running_fixture)
@@ -329,6 +329,20 @@ class ModernReceiptTests(unittest.TestCase):
         fixture["comments"].append(fixture["comments"][1] | {
             "id": 3, "body": "The code uses `codex-review-receipt:v1` as a marker."})
         self.assertEqual(self.result(self.snapshot(fixture))[0], "success")
+        fixture["comments"][-1]["body"] = "P2 Badge The code uses `codex-review-receipt:v1` as a marker."
+        self.assertEqual(self.result(self.snapshot(fixture))[0], "pending")
+
+    def test_receipt_existing_at_first_active_observation_stays_excluded(self):
+        fixture = self.with_reaction()
+        complete = self.snapshot(fixture)
+        fixture["comments"][0]["body"] = fixture["comments"][0]["body"].replace(
+            '"status":"completed"', '"status":"running"').replace("**Completed**", "**Running**")
+        running = self.snapshot(fixture)
+        origin = gate.timestamp("2026-10-18T03:54:00Z")
+        state = gate.initialize(running, origin, observed_since=origin)
+        gate.observe(state, running, origin + 93)
+        for now in (origin + 120, origin + 150):
+            self.assertEqual(gate.observe(state, complete, now)[0], "pending")
 
     def test_unknown_flags_cannot_use_reaction_without_modern_receipt(self):
         for change in ("missing", "legacy", "spoof_user", "spoof_app", "wrong_head", "extra_text", "duplicate_marker"):
