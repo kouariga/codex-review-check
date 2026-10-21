@@ -951,16 +951,22 @@ jobs:
                                "started": now, "initialized": False}
                   elif check["conclusion"] == "success":
                       accepted_since = state.get("candidate_at")
-                      renewed = dict(state, started=now, candidate_at=now - INTERVAL)
-                      try:
-                          snapshot = api.snapshot(number)
-                          status, reason = observe(renewed, snapshot, now)
-                          if status == "success" and original_proof == renewed.get("proof"):
-                              return True
-                      except APIBlocked:
-                          raise
-                      except Exception:
-                          pass
+                      while True:
+                          if clock() - now >= TIMEOUT:
+                              raise TimeoutError("Timed out revalidating prior review acceptance")
+                          try:
+                              snapshot = api.snapshot(number)
+                              renewed = copy.deepcopy(state)
+                              renewed.update(started=now, candidate_at=clock() - INTERVAL)
+                              status, reason = observe(renewed, snapshot, clock())
+                              break
+                          except APIBlocked:
+                              raise
+                          except Exception as error:
+                              print("Evidence unavailable: " + type(error).__name__, flush=True)
+                              sleep(INTERVAL)
+                      if status == "success" and original_proof == renewed.get("proof"):
+                          return True
                       state = renewed
                       if accepted_since is not None:
                           state["manual_since"] = max(state.get("manual_since", accepted_since), accepted_since)

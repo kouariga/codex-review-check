@@ -126,6 +126,37 @@ class RequiredGateTests(unittest.TestCase):
                 self.assertEqual([row['status'] for row in api.writes],
                                  ['in_progress', 'in_progress', 'completed'])
 
+    def test_cached_acceptance_recovers_after_transient_snapshot_error(self):
+        for manual in (False, True):
+            with self.subTest(manual=manual):
+                clean = sample(thumbs=['fresh'], summary='completed', completed=True,
+                               completed_at=10, reaction_times={'fresh': 12})
+                if manual:
+                    clean['manual'] = {
+                        'comments': [{'id': 'receipt', 'created': 9,
+                                      'updated': 9, 'digest': 'receipt'}],
+                        'thumbs': {'fresh': 12}, 'completed_at': 10,
+                        'summary_updated': 11}
+                state = gate.initialize(sample(), 0)
+                self.assertEqual(gate.observe(state, clean, 20)[0], 'pending')
+                self.assertEqual(gate.observe(state, clean, 50)[0], 'success')
+                api = FakeGitHub([OSError('temporary'), clean],
+                                 saved_check(conclusion='success', state=state))
+                self.assertIs(self.run_gate(api), True)
+                self.assertEqual(api.check['conclusion'], 'success')
+                self.assertEqual(api.writes, [])
+
+    def test_cached_acceptance_revalidation_has_a_bounded_retry(self):
+        clean = sample(thumbs=['fresh'], summary='completed', completed=True)
+        state = gate.initialize(sample(), 0)
+        gate.observe(state, clean, 0)
+        gate.observe(state, clean, 30)
+        api = FakeGitHub([OSError('unavailable')],
+                         saved_check(conclusion='success', state=state))
+        with self.assertRaises(TimeoutError):
+            self.run_gate(api)
+        self.assertEqual(api.writes, [])
+
     def test_snapshot_error_cannot_reuse_prior_lifecycle_receipt(self):
         receipt = {'id': 'receipt', 'created': 9, 'updated': 9, 'digest': 'receipt'}
         first = sample(thumbs=['first'], summary='first', completed=True, manual={
