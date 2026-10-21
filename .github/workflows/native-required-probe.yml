@@ -1,0 +1,17 @@
+name: Native required lifecycle fixture
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+permissions:
+  contents: read
+jobs:
+  codex-cloud-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Exercise native check lifecycle without review attestation
+        env:
+          ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          echo "Isolated fixture attempt $ATTEMPT. This is not Codex review approval."
+          sleep 30
+          test "$ATTEMPT" != 2
