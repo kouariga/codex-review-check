@@ -183,6 +183,7 @@ class RequiredGateTests(unittest.TestCase):
         state['disposition_floors'] = {'finding': 99}
         second = sample(thumbs=['second'], summary='second', completed=True)
         unresolved = {'completed': True, 'unresolved': True, 'has_findings': False,
+                      'unknown_findings': False, 'completed_at': 50,
                       'latest_completed_at': 50, 'summary_updated': 51}
         for change in ({'eyes': True}, {'completed': False}, {'failed': True},
                        {'unresolved_threads': True}, {'structured': unresolved}):
