@@ -283,9 +283,7 @@ class ModernReceiptTests(unittest.TestCase):
 
     def state(self, snapshot):
         origin = gate.timestamp("2026-10-18T03:54:00Z")
-        return gate.initialize(snapshot if snapshot.get("manual") is not None else
-                               snapshot | {"thumbs": [], "summary": "running-summary"},
-                               origin + 120, observed_since=origin)
+        return gate.initialize(snapshot, origin + 120, observed_since=origin)
 
     def result(self, snapshot):
         now = gate.timestamp("2026-10-18T03:56:00Z")
@@ -1090,6 +1088,17 @@ class ExplicitCleanReactionTests(unittest.TestCase):
                 if change == "baseline": state["baseline"] = snapshot["thumbs"]
                 self.assertEqual(self.result(snapshot, state)[0], "pending")
 
+    def test_recovered_observation_uses_saved_start_with_existing_thumb(self):
+        snapshot = self.snapshot(self.fixture())
+        origin = gate.timestamp("2026-10-18T03:54:00Z")
+        now = origin + 120
+        state = gate.initialize(snapshot, now, observed_since=origin)
+        self.assertEqual(self.result(snapshot, state)[0], "success")
+        for boundary in (now, origin + 100):
+            with self.subTest(boundary=boundary):
+                state = gate.initialize(snapshot, now, observed_since=boundary)
+                self.assertEqual(self.result(snapshot, state)[0], "pending")
+
     def test_explicit_nonclean_lifecycle_never_accepts_arbitrary_receipt(self):
         for status in ("running", "queued", "pending", "failed", "findings", "unresolved"):
             with self.subTest(status=status):
@@ -1165,6 +1174,18 @@ class ExplicitCleanReactionTests(unittest.TestCase):
                 snapshot["inventory"][0]["root"]["updated_at"] = updated
                 snapshot["inventory_digest"] = gate.digest(snapshot["inventory"])
                 self.assertEqual(self.result(snapshot)[0], "pending")
+
+    def test_later_codex_thread_replies_block_but_maintainer_replies_do_not(self):
+        for actor, expected in ((gate.BOT_ID, "pending"), (123, "success")):
+            for field in ("created_at", "updated_at"):
+                with self.subTest(actor=actor, field=field):
+                    snapshot = self.finding_snapshot()
+                    reply = {"user": {"id": actor}, "created_at": "2026-10-18T03:55:00Z",
+                             "updated_at": "2026-10-18T03:55:00Z", "body": "P1 Badge revised finding"}
+                    reply[field] = "2026-10-18T03:55:50Z"
+                    snapshot["inventory"][0]["replies"] = [reply]
+                    snapshot["inventory_digest"] = gate.digest(snapshot["inventory"])
+                    self.assertEqual(self.result(snapshot)[0], expected)
 
     def test_untrusted_or_missing_reaction_timestamp_cannot_approve(self):
         for change in ("actor", "timestamp"):

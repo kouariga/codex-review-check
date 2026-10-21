@@ -237,9 +237,12 @@ def observe(state, snapshot, now):
     if now - state["started"] >= TIMEOUT:
         return "failure", "Timed out without unambiguous current-head acceptance"
     state["eyes"] = state["eyes"] or snapshot["eyes"]
-    fresh = sorted(set(snapshot["thumbs"]) - set(state["baseline"]))
-    changed_summary = snapshot["summary"] != state["baseline_summary"]
     manual = snapshot.get("manual")
+    structured = snapshot.get("structured")
+    recovering = (state.get("manual_recovery") and manual is None and structured is not None
+                  and not structured["unknown_findings"])
+    fresh = sorted(set(snapshot["thumbs"]) - (set() if recovering else set(state["baseline"])))
+    changed_summary = recovering or snapshot["summary"] != state["baseline_summary"]
     receipt_proof = None
     manual_proof = None
     if not snapshot.get("review_completed", snapshot["completed"]) or snapshot["eyes"] or snapshot["failed"]:
@@ -280,7 +283,6 @@ def observe(state, snapshot, now):
                             manual["completed_at"], manual["summary_updated"]]
         fresh = eligible if manual_proof else []
         changed_summary = bool(manual_proof)
-    structured = snapshot.get("structured")
     supersession_boundary = manual_proof[0]["created"] if manual_proof else (
         math.floor(structured["completed_at"]) if structured and structured["completed"]
         and not structured["unknown_findings"] and not structured["has_findings"]
@@ -299,7 +301,9 @@ def observe(state, snapshot, now):
         try:
             created = timestamp(root.get("created_at"))
             if not manual_proof and supersession_boundary is not None:
-                created = max(created, timestamp(root.get("updated_at")))
+                thread_evidence = [root] + [reply for reply in item.get("replies", []) if bot(reply)]
+                created = max(timestamp(comment.get(field)) for comment in thread_evidence
+                              for field in ("created_at", "updated_at"))
         except ValueError:
             created = None
         associated = next((r for r in snapshot.get("review_findings", [])
