@@ -18,6 +18,7 @@ jobs:
     if: >-
       (github.event_name == 'pull_request_target' && inputs.required-job == '' && !github.event.pull_request.draft) ||
       github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_review' && github.event.review.user.id == 199175422) ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
        ((github.event.comment.user.id == 199175422 &&
          github.event.comment.performed_via_github_app.id == 1144995) ||

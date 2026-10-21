@@ -12,6 +12,7 @@ jobs:
     if: >-
       (github.event_name == 'pull_request_target' && inputs.required-job == '' && !github.event.pull_request.draft) ||
       github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_review' && github.event.review.user.id == 199175422) ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
        ((github.event.comment.user.id == 199175422 &&
          github.event.comment.performed_via_github_app.id == 1144995) ||
@@ -1078,7 +1079,7 @@ jobs:
               required = os.environ.get("CODEX_REQUIRED_REVIEW") == "true"
               if required and os.environ["GITHUB_EVENT_NAME"] != "pull_request_target":
                   raise ValueError("Required review needs a trusted pull_request_target event")
-              if not required and os.environ["GITHUB_EVENT_NAME"] not in ("pull_request_target", "issue_comment", "pull_request_review_comment", "workflow_dispatch"):
+              if not required and os.environ["GITHUB_EVENT_NAME"] not in ("pull_request_target", "issue_comment", "pull_request_review_comment", "pull_request_review", "workflow_dispatch"):
                   raise ValueError("Unsupported caller event")
               required_job = os.environ.get("CODEX_REQUIRED_JOB", "")
               if not required and required_job and os.environ["GITHUB_EVENT_NAME"] == "pull_request_target":
@@ -1091,6 +1092,8 @@ jobs:
                            or event.get("inputs", {}).get("pr", 0))
               if number <= 0:
                   raise ValueError("Missing PR number")
+              if os.environ["GITHUB_EVENT_NAME"] == "pull_request_review" and not bot(event.get("review", {})):
+                  return
               if os.environ["GITHUB_EVENT_NAME"] in ("issue_comment", "pull_request_review_comment"):
                   if os.environ["GITHUB_EVENT_NAME"] == "issue_comment" and not event["issue"].get("pull_request"):
                       return

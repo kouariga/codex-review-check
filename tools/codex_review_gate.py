@@ -1041,7 +1041,7 @@ def main():
     required = os.environ.get("CODEX_REQUIRED_REVIEW") == "true"
     if required and os.environ["GITHUB_EVENT_NAME"] != "pull_request_target":
         raise ValueError("Required review needs a trusted pull_request_target event")
-    if not required and os.environ["GITHUB_EVENT_NAME"] not in ("pull_request_target", "issue_comment", "pull_request_review_comment", "workflow_dispatch"):
+    if not required and os.environ["GITHUB_EVENT_NAME"] not in ("pull_request_target", "issue_comment", "pull_request_review_comment", "pull_request_review", "workflow_dispatch"):
         raise ValueError("Unsupported caller event")
     required_job = os.environ.get("CODEX_REQUIRED_JOB", "")
     if not required and required_job and os.environ["GITHUB_EVENT_NAME"] == "pull_request_target":
@@ -1054,6 +1054,8 @@ def main():
                  or event.get("inputs", {}).get("pr", 0))
     if number <= 0:
         raise ValueError("Missing PR number")
+    if os.environ["GITHUB_EVENT_NAME"] == "pull_request_review" and not bot(event.get("review", {})):
+        return
     if os.environ["GITHUB_EVENT_NAME"] in ("issue_comment", "pull_request_review_comment"):
         if os.environ["GITHUB_EVENT_NAME"] == "issue_comment" and not event["issue"].get("pull_request"):
             return

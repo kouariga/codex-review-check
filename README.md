@@ -9,8 +9,9 @@ resolves discussions, or merges PRs. Initial deployment is report-only.
 After the first tested `v1` release is published, copy [examples/caller.yml](examples/caller.yml)
 to `.github/workflows/codex-cloud-review.yml` in each caller repository.
 Install on its default branch for `issue_comment`, `workflow_dispatch`, and
-`pull_request_target`. Inline `pull_request_review_comment` events use the PR
-merge-ref workflow, which must also contain the subscription. Review permissions
+`pull_request_target`. `pull_request_review` and inline
+`pull_request_review_comment` events use the PR merge-ref workflow, which must
+also contain the subscriptions. Review permissions
 before enabling. An unmerged installation PR cannot replace the default caller.
 
 The caller uses this public reusable workflow with its own repository-scoped
@@ -54,6 +55,9 @@ codex-cloud-review` to the reusable workflow. Grant `actions: write` to that
 observer job, alongside `checks: write` and the existing read permissions. The reusable workflow
 inherits its caller's permissions. Without this input, it retains legacy
 report-only behavior and needs `checks: write` instead.
+Native callers must also subscribe to `pull_request_review` with `submitted`,
+`edited`, and `dismissed` so review-body changes trigger re-evaluation. Reviews
+use the same immutable Codex author ID as the snapshot evaluator.
 
 For each authenticated Codex update or authorized disposition, the observer
 finds the latest native job for the current PR head and base. It verifies the
@@ -270,7 +274,7 @@ If an observer fails before saving a deletion, a manual dispatch cannot rebuild
 the missing payload. Rerun the original failed event with its retained payload,
 or post a new decision reply and verify it with a manual dispatch. Do not treat
 a resolved thread or a later green observer as proof that the deletion was saved.
-Fork and Dependabot inline-comment events normally receive read-only tokens, so
+Fork and Dependabot review and inline-comment events normally receive read-only tokens, so
 they cannot persist these records or rerun the native job. Their inline event
 handling is unsupported without a trusted writable route. See [GitHub event
 permissions](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_review_comment).
