@@ -480,13 +480,18 @@ class DispositionTests(unittest.TestCase):
         with mock.patch.object(self.api, 'privileged', side_effect=lambda user: user['id'] == 42):
             for event_name in ('issue_comment', 'pull_request_review_comment'):
                 with self.subTest(event=event_name):
-                    self.assertTrue(self.event(event_name, comment, action='deleted'))
-                    self.assertEqual(self.api.disposition_floors, {'inline:11': 101})
-                    self.assertFalse(self.event(event_name, comment, action='created'))
-                    self.assertTrue(self.event(event_name, comment, action='edited'))
+                    self.assertEqual(self.event(event_name, comment, action='created'),
+                                     event_name == 'pull_request_review_comment')
+                    self.assertFalse(hasattr(self.api, 'disposition_floors'))
+                    for action in ('edited', 'deleted'):
+                        self.assertTrue(self.event(event_name, comment, action=action))
+                        self.assertEqual(self.api.disposition_floors, {'inline:11': 101})
+                    del self.api.disposition_floors
             self.user = {'id': 98, 'login': 'outsider', 'type': 'User'}
-            self.assertFalse(self.event('issue_comment', comment, action='deleted'))
-            self.assertFalse(self.event('issue_comment', comment, action='edited'))
+            for action in ('edited', 'deleted'):
+                self.assertFalse(self.event('issue_comment', comment, action=action))
+                self.assertTrue(self.event('pull_request_review_comment', comment, action=action))
+                self.assertFalse(hasattr(self.api, 'disposition_floors'))
 
     def test_top_level_target_edits_floor_both_old_and_new_targets(self):
         comment = self.decision('issue:21')
@@ -495,10 +500,11 @@ class DispositionTests(unittest.TestCase):
         self.assertTrue(self.event('issue_comment', comment, previous, 'edited'))
         self.assertEqual(self.api.disposition_floors, {'issue:21': 101, 'review:33': 101})
 
-    def test_outsider_decisions_and_ordinary_issue_comments_are_ignored(self):
+    def test_outsider_decisions_cannot_advance_floors(self):
         comment = self.decision('inline:11')
         self.permission = {'permission': 'read', 'user': {'id': 42}}
-        self.assertFalse(self.event('pull_request_review_comment', comment))
+        self.assertTrue(self.event('pull_request_review_comment', comment))
+        self.assertFalse(self.event('issue_comment', comment))
         self.assertFalse(hasattr(self.api, 'disposition_floors'))
         self.permission = {'permission': 'write', 'user': {'id': 42}}
         comment['body'] = 'Ordinary conversation'

@@ -301,26 +301,32 @@ class NativeRerunTests(unittest.TestCase):
         self.assertEqual(api.writes, [('actions/jobs/8/rerun', {}, 'POST')])
         self.assertEqual(api.check['status'], 'queued')
 
-    def test_ordinary_inline_replies_rerun_native_without_decision_floors(self):
+    def test_inline_replies_rerun_native_without_unauthorized_decision_floors(self):
         for action in ('created', 'edited', 'deleted'):
-            with self.subTest(action=action):
-                api = NativeGitHub()
-                event_body = {'action': action, 'pull_request': {'number': 1},
-                              'comment': {'id': 123, 'in_reply_to_id': 11,
-                                          'user': {'id': 456, 'type': 'User'},
-                                          'body': 'This still needs another change.'}}
-                with tempfile.NamedTemporaryFile(mode='w') as event:
-                    json.dump(event_body, event)
-                    event.flush()
-                    env = {'CODEX_REQUIRED_REVIEW': '', 'CODEX_REQUIRED_JOB': 'codex-cloud-review',
-                           'GITHUB_EVENT_NAME': 'pull_request_review_comment', 'GITHUB_EVENT_PATH': event.name,
-                           'GITHUB_TOKEN': 'unused', 'GITHUB_REPOSITORY': 'owner/repo',
-                           'GITHUB_WORKFLOW_REF': 'owner/repo/' + WORKFLOW + '@refs/heads/main',
-                           'GITHUB_RUN_ID': '17'}
-                    with mock.patch.dict(os.environ, env), mock.patch.object(gate, 'GitHub', return_value=api):
-                        gate.main()
-                self.assertEqual(api.writes, [('actions/jobs/8/rerun', {}, 'POST')])
-                self.assertFalse(hasattr(api, 'disposition_floors'))
+            for body, previous in (('This still needs another change.', None),
+                                   ('Now ordinary text.', 'Codex review: fixed'),
+                                   ('Codex review: fixed', None)):
+                with self.subTest(action=action, body=body, previous=previous):
+                    api = NativeGitHub()
+                    api.privileged = lambda user: False
+                    event_body = {'action': action, 'pull_request': {'number': 1},
+                                  'sender': {'id': 456, 'type': 'User'},
+                                  'comment': {'id': 123, 'in_reply_to_id': 11,
+                                              'user': {'id': 456, 'type': 'User'}, 'body': body}}
+                    if previous:
+                        event_body['changes'] = {'body': {'from': previous}}
+                    with tempfile.NamedTemporaryFile(mode='w') as event:
+                        json.dump(event_body, event)
+                        event.flush()
+                        env = {'CODEX_REQUIRED_REVIEW': '', 'CODEX_REQUIRED_JOB': 'codex-cloud-review',
+                               'GITHUB_EVENT_NAME': 'pull_request_review_comment', 'GITHUB_EVENT_PATH': event.name,
+                               'GITHUB_TOKEN': 'unused', 'GITHUB_REPOSITORY': 'owner/repo',
+                               'GITHUB_WORKFLOW_REF': 'owner/repo/' + WORKFLOW + '@refs/heads/main',
+                               'GITHUB_RUN_ID': '17'}
+                        with mock.patch.dict(os.environ, env), mock.patch.object(gate, 'GitHub', return_value=api):
+                            gate.main()
+                    self.assertEqual(api.writes, [('actions/jobs/8/rerun', {}, 'POST')])
+                    self.assertFalse(hasattr(api, 'disposition_floors'))
 
     def test_top_level_codex_review_events_rerun_native_and_ignore_other_authors(self):
         for action in ('submitted', 'edited', 'dismissed'):
