@@ -291,6 +291,24 @@ class ModernReceiptTests(unittest.TestCase):
         self.assertEqual(gate.observe(state, snapshot, now)[0], "pending")
         return gate.observe(state, snapshot, now + 30)[0], state
 
+    def test_unknown_clean_receipt_suffix_is_rejected(self):
+        fixture = self.with_reaction()
+        fixture["comments"][1]["body"] = fixture["comments"][1]["body"].replace(
+            "Didn't find any major issues.", "Didn't find any major issues. A finding remains.")
+        with self.assertRaises(ValueError):
+            self.snapshot(fixture)
+
+    def test_modern_known_clean_flags_require_fresh_receipt_and_reaction(self):
+        fixture = self.with_reaction()
+        fixture["comments"][0]["body"] = fixture["comments"][0]["body"].replace(
+            '"has_any_findings":null,"has_unresolved_findings":null',
+            '"has_any_findings":false,"has_unresolved_findings":false', 1)
+        result, state = self.result(self.snapshot(fixture))
+        self.assertEqual(result, "success")
+        self.assertEqual(state["proof"]["kind"], "clean_codex")
+        fixture["reactions"] = []
+        self.assertEqual(self.result(self.snapshot(fixture))[0], "pending")
+
     def test_modern_unknown_flags_require_fresh_receipt_and_reaction(self):
         snapshot = self.snapshot(self.with_reaction())
         self.assertTrue(snapshot["structured"]["unknown_findings"])
@@ -516,6 +534,14 @@ class ModernReceiptTests(unittest.TestCase):
                                     "has_any_findings": True, "has_unresolved_findings": False}
         fixture["comments"][0]["body"] = body.replace(marker, json.dumps(value)) + '\n| **Security Review** | **Completed** <relative-time datetime="2026-10-18T03:55:34Z">done</relative-time> | `aaaaaaa` | Manual request |'
         self.assertEqual(self.result(self.snapshot(fixture))[0], "pending")
+
+
+class AnotherRoundReceiptTests(ModernReceiptTests):
+    def fixture(self):
+        fixture = super().fixture()
+        fixture["comments"][1]["body"] = fixture["comments"][1]["body"].replace(
+            "Keep it up!", "Another round soon, please!")
+        return fixture
 
 
 class ReviewChronologyTests(unittest.TestCase):
