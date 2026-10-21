@@ -95,16 +95,12 @@ def is_clean_review_body(body):
     return body.strip() in {"Didn't find any major issues.", "Codex Review: Didn't find any major issues."}
 
 
-def is_clean_review_receipt(body, *, structured_clean=False):
+def is_clean_review_receipt(body):
     clean = "Codex Review: Didn't find any major issues."
     template = FINDING_REVIEW_WRAPPER.replace(
         "### 💡 Codex Review\n\nHere are some automated review suggestions for this pull request.", clean)
-    assertion = r"\s+".join(re.escape(word) for word in clean.split())
-    suffix = r"(?:\s+(?:Keep\s+it\s+up!|Another\s+round\s+soon,\s+please!|:\+1:|:thumbsup:|👍[\ufe0e\ufe0f]?[\U0001f3fb-\U0001f3ff]?))?"
-    normalized = re.sub("^" + assertion + suffix + r"[^\S\n]*$", clean, body, flags=re.MULTILINE)
-    if structured_clean:
-        normalized = re.sub("^" + re.escape(clean) + r"(?:[^\S\r\n]+[^\r\n\v\f\x85\u2028\u2029]*)?[^\S\n]*$",
-                            clean, normalized, flags=re.MULTILINE)
+    suffix = r"(?: (?:Keep it up!|Another round soon, please!|:\+1:|:thumbsup:|👍[\ufe0e\ufe0f]?[\U0001f3fb-\U0001f3ff]?))?"
+    normalized = re.sub("^" + re.escape(clean) + suffix + "$", clean, body, flags=re.MULTILINE)
     normalized = re.sub(r"(\*\*Reviewed commit:\*\* `)[0-9a-f]{7,40}(`)", r"\1{commit}\2", normalized)
     return body.startswith("<!-- codex-review-receipt:v1 -->") and normalized.split() == template.split()
 
@@ -244,9 +240,12 @@ def observe(state, snapshot, now):
     if now - state["started"] >= TIMEOUT:
         return "failure", "Timed out without unambiguous current-head acceptance"
     state["eyes"] = state["eyes"] or snapshot["eyes"]
-    fresh = sorted(set(snapshot["thumbs"]) - set(state["baseline"]))
-    changed_summary = snapshot["summary"] != state["baseline_summary"]
     manual = snapshot.get("manual")
+    structured = snapshot.get("structured")
+    recovering = (state.get("manual_recovery") and manual is None and structured is not None
+                  and not structured["unknown_findings"])
+    fresh = sorted(set(snapshot["thumbs"]) - (set() if recovering else set(state["baseline"])))
+    changed_summary = recovering or snapshot["summary"] != state["baseline_summary"]
     receipt_proof = None
     manual_proof = None
     if not snapshot.get("review_completed", snapshot["completed"]) or snapshot["eyes"] or snapshot["failed"]:
@@ -287,11 +286,15 @@ def observe(state, snapshot, now):
                             manual["completed_at"], manual["summary_updated"]]
         fresh = eligible if manual_proof else []
         changed_summary = bool(manual_proof)
+    supersession_boundary = manual_proof[0]["created"] if manual_proof else (
+        math.floor(structured["completed_at"]) if structured and structured["completed"]
+        and not structured["unknown_findings"] and not structured["has_findings"]
+        and not structured["unresolved"] else None)
     findings = list(snapshot["findings"])
     for review in snapshot.get("review_findings", []):
-        if not (manual_proof and review["resolved_threads"]
+        if not (supersession_boundary is not None and review["resolved_threads"]
                 and review["submitted"] is not None
-                and review["submitted"] < manual_proof[0]["created"]):
+                and review["submitted"] < supersession_boundary):
             findings.append(review["id"])
     for item in snapshot.get("inventory", []):
         if "root" not in item:
@@ -300,14 +303,19 @@ def observe(state, snapshot, now):
         root = item["root"]
         try:
             created = timestamp(root.get("created_at"))
+            if not manual_proof and supersession_boundary is not None:
+                thread_evidence = [root] + [reply for reply in item.get("replies", []) if bot(reply)]
+                created = max(timestamp(comment.get(field)) for comment in thread_evidence
+                              for field in ("created_at", "updated_at"))
         except ValueError:
             created = None
         associated = next((r for r in snapshot.get("review_findings", [])
                            if r["id"] == root.get("pull_request_review_id")), None)
-        superseded = (manual_proof and item["resolved"] and associated
+        superseded = (supersession_boundary is not None and item["resolved"] and associated
                       and associated["resolved_threads"] and associated["submitted"] is not None
-                      and associated["submitted"] < manual_proof[0]["created"]
-                      and (created is None or created < manual_proof[0]["created"]))
+                      and associated["submitted"] < supersession_boundary
+                      and ((created is None and manual_proof) or
+                           (created is not None and created < supersession_boundary)))
         reviewed_head = root.get("original_commit_id") or root.get("commit_id")
         if not superseded and (not reviewed_head or reviewed_head == snapshot["head"]
                                or created is None or snapshot.get("completed_at") is None
@@ -316,7 +324,6 @@ def observe(state, snapshot, now):
     clean = (snapshot["completed"] and not findings
              and not snapshot["eyes"] and fresh
              and (state["eyes"] or changed_summary))
-    structured = snapshot.get("structured")
     unknown_findings = bool(structured and structured.get("unknown_findings"))
     lifecycle_valid = (snapshot.get("review_completed", snapshot["completed"]) and not snapshot["eyes"] and not snapshot["failed"]
                        and not snapshot.get("unresolved_threads", False)
@@ -329,6 +336,8 @@ def observe(state, snapshot, now):
         clean = clean and (bool(manual_proof) or not structured["has_findings"])
     if unknown_findings:
         clean = clean and bool(manual_proof) and not structured["has_findings"] and not snapshot.get("inventory")
+    if manual is None and structured is not None and "reaction_times" not in snapshot:
+        clean = False
     if manual is None and "reaction_times" in snapshot:
         boundary = max(state.get("observed_since", state["started"]),
                        state.get("manual_since", state.get("observed_since", state["started"])),
@@ -599,9 +608,6 @@ class GitHub:
             completed = completed and resolved == head and "**Completed**" in cells[2]
         structured = structured_review(summary, rows, head)
         unknown_findings = bool(structured and structured["unknown_findings"])
-        structured_clean = bool(structured and structured["completed"]
-                                and not structured["unknown_findings"]
-                                and not structured["has_findings"] and not structured["unresolved"])
         if structured is not None:
             completed = completed and structured["completed"]
         reactions = self.pages(f"issues/{number}/reactions")
@@ -645,28 +651,25 @@ class GitHub:
                      and re.search(r"\bP[0-3] Badge\b", c["body"])]
         review_completed = bool(completed)
         manual_evidence = None
-        if manual or unknown_findings or (structured is not None and not structured["completed"]):
+        if unknown_findings or (structured is None and manual):
             completions = []
             for comment in comments:
                 if not trusted(comment):
                     continue
                 comment_body = comment["body"]
                 modern = comment_body.startswith("<!-- codex-review-receipt:")
-                if modern and not is_clean_review_receipt(comment_body, structured_clean=True):
+                if modern and not is_clean_review_receipt(comment_body):
                     raise ValueError("Unknown clean review receipt format")
                 content = comment_body.removeprefix("<!-- codex-review-receipt:v1 -->").lstrip() if modern else comment_body
                 if not content.startswith("Codex Review: Didn't find any major issues."):
                     continue
                 if unknown_findings and not modern:
                     continue
-                commits = re.findall(r"^\*\*Reviewed commit:\*\* `([0-9a-f]{7,40})`[^\S\n]*$",
+                commits = re.findall(r"^\*\*Reviewed commit:\*\* `([0-9a-f]{7,40})`$",
                                      comment_body, re.MULTILINE)
                 if len(commits) != 1 or comment_body.count("**Reviewed commit:**") != 1:
                     raise ValueError("Ambiguous manual reviewed commit")
                 current_head = self.repo_call("commits/" + commits[0])["sha"] == head
-                if modern and not is_clean_review_receipt(comment_body):
-                    if current_head and not structured_clean:
-                        raise ValueError("Variable closing requires explicit current-head clean state")
                 if current_head or modern:
                     completions.append({"id": comment["id"], "digest": digest(review_evidence(comment)),
                                         "current_head": current_head,
