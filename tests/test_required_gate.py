@@ -126,6 +126,23 @@ class RequiredGateTests(unittest.TestCase):
                 self.assertEqual([row['status'] for row in api.writes],
                                  ['in_progress', 'in_progress', 'completed'])
 
+    def test_snapshot_error_cannot_reuse_prior_lifecycle_receipt(self):
+        receipt = {'id': 'receipt', 'created': 9, 'updated': 9, 'digest': 'receipt'}
+        first = sample(thumbs=['first'], summary='first', completed=True, manual={
+            'comments': [receipt], 'thumbs': {'first': 12},
+            'completed_at': 10, 'summary_updated': 11})
+        state = gate.initialize(sample(), 0)
+        self.assertEqual(gate.observe(state, first, 20)[0], 'pending')
+        self.assertEqual(gate.observe(state, first, 50)[0], 'success')
+        second = sample(thumbs=['second'], summary='second', completed=True, manual={
+            'comments': [receipt], 'thumbs': {'second': 57},
+            'completed_at': 55, 'summary_updated': 56})
+        for snapshots in ([second], [OSError('transient'), second]):
+            with self.subTest(error=isinstance(snapshots[0], Exception)):
+                api = FakeGitHub(snapshots, saved_check(conclusion='success', state=state))
+                self.assertIs(self.run_gate(api), False)
+                self.assertGreaterEqual(json.loads(api.check['output']['text'])['manual_since'], 20)
+
     def test_completed_rereview_recovery_preserves_rejection_and_disposition_floors(self):
         first = sample(thumbs=['first'], summary='first', completed=True)
         state = gate.initialize(sample(), 0)
