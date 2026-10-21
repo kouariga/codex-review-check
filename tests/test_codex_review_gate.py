@@ -291,6 +291,43 @@ class ModernReceiptTests(unittest.TestCase):
         self.assertEqual(gate.observe(state, snapshot, now)[0], "pending")
         return gate.observe(state, snapshot, now + 30)[0], state
 
+    def test_positive_reaction_suffixes_preserve_full_acceptance_guards(self):
+        for suffix in ("", "Keep it up!", "Another round soon, please!", ":+1:", ":thumbsup:",
+                       "👍", "👍\ufe0f", "👍\ufe0e", "👍🏻", "👍🏿", "👍\ufe0f🏽"):
+            for known_flags in (False, True):
+                with self.subTest(suffix=suffix, known_flags=known_flags):
+                    fixture = self.with_reaction()
+                    original = fixture["comments"][1]["body"]
+                    line = next(line for line in original.splitlines() if line.startswith("Codex Review:"))
+                    clean = "Codex Review: Didn't find any major issues."
+                    fixture["comments"][1]["body"] = original.replace(line, clean + (" " + suffix if suffix else ""))
+                    if known_flags:
+                        fixture["comments"][0]["body"] = fixture["comments"][0]["body"].replace(
+                            '"has_any_findings":null,"has_unresolved_findings":null',
+                            '"has_any_findings":false,"has_unresolved_findings":false', 1)
+                    self.assertEqual(self.result(self.snapshot(fixture))[0], "success")
+                    fixture["reactions"] = []
+                    self.assertEqual(self.result(self.snapshot(fixture))[0], "pending")
+
+    def test_reaction_suffix_cannot_carry_unknown_content(self):
+        suffixes = (":warning:", ":unknown:", ":-1:", ":+1: :+1:", ":+1:!", "👍👍", "👍\u200b",
+                    "Nice work!", "A critical finding remains.", ":+1: A critical finding remains.",
+                    ":+1:\nA critical finding remains.", ":+1: <!-- finding -->", ":+1: [finding](url)")
+        for suffix in suffixes:
+            for known_flags in (False, True):
+                with self.subTest(suffix=suffix, known_flags=known_flags):
+                    fixture = self.with_reaction()
+                    original = fixture["comments"][1]["body"]
+                    line = next(line for line in original.splitlines() if line.startswith("Codex Review:"))
+                    fixture["comments"][1]["body"] = original.replace(
+                        line, "Codex Review: Didn't find any major issues. " + suffix)
+                    if known_flags:
+                        fixture["comments"][0]["body"] = fixture["comments"][0]["body"].replace(
+                            '"has_any_findings":null,"has_unresolved_findings":null',
+                            '"has_any_findings":false,"has_unresolved_findings":false', 1)
+                    with self.assertRaises(ValueError):
+                        self.snapshot(fixture)
+
     def test_unknown_clean_receipt_suffix_is_rejected(self):
         fixture = self.with_reaction()
         fixture["comments"][1]["body"] = fixture["comments"][1]["body"].replace(
@@ -541,6 +578,13 @@ class AnotherRoundReceiptTests(ModernReceiptTests):
         fixture = super().fixture()
         fixture["comments"][1]["body"] = fixture["comments"][1]["body"].replace(
             "Keep it up!", "Another round soon, please!")
+        return fixture
+
+
+class ThumbsUpReceiptTests(ModernReceiptTests):
+    def fixture(self):
+        fixture = super().fixture()
+        fixture["comments"][1]["body"] = fixture["comments"][1]["body"].replace("Keep it up!", ":+1:")
         return fixture
 
 

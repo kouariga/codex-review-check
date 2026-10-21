@@ -109,9 +109,12 @@ Manual evidence is parsed even when structured metadata is present.
 A completed Code Review may report both finding flags as null. The observer treats
 those flags as unknown and requires a fresh trusted `codex-review-receipt:v1`
 completion on the exact current head. Only the known clean receipt template is
-accepted, including its reviewed commit and boilerplate. Its closing sentence
-must be exactly `Keep it up!` or `Another round soon, please!`; other suffixes
-and additional text are rejected. Partial null flags,
+accepted, including its reviewed commit and boilerplate. After the exact clean
+assertion, the optional suffix may be `Keep it up!`, `Another round soon, please!`,
+or one positive thumbs-up token (`:+1:`, `:thumbsup:`, or `👍` with an optional
+variation selector and skin tone). Unknown prose, other reaction tokens, and
+additional text are rejected. This normalizes equivalent positive reactions; it
+does not accept arbitrary future closing sentences. Partial null flags,
 unknown completed Security Review flags, and additional receipt text block.
 The receipt follows the same start, restart, timestamp, and ambiguity checks as
 manual completion. It cannot supply clean approval without a fresh trusted
