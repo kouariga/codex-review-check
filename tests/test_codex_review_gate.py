@@ -283,7 +283,9 @@ class ModernReceiptTests(unittest.TestCase):
 
     def state(self, snapshot):
         origin = gate.timestamp("2026-10-18T03:54:00Z")
-        return gate.initialize(snapshot, origin + 120, observed_since=origin)
+        return gate.initialize(snapshot if snapshot.get("manual") is not None else
+                               snapshot | {"thumbs": [], "summary": "running-summary"},
+                               origin + 120, observed_since=origin)
 
     def result(self, snapshot):
         now = gate.timestamp("2026-10-18T03:56:00Z")
@@ -309,7 +311,7 @@ class ModernReceiptTests(unittest.TestCase):
                     fixture["reactions"] = []
                     self.assertEqual(self.result(self.snapshot(fixture))[0], "pending")
 
-    def test_reaction_suffix_cannot_carry_unknown_content(self):
+    def test_unknown_flags_reject_unrecognized_receipt_prose(self):
         suffixes = (":warning:", ":unknown:", ":-1:", ":+1: :+1:", ":+1:!", "👍👍", "👍\u200b",
                     "Nice work!", "A critical finding remains.", ":+1: A critical finding remains.",
                     ":+1:\nA critical finding remains.", ":+1: <!-- finding -->", ":+1: [finding](url)")
@@ -325,8 +327,11 @@ class ModernReceiptTests(unittest.TestCase):
                         fixture["comments"][0]["body"] = fixture["comments"][0]["body"].replace(
                             '"has_any_findings":null,"has_unresolved_findings":null',
                             '"has_any_findings":false,"has_unresolved_findings":false', 1)
-                    with self.assertRaises(ValueError):
-                        self.snapshot(fixture)
+                    if known_flags:
+                        self.assertEqual(self.result(self.snapshot(fixture))[0], "success")
+                    else:
+                        with self.assertRaises(ValueError):
+                            self.snapshot(fixture)
 
     def test_unknown_clean_receipt_suffix_is_rejected(self):
         fixture = self.with_reaction()
@@ -335,7 +340,7 @@ class ModernReceiptTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.snapshot(fixture)
 
-    def test_modern_known_clean_flags_require_fresh_receipt_and_reaction(self):
+    def test_modern_known_clean_flags_require_fresh_reaction(self):
         fixture = self.with_reaction()
         fixture["comments"][0]["body"] = fixture["comments"][0]["body"].replace(
             '"has_any_findings":null,"has_unresolved_findings":null',
@@ -1033,6 +1038,123 @@ class ManualFixtureTests(unittest.TestCase):
         api, _ = self.run_history(snapshot, origin, history)
         self.assertEqual(api.check["conclusion"], "failure")
         self.assertEqual(json.loads(api.check["output"]["text"])["observed_since"], origin + 3600)
+
+
+class ExplicitCleanReactionTests(unittest.TestCase):
+    def fixture(self):
+        fixture = ModernReceiptTests().with_reaction()
+        fixture["comments"][0]["body"] = fixture["comments"][0]["body"].replace(
+            '"has_any_findings":null,"has_unresolved_findings":null',
+            '"has_any_findings":false,"has_unresolved_findings":false', 1)
+        return fixture
+
+    def snapshot(self, fixture):
+        return ManualFixtureTests().api(fixture).snapshot(1)
+
+    def state(self, snapshot):
+        origin = gate.timestamp("2026-10-18T03:54:00Z")
+        return gate.initialize(snapshot | {"thumbs": [], "summary": "before-review"}, origin)
+
+    def result(self, snapshot, state=None):
+        now = gate.timestamp("2026-10-18T03:56:00Z")
+        state = self.state(snapshot) if state is None else state
+        self.assertEqual(gate.observe(state, snapshot, now)[0], "pending")
+        return gate.observe(state, snapshot, now + 30)[0], state
+
+    def test_receipt_text_or_absence_does_not_decide_explicit_clean_review(self):
+        for text in ("Bravo.", "Arbitrary notification text.", None):
+            with self.subTest(text=text):
+                fixture = self.fixture()
+                if text is None:
+                    fixture["comments"] = fixture["comments"][:1]
+                else:
+                    fixture["comments"][1]["body"] = fixture["comments"][1]["body"].replace("Keep it up!", text)
+                snapshot = self.snapshot(fixture)
+                self.assertIsNone(snapshot["manual"])
+                result, state = self.result(snapshot)
+                self.assertEqual(result, "success")
+                self.assertEqual(state["proof"]["kind"], "clean_codex")
+
+    def test_reaction_must_follow_all_observation_and_summary_boundaries(self):
+        for change in ("absent", "old", "same_second", "future", "summary_updated", "missing_times", "baseline"):
+            with self.subTest(change=change):
+                fixture = self.fixture()
+                if change == "absent": fixture["reactions"] = []
+                elif change == "old": fixture["reactions"][0]["created_at"] = "2026-10-18T03:53:59Z"
+                elif change == "same_second": fixture["reactions"][0]["created_at"] = fixture["comments"][0]["updated_at"]
+                elif change == "future": fixture["reactions"][0]["created_at"] = "2026-10-18T04:00:00Z"
+                elif change == "summary_updated": fixture["comments"][0]["updated_at"] = "2026-10-18T03:55:38Z"
+                snapshot = self.snapshot(fixture)
+                if change == "missing_times": del snapshot["reaction_times"]
+                state = self.state(snapshot)
+                if change == "baseline": state["baseline"] = snapshot["thumbs"]
+                self.assertEqual(self.result(snapshot, state)[0], "pending")
+
+    def test_explicit_nonclean_lifecycle_never_accepts_arbitrary_receipt(self):
+        for status in ("running", "queued", "pending", "failed", "findings", "unresolved"):
+            with self.subTest(status=status):
+                fixture = self.fixture()
+                summary = fixture["comments"][0]
+                fixture["comments"][1]["body"] = fixture["comments"][1]["body"].replace("Keep it up!", "Bravo.")
+                if status in ("findings", "unresolved"):
+                    summary["body"] = summary["body"].replace('"has_any_findings":false', '"has_any_findings":true')
+                    if status == "unresolved":
+                        summary["body"] = summary["body"].replace('"has_unresolved_findings":false', '"has_unresolved_findings":true')
+                else:
+                    summary["body"] = summary["body"].replace('"status":"completed"', '"status":"' + status + '"').replace("**Completed**", "**" + status.title() + "**")
+                snapshot = self.snapshot(fixture)
+                now = gate.timestamp("2026-10-18T03:56:00Z")
+                state = self.state(snapshot)
+                gate.observe(state, snapshot, now)
+                self.assertEqual(gate.observe(state, snapshot, now + 30)[0], "failure" if status == "failed" else "pending")
+
+    def test_same_head_restart_invalidates_old_success_until_new_thumb(self):
+        fixture = self.fixture()
+        complete = self.snapshot(fixture)
+        result, state = self.result(complete)
+        self.assertEqual(result, "success")
+        now = gate.timestamp("2026-10-18T03:57:00Z")
+        for phase in ({"eyes": True}, {"completed": False, "review_completed": False}):
+            with self.subTest(phase=phase):
+                restarted = copy.deepcopy(state)
+                self.assertEqual(gate.observe(restarted, complete | phase, now)[0], "pending")
+                self.assertEqual(gate.observe(restarted, complete, now + 30)[0], "pending")
+                self.assertEqual(gate.observe(restarted, complete, now + 60)[0], "pending")
+                later = copy.deepcopy(complete)
+                later["thumbs"] = ["11"]
+                later["reaction_times"] = {"11": now + 61}
+                self.assertEqual(gate.observe(restarted, later, now + 90)[0], "pending")
+                self.assertEqual(gate.observe(restarted, later, now + 120)[0], "success")
+
+    def finding_snapshot(self, *, resolved=True, created="2026-10-18T03:55:00Z", submitted="2026-10-18T03:55:00Z"):
+        fixture = self.fixture()
+        api = ManualFixtureTests().api(fixture)
+        original = api.pages
+        head = fixture["pr"]["head"]["sha"]
+        root = {"id": 71, "user": {"id": gate.BOT_ID}, "original_commit_id": head,
+                "pull_request_review_id": 81, "created_at": created}
+        review = {"id": 81, "user": {"id": gate.BOT_ID}, "commit_id": head,
+                  "state": "COMMENTED", "body": gate.FINDING_REVIEW_WRAPPER.replace("{commit}", head),
+                  "submitted_at": submitted}
+        api.pages = lambda path: ([root] if path == "pulls/1/comments" else
+                                [review] if path == "pulls/1/reviews" else original(path))
+        api.review_threads = lambda number: {71: resolved}
+        return api.snapshot(1)
+
+    def test_resolved_associated_same_head_findings_precede_clean_completion(self):
+        self.assertEqual(self.result(self.finding_snapshot())[0], "success")
+        for changes in ({"resolved": False}, {"created": "2026-10-18T03:55:35Z"},
+                        {"created": None}, {"submitted": None}, {"submitted": "2026-10-18T03:55:35Z"}):
+            with self.subTest(changes=changes):
+                self.assertEqual(self.result(self.finding_snapshot(**changes))[0], "pending")
+
+    def test_standalone_and_unassociated_findings_remain_blocking(self):
+        snapshot = self.snapshot(self.fixture())
+        for item in ({"key": "issue:99"}, {"key": "review:99"},
+                     {"key": "inline:99", "resolved": True, "root": {
+                         "original_commit_id": "a" * 40, "created_at": "2026-10-18T03:50:00Z"}}):
+            with self.subTest(item=item):
+                self.assertEqual(self.result(snapshot | {"inventory": [item]})[0], "pending")
 
 
 class HTTPTests(unittest.TestCase):
