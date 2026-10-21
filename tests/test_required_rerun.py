@@ -87,6 +87,38 @@ class NativeRerunTests(unittest.TestCase):
         self.assertEqual(api.writes, [('actions/jobs/8/rerun', {}, 'POST')])
         self.assertEqual((api.check['status'], api.check['conclusion']), ('queued', None))
 
+    def test_workflow_path_accepts_unqualified_and_ref_qualified_api_forms(self):
+        for suffix in ('', '@main', '@refs/heads/main'):
+            with self.subTest(suffix=suffix):
+                api = NativeGitHub()
+                api.workflow['path'] = WORKFLOW + suffix
+                self.assertIs(self.rerun(api), True)
+                self.assertEqual(api.writes, [('actions/jobs/8/rerun', {}, 'POST')])
+                self.assertEqual((api.check['status'], api.check['conclusion']), ('queued', None))
+        api = NativeGitHub()
+        api.workflow['path'] = '.github/workflows/other.yml@main'
+        self.assertIs(self.rerun(api), False)
+        self.assertEqual(api.writes, [])
+
+    def test_opted_in_pull_request_target_leaves_native_job_to_its_own_workflow(self):
+        api = NativeGitHub()
+        api.job['status'] = api.check['status'] = api.workflow['status'] = 'in_progress'
+        api.check['conclusion'] = None
+        with tempfile.NamedTemporaryFile(mode='w') as event:
+            json.dump({'pull_request': {'number': 1, 'head': {'sha': HEAD}}}, event)
+            event.flush()
+            env = {'CODEX_REQUIRED_REVIEW': '', 'CODEX_REQUIRED_JOB': 'codex-cloud-review',
+                   'GITHUB_EVENT_NAME': 'pull_request_target', 'GITHUB_EVENT_PATH': event.name,
+                   'GITHUB_TOKEN': 'unused', 'GITHUB_REPOSITORY': 'owner/repo',
+                   'GITHUB_WORKFLOW_REF': 'owner/repo/' + WORKFLOW + '@refs/heads/main'}
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(gate, 'GitHub', return_value=api), \
+                    mock.patch.object(gate, 'rerun_required_job', side_effect=AssertionError('self rerun')):
+                self.assertIsNone(gate.main())
+        self.assertEqual(api.pr_reads, 0)
+        self.assertEqual(api.writes, [])
+        self.assertEqual((api.check['status'], api.check['conclusion']), ('in_progress', None))
+
     def test_active_job_is_rerun_after_finishing_so_its_success_cannot_escape(self):
         api = NativeGitHub()
         api.job['status'] = api.check['status'] = 'in_progress'
