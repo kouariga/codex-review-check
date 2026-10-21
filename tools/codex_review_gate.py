@@ -993,7 +993,7 @@ def rerun_required_job(api, number, job_name, workflow_path, clock=time.time, sl
                 continue
             workflow = api.repo_call(f"actions/runs/{run_id}")
             if (workflow.get("id") != run_id or workflow.get("event") != "pull_request_target"
-                    or workflow.get("path") != workflow_path
+                    or (workflow.get("path") or "").partition("@")[0] != workflow_path
                     or not any(row.get("number") == number and (row.get("head") or {}).get("sha") == head
                                and all((row.get("base") or {}).get(key) == value for key, value in base.items())
                                for row in workflow.get("pull_requests", []))):
@@ -1020,6 +1020,9 @@ def main():
         raise ValueError("Required review needs a trusted pull_request_target event")
     if not required and os.environ["GITHUB_EVENT_NAME"] not in ("pull_request_target", "issue_comment", "pull_request_review_comment", "workflow_dispatch"):
         raise ValueError("Unsupported caller event")
+    required_job = os.environ.get("CODEX_REQUIRED_JOB", "")
+    if not required and required_job and os.environ["GITHUB_EVENT_NAME"] == "pull_request_target":
+        return
     api = GitHub(os.environ["GITHUB_TOKEN"], os.environ["GITHUB_REPOSITORY"])
     with open(os.environ["GITHUB_EVENT_PATH"]) as event_file:
         event = json.load(event_file)
@@ -1046,7 +1049,6 @@ def main():
             raise ValueError("Missing or malformed event head")
         accepted = run(api, number, expected_head=expected_head)
         raise SystemExit(0 if accepted is True else 1)
-    required_job = os.environ.get("CODEX_REQUIRED_JOB", "")
     if required_job:
         prefix = api.repo + "/"
         workflow_ref = os.environ.get("GITHUB_WORKFLOW_REF", "")

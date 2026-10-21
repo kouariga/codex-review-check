@@ -34,6 +34,10 @@ used instead when per-repository adoption control is preferred.
 
 ## Required native Actions job
 
+Merge queues are unsupported. Do not configure this gate as a required merge-queue
+check. Reviews bind to a PR head and base, and do not attest the synthetic
+`merge_group` commit. Queue support needs a separate review contract.
+
 For enforcement, define a native job named `codex-cloud-review` in a trusted
 `pull_request_target` caller. Its step uses `kouariga/codex-review-check@<reviewed-commit-sha>`
 as a composite action, with the same repository permissions shown above. Do not

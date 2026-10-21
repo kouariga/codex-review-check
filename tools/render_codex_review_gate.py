@@ -16,7 +16,7 @@ on:
 jobs:
   observe:
     if: >-
-      (github.event_name == 'pull_request_target' && !github.event.pull_request.draft) ||
+      (github.event_name == 'pull_request_target' && inputs.required-job == '' && !github.event.pull_request.draft) ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
        ((github.event.comment.user.id == 199175422 &&
