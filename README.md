@@ -54,7 +54,7 @@ as a composite action, with the same repository permissions shown above. Do not
 check out or execute PR code. Required mode rejects `pull_request` because that
 event lets the PR replace its own workflow definition.
 
-The action binds the event head and base ref/SHA to the live PR, polls the existing acceptance
+The action binds the event head to the live PR, polls the existing acceptance
 rules, and exits zero only for explicit acceptance. Unfinished reviews,
 unresolved threads, stale identity, API errors, and timeouts do not succeed.
 It persists retry state in `codex-review-evidence`, including migration from
@@ -73,6 +73,9 @@ manually dispatch the caller workflow to re-evaluate the native job. Reopening
 a resolved thread after a successful check does not automatically invalidate
 that result. Automatic handling of this case is outside the supported contract;
 do not treat a completed check as a continuous guarantee of thread state.
+Retargeting a PR while an older `pull_request_target` run is queued is also
+unsupported. That run is not bound to the event's original base. Cancel stale
+runs and start a new run for the current target before relying on its result.
 
 For each authenticated Codex update or authorized disposition, the observer
 finds the latest native job for the current PR head and base. It verifies the
