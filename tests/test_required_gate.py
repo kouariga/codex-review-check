@@ -144,7 +144,8 @@ class RequiredGateTests(unittest.TestCase):
                                  saved_check(conclusion='success', state=state))
                 self.assertIs(self.run_gate(api), True)
                 self.assertEqual(api.check['conclusion'], 'success')
-                self.assertEqual(api.writes, [])
+                self.assertEqual([row['status'] for row in api.writes],
+                                 ['in_progress', 'in_progress', 'completed'])
 
     def test_cached_acceptance_revalidation_has_a_bounded_retry(self):
         clean = sample(thumbs=['fresh'], summary='completed', completed=True)
@@ -153,9 +154,33 @@ class RequiredGateTests(unittest.TestCase):
         gate.observe(state, clean, 30)
         api = FakeGitHub([OSError('unavailable')],
                          saved_check(conclusion='success', state=state))
-        with self.assertRaises(TimeoutError):
+        self.assertIs(self.run_gate(api), False)
+        self.assertEqual(api.writes[0]['status'], 'in_progress')
+        self.assertEqual(api.check['conclusion'], 'failure')
+        self.assertIn('renewal', json.loads(api.check['output']['text']))
+
+    def test_cached_revalidation_survives_interruption(self):
+        receipt = {'id': 'receipt', 'created': 9, 'updated': 9, 'digest': 'receipt'}
+        first = sample(thumbs=['first'], summary='first', completed=True, manual={
+            'comments': [receipt], 'thumbs': {'first': 12},
+            'completed_at': 10, 'summary_updated': 11})
+        state = gate.initialize(sample(), 0)
+        gate.observe(state, first, 20)
+        gate.observe(state, first, 50)
+        api = FakeGitHub([OSError('temporary'), gate.APIBlocked('interrupted')],
+                         saved_check(name='codex-cloud-review', conclusion='success', state=state))
+        with self.assertRaises(gate.APIBlocked):
             self.run_gate(api)
-        self.assertEqual(api.writes, [])
+        self.assertEqual(api.check['status'], 'in_progress')
+        pending = api.check
+        second = sample(thumbs=['second'], summary='second', completed=True, manual={
+            'comments': [receipt], 'thumbs': {'second': 57},
+            'completed_at': 55, 'summary_updated': 56})
+        for snapshot, expected in ((first, True), (second, False)):
+            with self.subTest(unchanged=expected):
+                recovered = FakeGitHub([snapshot], json.loads(json.dumps(pending)))
+                self.assertIs(self.run_gate(recovered), expected)
+                self.assertNotIn('renewal', json.loads(recovered.check['output']['text']))
 
     def test_snapshot_error_cannot_reuse_prior_lifecycle_receipt(self):
         receipt = {'id': 'receipt', 'created': 9, 'updated': 9, 'digest': 'receipt'}
