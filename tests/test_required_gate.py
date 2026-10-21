@@ -235,6 +235,8 @@ class RequiredMainTests(unittest.TestCase):
             event.flush()
             env = {'CODEX_REQUIRED_REVIEW': '', 'GITHUB_EVENT_NAME': 'pull_request_target',
                    'GITHUB_EVENT_PATH': event.name, 'GITHUB_TOKEN': 'unused', 'GITHUB_REPOSITORY': 'owner/repo'}
-            with mock.patch.dict(os.environ, env), mock.patch.object(gate, 'GitHub'), \
-                    mock.patch.object(gate, 'run', return_value=False):
+            with mock.patch.dict(os.environ, env | {'CODEX_REQUIRED_JOB': ''}), \
+                    mock.patch.object(gate, 'GitHub') as api, \
+                    mock.patch.object(gate, 'run', return_value=False) as run:
                 self.assertIsNone(gate.main())
+                run.assert_called_once_with(api.return_value, 1)
