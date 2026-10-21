@@ -150,6 +150,35 @@ class NativeRerunTests(unittest.TestCase):
         self.assertIs(self.rerun(api, lambda: sleeps.append(True), observed_after=BOUNDARY), True)
         self.assertEqual(len(sleeps), 1)
 
+    def test_preboundary_active_attempt_still_reruns_after_finishing(self):
+        api = NativeGitHub()
+        api.job.update(status='in_progress', started_at=server_time(99))
+        api.workflow['status'] = 'in_progress'
+        def finish():
+            api.job['status'] = api.workflow['status'] = 'completed'
+        self.assertIs(self.rerun(api, finish, observed_after=BOUNDARY), True)
+        self.assertEqual(api.writes, [('actions/jobs/8/rerun', {}, 'POST')])
+
+    def test_race_recheck_failure_preserves_original_rerun_denial(self):
+        api = NativeGitHub()
+        api.denied = True
+        call = api.repo_call
+        workflow_reads = [0]
+        original = gate.APIBlocked('original rerun denial')
+        def blocked(path, data=None, method=None):
+            if path.endswith('/rerun'):
+                raise original
+            if path == 'actions/runs/7':
+                workflow_reads[0] += 1
+                if workflow_reads[0] > 1:
+                    raise gate.APIBlocked('workflow reread denied')
+            return call(path, data, method)
+        api.repo_call = blocked
+        with self.assertRaises(gate.APIBlocked) as raised:
+            self.rerun(api, observed_after=BOUNDARY)
+        self.assertIs(raised.exception, original)
+        self.assertEqual(api.writes, [])
+
     def test_completed_success_is_replaced_by_queued_native_rerun(self):
         api = NativeGitHub()
         self.assertIs(self.rerun(api), True)
