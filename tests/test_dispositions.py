@@ -52,7 +52,7 @@ class DispositionTests(unittest.TestCase):
         self.api.pages = self.pages
         self.api.review_threads = lambda number: copy.deepcopy(self.resolved)
         self.review_updated = {}
-        self.api.review_updates = lambda number: {r["id"]: self.review_updated.get(r["id"], r["submitted_at"]) for r in self.reviews}
+        self.api.review_updates = lambda number: {r["id"]: self.review_updated.get(r["id"], r.get("updated_at", r["submitted_at"])) for r in self.reviews}
         self.refresh_summary()
 
     def refresh_summary(self, status='Completed', completion=90):
@@ -426,6 +426,14 @@ class DispositionTests(unittest.TestCase):
                     self.assertEqual(gate.observe(state, snapshot, 150)[0], 'pending')
                     evidence.clear()
                     evidence.update(original)
+
+    def test_known_flags_reject_disposition_after_review_edit(self):
+        self.decisions()
+        self.assertEqual(self.verdict(self.api.snapshot(1))[2][0], 'success')
+        self.review_updated[33] = iso(120)
+        snapshot = self.api.snapshot(1)
+        self.assertFalse(snapshot['dispositions']['review:33']['valid'])
+        self.assertEqual(self.verdict(snapshot)[2][0], 'pending')
 
     def test_unknown_flags_require_authoritative_review_update_chronology(self):
         self.metadata['code_review'].update(has_any_findings=None, has_unresolved_findings=None)

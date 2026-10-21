@@ -648,7 +648,7 @@ jobs:
                   reactions = [r for r in reactions if bot(r)]
                   inline = self.pages(f"pulls/{number}/comments")
                   reviews = self.pages(f"pulls/{number}/reviews")
-                  if unknown_findings and any(bot(review) for review in reviews):
+                  if any(bot(review) for review in reviews):
                       updates = self.review_updates(number)
                       for review in reviews:
                           if bot(review):
@@ -672,7 +672,7 @@ jobs:
                           continue
                       associated = [c for c in codex_inline if c.get("pull_request_review_id") == review["id"]]
                       try:
-                          submitted = timestamp(review.get("submitted_at"))
+                          submitted = max(timestamp(review.get("submitted_at")), timestamp(review.get("updated_at")))
                       except ValueError:
                           submitted = None
                       review_findings.append({"id": review["id"], "submitted": submitted,

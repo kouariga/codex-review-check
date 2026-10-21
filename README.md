@@ -221,7 +221,7 @@ a newer wrong-head receipt blocks fallback to an older current-head receipt.
 
 Finding comments require both creation and update timestamps. Substantive review
 chronology requires submission and update timestamps. GitHub REST reviews omit
-the update timestamp, so unknown-flags observations enrich Codex review rows from
+the update timestamp, so observations enrich Codex review rows from
 the paginated GraphQL reviews connection, joining by database ID. Missing,
 malformed, ambiguous, or unavailable chronology blocks acceptance.
 
