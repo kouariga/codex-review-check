@@ -5,6 +5,7 @@ on:
 permissions:
   contents: read
   checks: write
+  actions: write
 jobs:
   attestation-probe:
     runs-on: ubuntu-latest
@@ -21,8 +22,5 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          job_id=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" --jq '.jobs[] | select(.name == "attestation-probe") | .id')
-          gh api "repos/$REPO/check-runs/$job_id" --jq '{id,status,conclusion,head_sha,check_suite:.check_suite.id}'
-          gh api --method PATCH "repos/$REPO/check-runs/$job_id" -f status=in_progress --jq '{id,status,conclusion,head_sha,check_suite:.check_suite.id}'
-          gh api --method PATCH "repos/$REPO/check-runs/$job_id" -f status=completed -f conclusion=failure --jq '{id,status,conclusion,head_sha,check_suite:.check_suite.id}'
-          gh api --method PATCH "repos/$REPO/check-runs/$job_id" -f status=completed -f conclusion=success --jq '{id,status,conclusion,head_sha,check_suite:.check_suite.id}'
+          gh api --method POST "repos/$REPO/actions/jobs/119083936660/rerun"
+          gh api "repos/$REPO/actions/runs/39558430800/jobs" --jq '.jobs[] | {id,name,status,conclusion,check_run_url}'
