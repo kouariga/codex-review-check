@@ -314,19 +314,108 @@ class ModernReceiptTests(unittest.TestCase):
                     "Nice work!", "A critical finding remains.", ":+1: A critical finding remains.",
                     ":+1:\nA critical finding remains.", ":+1: <!-- finding -->", ":+1: [finding](url)")
         for suffix in suffixes:
-            for known_flags in (False, True):
-                with self.subTest(suffix=suffix, known_flags=known_flags):
-                    fixture = self.with_reaction()
-                    original = fixture["comments"][1]["body"]
-                    line = next(line for line in original.splitlines() if line.startswith("Codex Review:"))
-                    fixture["comments"][1]["body"] = original.replace(
-                        line, "Codex Review: Didn't find any major issues. " + suffix)
-                    if known_flags:
-                        fixture["comments"][0]["body"] = fixture["comments"][0]["body"].replace(
-                            '"has_any_findings":null,"has_unresolved_findings":null',
-                            '"has_any_findings":false,"has_unresolved_findings":false', 1)
+            with self.subTest(suffix=suffix):
+                fixture = self.with_reaction()
+                original = fixture["comments"][1]["body"]
+                line = next(line for line in original.splitlines() if line.startswith("Codex Review:"))
+                fixture["comments"][1]["body"] = original.replace(
+                    line, "Codex Review: Didn't find any major issues. " + suffix)
+                with self.assertRaises(ValueError):
+                    self.snapshot(fixture)
+
+    def test_variable_closing_requires_explicit_completed_clean_state(self):
+        fixture = self.with_reaction()
+        original = fixture["comments"][1]["body"]
+        line = next(line for line in original.splitlines() if line.startswith("Codex Review:"))
+        fixture["comments"][1]["body"] = original.replace(
+            line, "Codex Review: Didn't find any major issues. Already looking forward to the next diff.")
+        fixture["comments"][0]["body"] = fixture["comments"][0]["body"].replace(
+            '"has_any_findings":null,"has_unresolved_findings":null',
+            '"has_any_findings":false,"has_unresolved_findings":false', 1)
+        self.assertEqual(self.result(self.snapshot(fixture))[0], "success")
+        contradictory = copy.deepcopy(fixture)
+        contradictory["comments"][1]["body"] = contradictory["comments"][1]["body"].replace(
+            "Already looking forward to the next diff.", "A critical finding remains.")
+        self.assertEqual(self.result(self.snapshot(contradictory))[0], "success")
+        for change in ("unknown", "findings", "unresolved", "running", "newline", "reaction"):
+            with self.subTest(change=change):
+                changed = copy.deepcopy(fixture)
+                summary = changed["comments"][0]
+                receipt = changed["comments"][1]
+                if change == "unknown":
+                    summary["body"] = summary["body"].replace(
+                        '"has_any_findings":false,"has_unresolved_findings":false',
+                        '"has_any_findings":null,"has_unresolved_findings":null', 1)
+                elif change in ("findings", "unresolved"):
+                    summary["body"] = summary["body"].replace('"has_any_findings":false', '"has_any_findings":true', 1)
+                    if change == "unresolved":
+                        summary["body"] = summary["body"].replace('"has_unresolved_findings":false', '"has_unresolved_findings":true', 1)
+                elif change == "running":
+                    summary["body"] = summary["body"].replace('"status":"completed"', '"status":"running"').replace("**Completed**", "**Running**")
+                elif change == "newline":
+                    receipt["body"] = receipt["body"].replace("Already looking", "Extra unrecognized content\nAlready looking")
+                else:
+                    changed["reactions"] = []
+                if change in ("unknown", "findings", "unresolved", "running", "newline"):
                     with self.assertRaises(ValueError):
-                        self.snapshot(fixture)
+                        self.snapshot(changed)
+                else:
+                    self.assertEqual(self.result(self.snapshot(changed))[0], "pending")
+
+    def test_old_head_variable_receipt_does_not_depend_on_current_summary(self):
+        for status in ("clean", "unknown", "running", "findings"):
+            with self.subTest(status=status):
+                fixture = self.with_reaction()
+                fixture["comments"][1]["body"] = fixture["comments"][1]["body"].replace(
+                    "`aaaaaaaaaa`", "`bbbbbbbbbb`").replace(
+                    "Keep it up!", "Already looking forward to the next diff.").replace(
+                    "Another round soon, please!", "Already looking forward to the next diff.").replace(
+                    ":+1:", "Already looking forward to the next diff.")
+                summary = fixture["comments"][0]
+                if status != "unknown":
+                    summary["body"] = summary["body"].replace(
+                        '"has_any_findings":null,"has_unresolved_findings":null',
+                        '"has_any_findings":false,"has_unresolved_findings":false', 1)
+                if status == "running":
+                    summary["body"] = summary["body"].replace('"status":"completed"', '"status":"running"').replace("**Completed**", "**Running**")
+                elif status == "findings":
+                    summary["body"] = summary["body"].replace('"has_any_findings":false', '"has_any_findings":true', 1)
+                api = ManualFixtureTests().api(fixture)
+                original = api.repo_call
+                api.repo_call = lambda path: {"sha": "b" * 40} if path == "commits/bbbbbbbbbb" else original(path)
+                snapshot = api.snapshot(1)
+                self.assertEqual(len(snapshot["manual"]["comments"]), 1)
+                self.assertFalse(snapshot["manual"]["comments"][0]["current_head"])
+                self.assertEqual(self.result(snapshot)[0], "pending")
+                if status in ("clean", "unknown"):
+                    fixture["comments"][1].update(id=3, created_at="2026-10-18T03:55:33Z", updated_at="2026-10-18T03:55:33Z")
+                    fixture["comments"].insert(1, self.with_reaction()["comments"][1])
+                    self.assertEqual(self.result(api.snapshot(1))[0], "pending")
+                    fixture["comments"].pop()
+                    self.assertEqual(self.result(api.snapshot(1))[0], "success")
+
+    def test_security_findings_cannot_authorize_variable_closing(self):
+        fixture = self.with_reaction()
+        summary = fixture["comments"][0]
+        marker = summary["body"].split("<!-- codex-review-state:v1 ")[1].split(" -->")[0]
+        value = json.loads(marker)
+        value["code_review"].update(has_any_findings=False, has_unresolved_findings=False)
+        value["security_review"] = value["code_review"] | {"has_any_findings": True}
+        summary["body"] = summary["body"].replace(marker, json.dumps(value)) + '\n| **Security Review** | **Completed** <relative-time datetime="2026-10-18T03:55:34Z">done</relative-time> | `aaaaaaa` | Manual request |'
+        receipt = fixture["comments"][1]
+        line = next(line for line in receipt["body"].splitlines() if line.startswith("Codex Review:"))
+        receipt["body"] = receipt["body"].replace(line, "Codex Review: Didn't find any major issues. Already looking forward to the next diff.")
+        with self.assertRaises(ValueError):
+            self.snapshot(fixture)
+
+    def test_known_receipt_suffix_preserves_legacy_whitespace_tolerance(self):
+        for suffix in ("Keep\tit  up!", "Another\nround soon,\tplease!", ":+1:"):
+            fixture = self.with_reaction()
+            original = fixture["comments"][1]["body"]
+            line = next(line for line in original.splitlines() if line.startswith("Codex Review:"))
+            fixture["comments"][1]["body"] = original.replace(
+                line, "Codex Review: Didn't find any major issues.\t" + suffix + "  ").replace("\n", "\r\n")
+            self.assertEqual(self.result(self.snapshot(fixture))[0], "success")
 
     def test_unknown_clean_receipt_suffix_is_rejected(self):
         fixture = self.with_reaction()

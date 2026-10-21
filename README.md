@@ -184,7 +184,14 @@ assertion, the optional suffix may be `Keep it up!`, `Another round soon, please
 or one positive thumbs-up token (`:+1:`, `:thumbsup:`, or `👍` with an optional
 variation selector and skin tone). Unknown prose, other reaction tokens, and
 additional text are rejected. This normalizes equivalent positive reactions; it
-does not accept arbitrary future closing sentences. Partial null flags,
+does not accept arbitrary future closing sentences when the finding flags are unknown.
+When every structured review is completed and both finding flags are explicitly
+false, the exact clean assertion may instead have any same-line closing text. The
+structured flags are authoritative in that case, including when the closing text
+is contradictory. Variable-closing receipts for older heads remain non-current
+chronology evidence and cannot inherit the current head's flags or approve it. The full receipt wrapper, single reviewed commit, fresh
+thumbs-up, and all chronology and unresolved-finding checks still apply. Legacy
+known suffixes retain whitespace equivalence, including CRLF. Partial null flags,
 unknown completed Security Review flags, and additional receipt text block.
 The receipt follows the same start, restart, timestamp, and ambiguity checks as
 manual completion. It cannot supply clean approval without a fresh trusted

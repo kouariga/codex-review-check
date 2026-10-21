@@ -133,12 +133,16 @@ jobs:
               return body.strip() in {"Didn't find any major issues.", "Codex Review: Didn't find any major issues."}
 
 
-          def is_clean_review_receipt(body):
+          def is_clean_review_receipt(body, *, structured_clean=False):
               clean = "Codex Review: Didn't find any major issues."
               template = FINDING_REVIEW_WRAPPER.replace(
                   "### 💡 Codex Review\n\nHere are some automated review suggestions for this pull request.", clean)
-              suffix = r"(?: (?:Keep it up!|Another round soon, please!|:\+1:|:thumbsup:|👍[\ufe0e\ufe0f]?[\U0001f3fb-\U0001f3ff]?))?"
-              normalized = re.sub("^" + re.escape(clean) + suffix + "$", clean, body, flags=re.MULTILINE)
+              assertion = r"\s+".join(re.escape(word) for word in clean.split())
+              suffix = r"(?:\s+(?:Keep\s+it\s+up!|Another\s+round\s+soon,\s+please!|:\+1:|:thumbsup:|👍[\ufe0e\ufe0f]?[\U0001f3fb-\U0001f3ff]?))?"
+              normalized = re.sub("^" + assertion + suffix + r"[^\S\n]*$", clean, body, flags=re.MULTILINE)
+              if structured_clean:
+                  normalized = re.sub("^" + re.escape(clean) + r"(?:[^\S\r\n]+[^\r\n\v\f\x85\u2028\u2029]*)?[^\S\n]*$",
+                                      clean, normalized, flags=re.MULTILINE)
               normalized = re.sub(r"(\*\*Reviewed commit:\*\* `)[0-9a-f]{7,40}(`)", r"\1{commit}\2", normalized)
               return body.startswith("<!-- codex-review-receipt:v1 -->") and normalized.split() == template.split()
 
@@ -633,6 +637,9 @@ jobs:
                       completed = completed and resolved == head and "**Completed**" in cells[2]
                   structured = structured_review(summary, rows, head)
                   unknown_findings = bool(structured and structured["unknown_findings"])
+                  structured_clean = bool(structured and structured["completed"]
+                                          and not structured["unknown_findings"]
+                                          and not structured["has_findings"] and not structured["unresolved"])
                   if structured is not None:
                       completed = completed and structured["completed"]
                   reactions = self.pages(f"issues/{number}/reactions")
@@ -683,18 +690,21 @@ jobs:
                               continue
                           comment_body = comment["body"]
                           modern = comment_body.startswith("<!-- codex-review-receipt:")
-                          if modern and not is_clean_review_receipt(comment_body):
+                          if modern and not is_clean_review_receipt(comment_body, structured_clean=True):
                               raise ValueError("Unknown clean review receipt format")
                           content = comment_body.removeprefix("<!-- codex-review-receipt:v1 -->").lstrip() if modern else comment_body
                           if not content.startswith("Codex Review: Didn't find any major issues."):
                               continue
                           if unknown_findings and not modern:
                               continue
-                          commits = re.findall(r"^\*\*Reviewed commit:\*\* `([0-9a-f]{7,40})`$",
+                          commits = re.findall(r"^\*\*Reviewed commit:\*\* `([0-9a-f]{7,40})`[^\S\n]*$",
                                                comment_body, re.MULTILINE)
                           if len(commits) != 1 or comment_body.count("**Reviewed commit:**") != 1:
                               raise ValueError("Ambiguous manual reviewed commit")
                           current_head = self.repo_call("commits/" + commits[0])["sha"] == head
+                          if modern and not is_clean_review_receipt(comment_body):
+                              if current_head and not structured_clean:
+                                  raise ValueError("Variable closing requires explicit current-head clean state")
                           if current_head or modern:
                               completions.append({"id": comment["id"], "digest": digest(review_evidence(comment)),
                                                   "current_head": current_head,
