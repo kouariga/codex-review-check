@@ -1127,7 +1127,8 @@ jobs:
                       previous = event.get("changes", {}).get("body", {}).get("from", "")
                       bodies = [comment.get("body", ""), previous]
                       if (not any(body.startswith(DECISION_PREFIX) for body in bodies)
-                              or not api.privileged(event.get("sender")) or not api.privileged(comment.get("user"))):
+                              or not api.privileged(event.get("sender"))
+                              or (event.get("action") != "deleted" and not api.privileged(comment.get("user")))):
                           return
                       api.disposition_floors = {key: comment["id"] for body in bodies
                                                 for key in decision_targets(body, comment.get("in_reply_to_id"))}

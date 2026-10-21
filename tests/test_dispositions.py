@@ -474,6 +474,19 @@ class DispositionTests(unittest.TestCase):
         comment['body'] = previous
         self.assertTrue(self.event('pull_request_review_comment', comment, action='deleted'))
 
+    def test_current_maintainer_can_delete_revoked_authors_decision(self):
+        comment = self.decision('inline:11')
+        comment['user'] = {'id': 99, 'login': 'former-maintainer', 'type': 'User'}
+        with mock.patch.object(self.api, 'privileged', side_effect=lambda user: user['id'] == 42):
+            for event_name in ('issue_comment', 'pull_request_review_comment'):
+                with self.subTest(event=event_name):
+                    self.assertTrue(self.event(event_name, comment, action='deleted'))
+                    self.assertEqual(self.api.disposition_floors, {'inline:11': 101})
+                    self.assertFalse(self.event(event_name, comment, action='created'))
+                    self.assertFalse(self.event(event_name, comment, action='edited'))
+            self.user = {'id': 98, 'login': 'outsider', 'type': 'User'}
+            self.assertFalse(self.event('issue_comment', comment, action='deleted'))
+
     def test_top_level_target_edits_floor_both_old_and_new_targets(self):
         comment = self.decision('issue:21')
         previous = comment['body']
