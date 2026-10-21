@@ -9,6 +9,7 @@ from unittest import mock
 from test_codex_review_gate import FakeGitHub, gate, sample
 
 HEAD = 'a' * 40
+BASE = {'ref': 'main', 'sha': 'd' * 40}
 EVIDENCE = 'codex-review-evidence'
 
 
@@ -25,7 +26,7 @@ class RequiredGateTests(unittest.TestCase):
         def sleep(seconds):
             now[0] += seconds
         with contextlib.redirect_stdout(io.StringIO()):
-            return gate.run(api, 1, lambda: now[0], sleep, expected_head=HEAD)
+            return gate.run(api, 1, lambda: now[0], sleep, expected_head=HEAD, expected_base=BASE)
 
     def test_stable_acceptance_returns_true_and_writes_only_evidence_name(self):
         clean = sample(thumbs=['new'], summary='complete', completed=True)
@@ -64,6 +65,26 @@ class RequiredGateTests(unittest.TestCase):
             api.repo_call = call
             self.assertIs(self.run_gate(api), False)
             self.assertEqual(api.writes, [])
+
+    def test_queued_event_for_previous_base_cannot_publish_or_reuse_success(self):
+        clean = sample(thumbs=['new'], summary='complete', completed=True)
+        state = gate.initialize(sample(), 0)
+        gate.observe(state, clean, 0)
+        gate.observe(state, clean, 30)
+        for base in ({'ref': 'release', 'sha': BASE['sha']},
+                     {'ref': BASE['ref'], 'sha': 'e' * 40}):
+            for saved in (None, saved_check(conclusion='success', state=state)):
+                with self.subTest(base=base, cached=saved is not None):
+                    api = FakeGitHub([clean], saved)
+                    original = api.repo_call
+                    def call(path, data=None, method=None):
+                        result = original(path, data, method)
+                        return result | {'base': base} if path.startswith('pulls/') else result
+                    api.repo_call = call
+                    api.pages = mock.Mock(side_effect=AssertionError('stale event read checks'))
+                    self.assertIs(self.run_gate(api), False)
+                    self.assertEqual(api.writes, [])
+                    api.pages.assert_not_called()
 
     def test_head_and_base_changes_stop_observation(self):
         for snapshot in (sample(head='b' * 40), sample(base={'ref': 'main', 'sha': 'e' * 40})):
@@ -208,7 +229,7 @@ class RequiredGateTests(unittest.TestCase):
 class RequiredMainTests(unittest.TestCase):
     def test_required_cli_exits_zero_only_for_explicit_true(self):
         with tempfile.NamedTemporaryFile(mode='w') as event:
-            json.dump({'pull_request': {'number': 1, 'head': {'sha': HEAD, 'repo': {'full_name': 'owner/repo'}}}}, event)
+            json.dump({'pull_request': {'number': 1, 'head': {'sha': HEAD, 'repo': {'full_name': 'owner/repo'}}, 'base': BASE}}, event)
             event.flush()
             env = {'CODEX_REQUIRED_REVIEW': 'true', 'GITHUB_EVENT_NAME': 'pull_request_target',
                    'GITHUB_EVENT_PATH': event.name, 'GITHUB_TOKEN': 'unused', 'GITHUB_REPOSITORY': 'owner/repo'}
@@ -218,7 +239,26 @@ class RequiredMainTests(unittest.TestCase):
                     with self.assertRaises(SystemExit) as result:
                         gate.main()
                     self.assertEqual(result.exception.code, code)
-                    self.assertEqual(run.call_args.kwargs, {'expected_head': HEAD})
+                    self.assertEqual(run.call_args.kwargs, {'expected_head': HEAD, 'expected_base': BASE})
+
+    def test_required_mode_rejects_missing_or_malformed_event_base(self):
+        for base in (None, [], 'main', {}, {'ref': 'main'}, {'sha': 'd' * 40},
+                     {'ref': '', 'sha': 'd' * 40}, {'ref': ' ', 'sha': 'd' * 40},
+                     {'ref': 1, 'sha': 'd' * 40}, {'ref': 'main', 'sha': None},
+                     {'ref': 'main', 'sha': 'd' * 39}, {'ref': 'main', 'sha': 'x' * 40}):
+            with self.subTest(base=base), tempfile.NamedTemporaryFile(mode='w') as event:
+                json.dump({'pull_request': {'number': 1, 'head': {'sha': HEAD,
+                           'repo': {'full_name': 'owner/repo'}}, 'base': base}}, event)
+                event.flush()
+                env = {'CODEX_REQUIRED_REVIEW': 'true', 'GITHUB_EVENT_NAME': 'pull_request_target',
+                       'GITHUB_EVENT_PATH': event.name, 'GITHUB_TOKEN': 'unused',
+                       'GITHUB_REPOSITORY': 'owner/repo'}
+                with mock.patch.dict(os.environ, env), mock.patch.object(gate, 'GitHub') as api, \
+                        mock.patch.object(gate, 'run', return_value=True) as run:
+                    with self.assertRaises(ValueError):
+                        gate.main()
+                    run.assert_not_called()
+                    api.return_value.repo_call.assert_not_called()
 
     def test_required_mode_rejects_fork_dependabot_and_missing_repository(self):
         for repository, author in (("other/fork", "person"), ("owner/repo", "dependabot[bot]"), (None, "person")):
