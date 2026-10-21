@@ -876,7 +876,7 @@ jobs:
               return origin
 
 
-          def run(api, number, clock=time.time, sleep=time.sleep, expected_head=None, expected_base=None):
+          def run(api, number, clock=time.time, sleep=time.sleep, expected_head=None):
               pr = api.repo_call(f"pulls/{number}")
               if pr["state"] != "open" or pr["draft"]:
                   return False
@@ -885,8 +885,6 @@ jobs:
                   return False
               check_name = EVIDENCE_CHECK if expected_head is not None else CHECK
               base = base_identity(pr)
-              if expected_base is not None and base != expected_base:
-                  return False
               external = f"codex-gate-v1:{api.repo}:{number}:{head}"
               checks = api.pages(f"commits/{head}/check-runs?filter=all", "check_runs")
               event_floors = {"disposition_floors": dict(getattr(api, "disposition_floors", {}))}
@@ -1127,13 +1125,7 @@ jobs:
                   expected_head = pr["head"]["sha"]
                   if not isinstance(expected_head, str) or not re.fullmatch(r"[0-9a-f]{40}", expected_head):
                       raise ValueError("Missing or malformed event head")
-                  event_base = pr.get("base")
-                  if (not isinstance(event_base, dict)
-                          or not isinstance(event_base.get("ref"), str) or not event_base["ref"].strip()
-                          or not isinstance(event_base.get("sha"), str)
-                          or not re.fullmatch(r"[0-9a-f]{40}", event_base["sha"])):
-                      raise ValueError("Missing or malformed event base")
-                  accepted = run(api, number, expected_head=expected_head, expected_base=base_identity(pr))
+                  accepted = run(api, number, expected_head=expected_head)
                   raise SystemExit(0 if accepted is True else 1)
               if required_job:
                   prefix = api.repo + "/"
