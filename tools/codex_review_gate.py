@@ -298,6 +298,8 @@ def observe(state, snapshot, now):
         root = item["root"]
         try:
             created = timestamp(root.get("created_at"))
+            if not manual_proof and supersession_boundary is not None:
+                created = max(created, timestamp(root.get("updated_at")))
         except ValueError:
             created = None
         associated = next((r for r in snapshot.get("review_findings", [])

@@ -64,8 +64,8 @@ Resolving threads alone is not approval. Earlier aggregate review messages,
 including changes-requested reviews, can be superseded by fresh trusted clean
 approval on the current head. The earlier review must have associated inline
 findings and all their threads must be resolved. With explicit clean structured
-metadata, both review submission and root creation must precede the earliest
-present review completion. Legacy manual evidence uses the completion comment's
+metadata, review submission, root creation, and the root's last edit must precede
+the earliest present review completion. Legacy manual evidence uses the completion comment's
 creation as its boundary. Unthreaded review findings or missing timestamps remain
 blockers. A new finding after clean completion blocks.
 Resolved old-head findings must predate the earliest review completion's

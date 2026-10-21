@@ -1132,7 +1132,7 @@ class ExplicitCleanReactionTests(unittest.TestCase):
         original = api.pages
         head = fixture["pr"]["head"]["sha"]
         root = {"id": 71, "user": {"id": gate.BOT_ID}, "original_commit_id": head,
-                "pull_request_review_id": 81, "created_at": created}
+                "pull_request_review_id": 81, "created_at": created, "updated_at": created}
         review = {"id": 81, "user": {"id": gate.BOT_ID}, "commit_id": head,
                   "state": "COMMENTED", "body": gate.FINDING_REVIEW_WRAPPER.replace("{commit}", head),
                   "submitted_at": submitted}
@@ -1157,6 +1157,14 @@ class ExplicitCleanReactionTests(unittest.TestCase):
         snapshot["structured"]["summary_updated"] = later
         snapshot["completed_at"] = later
         self.assertEqual(self.result(snapshot)[0], "pending")
+
+    def test_resolved_finding_edited_after_clean_completion_stays_blocking(self):
+        for updated in ("2026-10-18T03:55:34Z", "2026-10-18T03:55:50Z", None, "invalid"):
+            with self.subTest(updated=updated):
+                snapshot = self.finding_snapshot()
+                snapshot["inventory"][0]["root"]["updated_at"] = updated
+                snapshot["inventory_digest"] = gate.digest(snapshot["inventory"])
+                self.assertEqual(self.result(snapshot)[0], "pending")
 
     def test_untrusted_or_missing_reaction_timestamp_cannot_approve(self):
         for change in ("actor", "timestamp"):
