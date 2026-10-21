@@ -24,11 +24,7 @@ jobs:
          github.event.comment.performed_via_github_app.id == 1144995) ||
         startsWith(github.event.comment.body, 'Codex review:') ||
         startsWith(github.event.changes.body.from, 'Codex review:'))) ||
-      (github.event_name == 'pull_request_review_comment' &&
-       ((github.event.comment.user.id == 199175422 &&
-         github.event.comment.performed_via_github_app.id == 1144995) ||
-        startsWith(github.event.comment.body, 'Codex review:') ||
-        startsWith(github.event.changes.body.from, 'Codex review:')))
+      github.event_name == 'pull_request_review_comment'
     concurrency:
       group: codex-review-check-${{ inputs.required-job != '' && github.run_id || (github.event.pull_request.number || github.event.issue.number || fromJSON(github.event.inputs.pr || '0')) }}
       cancel-in-progress: false

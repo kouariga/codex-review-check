@@ -1088,12 +1088,14 @@ def main():
         if not trusted(comment):
             previous = event.get("changes", {}).get("body", {}).get("from", "")
             bodies = [comment.get("body", ""), previous]
-            if (not any(body.startswith(DECISION_PREFIX) for body in bodies)
-                    or not api.privileged(event.get("sender"))
-                    or (event.get("action") not in ("edited", "deleted") and not api.privileged(comment.get("user")))):
+            if any(body.startswith(DECISION_PREFIX) for body in bodies):
+                if (not api.privileged(event.get("sender"))
+                        or (event.get("action") not in ("edited", "deleted") and not api.privileged(comment.get("user")))):
+                    return
+                api.disposition_floors = {key: comment["id"] for body in bodies
+                                          for key in decision_targets(body, comment.get("in_reply_to_id"))}
+            elif os.environ["GITHUB_EVENT_NAME"] != "pull_request_review_comment":
                 return
-            api.disposition_floors = {key: comment["id"] for body in bodies
-                                      for key in decision_targets(body, comment.get("in_reply_to_id"))}
     if required:
         pr = event["pull_request"]
         source_repo = (pr["head"].get("repo") or {}).get("full_name")

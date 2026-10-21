@@ -383,7 +383,9 @@ without an upstream lifecycle ID; multiple eligible comments fail closed.
 Observation state lives in the latest owned evidence check output. Native mode
 also reads the append-only feedback records. Code Review must be present;
 Security Review alone cannot approve the check. In legacy report-only mode,
-per-PR job concurrency serializes observations after narrow event filtering. Ordinary comments do not enter that queue. Receipt creation, edits,
+per-PR job concurrency serializes observations after event filtering. Ordinary
+issue comments do not enter that queue. Every inline comment event triggers
+revalidation because a new reply can invalidate a prior decision. Receipt creation, edits,
 and deletions qualify only when the event sender currently has repository write
 authority, checked before any check write. Marker removal uses the previous
 comment body supplied with an edit event. A restart resumes an incomplete run. A new authorized invocation creates a new

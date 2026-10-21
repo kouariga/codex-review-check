@@ -495,14 +495,16 @@ class DispositionTests(unittest.TestCase):
         self.assertTrue(self.event('issue_comment', comment, previous, 'edited'))
         self.assertEqual(self.api.disposition_floors, {'issue:21': 101, 'review:33': 101})
 
-    def test_ordinary_and_outsider_events_do_not_mutate_checks_or_floors(self):
+    def test_outsider_decisions_and_ordinary_issue_comments_are_ignored(self):
         comment = self.decision('inline:11')
         self.permission = {'permission': 'read', 'user': {'id': 42}}
         self.assertFalse(self.event('pull_request_review_comment', comment))
         self.assertFalse(hasattr(self.api, 'disposition_floors'))
         self.permission = {'permission': 'write', 'user': {'id': 42}}
         comment['body'] = 'Ordinary conversation'
-        self.assertFalse(self.event('pull_request_review_comment', comment))
+        self.assertFalse(self.event('issue_comment', comment))
+        self.assertTrue(self.event('pull_request_review_comment', comment))
+        self.assertFalse(hasattr(self.api, 'disposition_floors'))
 
     def test_deleted_reply_floor_survives_new_observer_and_saved_success_renewal(self):
         self.decisions()

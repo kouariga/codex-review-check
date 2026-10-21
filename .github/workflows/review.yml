@@ -18,11 +18,7 @@ jobs:
          github.event.comment.performed_via_github_app.id == 1144995) ||
         startsWith(github.event.comment.body, 'Codex review:') ||
         startsWith(github.event.changes.body.from, 'Codex review:'))) ||
-      (github.event_name == 'pull_request_review_comment' &&
-       ((github.event.comment.user.id == 199175422 &&
-         github.event.comment.performed_via_github_app.id == 1144995) ||
-        startsWith(github.event.comment.body, 'Codex review:') ||
-        startsWith(github.event.changes.body.from, 'Codex review:')))
+      github.event_name == 'pull_request_review_comment'
     concurrency:
       group: codex-review-check-${{ inputs.required-job != '' && github.run_id || (github.event.pull_request.number || github.event.issue.number || fromJSON(github.event.inputs.pr || '0')) }}
       cancel-in-progress: false
@@ -1126,12 +1122,14 @@ jobs:
                   if not trusted(comment):
                       previous = event.get("changes", {}).get("body", {}).get("from", "")
                       bodies = [comment.get("body", ""), previous]
-                      if (not any(body.startswith(DECISION_PREFIX) for body in bodies)
-                              or not api.privileged(event.get("sender"))
-                              or (event.get("action") not in ("edited", "deleted") and not api.privileged(comment.get("user")))):
+                      if any(body.startswith(DECISION_PREFIX) for body in bodies):
+                          if (not api.privileged(event.get("sender"))
+                                  or (event.get("action") not in ("edited", "deleted") and not api.privileged(comment.get("user")))):
+                              return
+                          api.disposition_floors = {key: comment["id"] for body in bodies
+                                                    for key in decision_targets(body, comment.get("in_reply_to_id"))}
+                      elif os.environ["GITHUB_EVENT_NAME"] != "pull_request_review_comment":
                           return
-                      api.disposition_floors = {key: comment["id"] for body in bodies
-                                                for key in decision_targets(body, comment.get("in_reply_to_id"))}
               if required:
                   pr = event["pull_request"]
                   source_repo = (pr["head"].get("repo") or {}).get("full_name")
