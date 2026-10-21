@@ -15,6 +15,7 @@ BOT_ID = 199175422
 CODEX_APP_ID = 1144995
 ACTIONS_APP_ID = 15368
 CHECK = "codex-cloud-review"
+EVIDENCE_CHECK = "codex-review-evidence"
 INTERVAL = 30
 TIMEOUT = 1200
 MARKER = "<!-- codex-pull-request-review-summary -->"
@@ -310,6 +311,7 @@ def observe(state, snapshot, now):
     structured = snapshot.get("structured")
     unknown_findings = bool(structured and structured.get("unknown_findings"))
     lifecycle_valid = (snapshot.get("review_completed", snapshot["completed"]) and not snapshot["eyes"] and not snapshot["failed"]
+                       and not snapshot.get("unresolved_threads", False)
                        and (not unknown_findings or receipt_proof is not None)
                        and (structured is None or (structured["completed"] and not structured["unresolved"]
                            and structured["latest_completed_at"] is not None
@@ -718,7 +720,7 @@ class GitHub:
 
 def publish(api, check_id, state, status, reason):
     payload = {"status": "completed" if status in ("success", "failure", "stale") else "in_progress",
-               "output": {"title": reason, "summary": "Report-only rollout. Not a required check.",
+               "output": {"title": reason, "summary": "Persisted Codex review observation.",
                           "text": json.dumps(state, sort_keys=True)}}
     if (state.get("proof") or {}).get("kind") == "verified_dispositions":
         payload["output"]["summary"] += " Feedback handling is maintainer-attested. This is not clean Codex approval."
@@ -821,15 +823,21 @@ def legacy_observation_origin(checks, latest, state, head, base, external, now):
     return origin
 
 
-def run(api, number, clock=time.time, sleep=time.sleep):
+def run(api, number, clock=time.time, sleep=time.sleep, expected_head=None):
     pr = api.repo_call(f"pulls/{number}")
     if pr["state"] != "open" or pr["draft"]:
-        return
+        return False
     head = pr["head"]["sha"]
+    if expected_head is not None and head != expected_head:
+        return False
+    check_name = EVIDENCE_CHECK if expected_head is not None else CHECK
     base = base_identity(pr)
     external = f"codex-gate-v1:{api.repo}:{number}:{head}"
     history = [c for c in api.pages(f"commits/{head}/check-runs?filter=all", "check_runs")
-               if c["name"] == CHECK and c["app"]["id"] == ACTIONS_APP_ID]
+               if c["name"] in (CHECK, check_name) and c["app"]["id"] == ACTIONS_APP_ID]
+    evidence_history = [c for c in history if c["name"] == check_name]
+    history = evidence_history if any(c.get("external_id") == external for c in evidence_history) else [
+        c for c in history if c["name"] == CHECK]
     owned = [c for c in history if c.get("external_id") == external]
     if sum(c["conclusion"] is None for c in owned) > 1:
         raise ValueError("Multiple active owned checks; refusing ambiguous state")
@@ -872,7 +880,7 @@ def run(api, number, clock=time.time, sleep=time.sleep):
                 snapshot = api.snapshot(number)
                 status, reason = observe(renewed, snapshot, now)
                 if status == "success" and original_proof == renewed.get("proof"):
-                    return
+                    return True
                 state = initialize(snapshot, now) | {
                     key: renewed[key] for key in ("disposition_floors", "manual_since", "manual_active")
                     if key in renewed}
@@ -883,15 +891,15 @@ def run(api, number, clock=time.time, sleep=time.sleep):
                 state = renewed
                 state.pop("proof", None)
                 state["candidate"] = state["candidate_at"] = None
-        if check["conclusion"] is None:
+        if check["conclusion"] is None and check["name"] == check_name:
             check_id = check["id"]
     else:
         state = {"version": 1, "head": head, "base": base, "started": now, "initialized": False}
     advance_floors(state, getattr(api, "disposition_floors", {}))
     if check_id is None:
-        check = api.repo_call("check-runs", {"name": CHECK, "head_sha": head,
+        check = api.repo_call("check-runs", {"name": check_name, "head_sha": head,
                               "external_id": external, "status": "in_progress",
-                              "output": {"title": "Observing Codex review", "summary": "Report-only rollout",
+                              "output": {"title": "Observing Codex review", "summary": "Persisted Codex review observation",
                                          "text": json.dumps(state)}})
         check_id = check["id"]
     while True:
@@ -909,7 +917,7 @@ def run(api, number, clock=time.time, sleep=time.sleep):
             publish(api, check_id, state, status, reason)
             print(status + ": " + reason, flush=True)
             if status != "pending":
-                return
+                return status == "success"
         except APIBlocked:
             raise
         except Exception as error:
@@ -921,12 +929,15 @@ def run(api, number, clock=time.time, sleep=time.sleep):
             publish(api, check_id, state, status, reason)
             print(reason, flush=True)
             if status == "failure":
-                return
+                return False
         sleep(INTERVAL)
 
 
 def main():
-    if os.environ["GITHUB_EVENT_NAME"] not in ("pull_request_target", "issue_comment", "pull_request_review_comment", "workflow_dispatch"):
+    required = os.environ.get("CODEX_REQUIRED_REVIEW") == "true"
+    if required and os.environ["GITHUB_EVENT_NAME"] != "pull_request":
+        raise ValueError("Required review needs a pull_request event")
+    if not required and os.environ["GITHUB_EVENT_NAME"] not in ("pull_request_target", "issue_comment", "pull_request_review_comment", "workflow_dispatch"):
         raise ValueError("Unsupported caller event")
     api = GitHub(os.environ["GITHUB_TOKEN"], os.environ["GITHUB_REPOSITORY"])
     with open(os.environ["GITHUB_EVENT_PATH"]) as event_file:
@@ -948,6 +959,12 @@ def main():
                 return
             api.disposition_floors = {key: comment["id"] for body in bodies
                                       for key in decision_targets(body, comment.get("in_reply_to_id"))}
+    if required:
+        expected_head = event["pull_request"]["head"]["sha"]
+        if not isinstance(expected_head, str) or not re.fullmatch(r"[0-9a-f]{40}", expected_head):
+            raise ValueError("Missing or malformed event head")
+        accepted = run(api, number, expected_head=expected_head)
+        raise SystemExit(0 if accepted is True else 1)
     run(api, number)
 
 
