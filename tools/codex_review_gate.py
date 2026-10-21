@@ -924,10 +924,11 @@ def run(api, number, clock=time.time, sleep=time.sleep, expected_head=None):
                 raise
             except Exception:
                 renewed = copy.deepcopy(state)
-                renewed.update(started=now, renewal={"candidate": state.get("candidate"),
+                renewed.update(started=now, renewal={"proof": original_proof,
                                                    "accepted_since": accepted_since})
             state = renewed
-            if "renewal" not in state and accepted_since is not None:
+            if ("renewal" not in state and accepted_since is not None
+                    and (original_proof is None or original_proof != state.get("proof"))):
                 state["manual_since"] = max(state.get("manual_since", accepted_since), accepted_since)
             state.pop("proof", None)
             state["candidate"] = state["candidate_at"] = None
@@ -957,7 +958,7 @@ def run(api, number, clock=time.time, sleep=time.sleep, expected_head=None):
                     prior = state["renewal"]
                     comparison = copy.deepcopy(state)
                     observe(comparison, snapshot, clock())
-                    if (comparison.get("proof") is None or comparison["candidate"] != prior["candidate"]):
+                    if (prior.get("proof") is None or comparison.get("proof") != prior["proof"]):
                         if prior["accepted_since"] is not None:
                             state["manual_since"] = max(state.get("manual_since", prior["accepted_since"]),
                                                         prior["accepted_since"])

@@ -147,6 +147,26 @@ class RequiredGateTests(unittest.TestCase):
                 self.assertEqual([row['status'] for row in api.writes],
                                  ['in_progress', 'in_progress', 'completed'])
 
+    def test_unchanged_proof_survives_review_metadata_enrichment(self):
+        clean = sample(thumbs=['fresh'], summary='completed', completed=True,
+                       completed_at=10, reaction_times={'fresh': 12})
+        disposed = sample(completed=True, inventory=[{'key': 'inline:1'}], dispositions={
+            'inline:1': {'id': 2, 'author': 3, 'valid': True, 'created': 10, 'digest': 'record'}})
+        for first in (clean, disposed):
+            for unavailable in (False, True):
+                with self.subTest(dispositions=bool(first.get('dispositions')), unavailable=unavailable):
+                    first = first | {'review_digest': 'before-chronology-enrichment'}
+                    state = gate.initialize(sample(), 0)
+                    gate.observe(state, first, 20)
+                    self.assertEqual(gate.observe(state, first, 50)[0], 'success')
+                    enriched = first | {'review_digest': 'with-authoritative-update-times'}
+                    api = FakeGitHub(([OSError('temporary')] if unavailable else []) + [enriched],
+                                     saved_check(conclusion='success', state=state))
+                    self.assertIs(self.run_gate(api), True)
+                    saved = json.loads(api.check['output']['text'])
+                    self.assertNotIn('manual_since', saved)
+                    self.assertEqual(saved['proof'], state['proof'])
+
     def test_cached_acceptance_revalidation_has_a_bounded_retry(self):
         clean = sample(thumbs=['fresh'], summary='completed', completed=True)
         state = gate.initialize(sample(), 0)
