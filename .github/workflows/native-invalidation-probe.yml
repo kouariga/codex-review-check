@@ -1,0 +1,28 @@
+name: Native invalidation probe
+on:
+  push:
+    branches: [test/native-review-invalidation]
+permissions:
+  contents: read
+  checks: write
+jobs:
+  attestation-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Temporary isolated check for lifecycle experiment'
+  invalidate-probe:
+    needs: attestation-probe
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          job_id=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" --jq '.jobs[] | select(.name == "attestation-probe") | .id')
+          gh api "repos/$REPO/check-runs/$job_id" --jq '{id,status,conclusion,head_sha,check_suite:.check_suite.id}'
+          gh api --method PATCH "repos/$REPO/check-runs/$job_id" -f status=in_progress --jq '{id,status,conclusion,head_sha,check_suite:.check_suite.id}'
+          gh api --method PATCH "repos/$REPO/check-runs/$job_id" -f status=completed -f conclusion=failure --jq '{id,status,conclusion,head_sha,check_suite:.check_suite.id}'
+          gh api --method PATCH "repos/$REPO/check-runs/$job_id" -f status=completed -f conclusion=success --jq '{id,status,conclusion,head_sha,check_suite:.check_suite.id}'
