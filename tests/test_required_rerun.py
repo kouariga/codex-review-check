@@ -301,6 +301,37 @@ class NativeRerunTests(unittest.TestCase):
         self.assertEqual(api.writes, [('actions/jobs/8/rerun', {}, 'POST')])
         self.assertEqual(api.check['status'], 'queued')
 
+    def test_top_level_codex_review_events_rerun_native_and_ignore_other_authors(self):
+        for action in ('submitted', 'edited', 'dismissed'):
+            for author in (199175422, 123):
+                with self.subTest(action=action, author=author):
+                    api = NativeGitHub()
+                    event_body = {'action': action, 'pull_request': {'number': 1},
+                                  'sender': {'id': 456},
+                                  'review': {'user': {'id': author, 'login': 'chatgpt-codex-connector[bot]'},
+                                             'body': '[P1] A top-level finding without inline comments'}}
+                    with tempfile.NamedTemporaryFile(mode='w') as event:
+                        json.dump(event_body, event)
+                        event.flush()
+                        env = {'CODEX_REQUIRED_REVIEW': '', 'CODEX_REQUIRED_JOB': 'codex-cloud-review',
+                               'GITHUB_EVENT_NAME': 'pull_request_review', 'GITHUB_EVENT_PATH': event.name,
+                               'GITHUB_TOKEN': 'unused', 'GITHUB_REPOSITORY': 'owner/repo',
+                               'GITHUB_WORKFLOW_REF': 'owner/repo/' + WORKFLOW + '@refs/heads/main',
+                               'GITHUB_RUN_ID': '17'}
+                        with mock.patch.dict(os.environ, env), \
+                                mock.patch.object(gate, 'GitHub', return_value=api), \
+                                mock.patch.object(api, 'repo_call', wraps=api.repo_call) as requests, \
+                                mock.patch.object(api, 'pages', wraps=api.pages) as pages:
+                            gate.main()
+                    if author == 199175422:
+                        self.assertEqual(api.writes, [('actions/jobs/8/rerun', {}, 'POST')])
+                        self.assertEqual(api.check['status'], 'queued')
+                    else:
+                        requests.assert_not_called()
+                        pages.assert_not_called()
+                        self.assertEqual(api.writes, [])
+                        self.assertEqual(api.check['conclusion'], 'success')
+
     def test_comment_observer_uses_server_run_start_and_rejects_invalid_identity(self):
         event_body = {'issue': {'number': 1, 'pull_request': {'url': 'unused'}},
                       'comment': {'user': {'id': 199175422},
