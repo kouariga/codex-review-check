@@ -97,6 +97,35 @@ class RequiredGateTests(unittest.TestCase):
                 self.assertEqual(api.check['name'], EVIDENCE)
                 self.assertEqual(len(api.writes), writes)
 
+    def test_completed_same_head_rereview_retains_original_observation_baseline(self):
+        for manual in (False, True):
+            with self.subTest(manual=manual):
+                def complete(identifier, completed_at):
+                    result = sample(thumbs=[identifier], summary=identifier, completed=True,
+                                    completed_at=completed_at)
+                    if manual:
+                        result['manual'] = {
+                            'comments': [{'id': identifier, 'created': completed_at - 1,
+                                          'updated': completed_at - 1, 'digest': identifier}],
+                            'thumbs': {identifier: completed_at + 2},
+                            'completed_at': completed_at, 'summary_updated': completed_at + 1}
+                    else:
+                        result['reaction_times'] = {identifier: completed_at + 2}
+                    return result
+                first = complete('first', 10)
+                state = gate.initialize(sample(), 0)
+                self.assertEqual(gate.observe(state, first, 20)[0], 'pending')
+                self.assertEqual(gate.observe(state, first, 50)[0], 'success')
+                second = complete('second', 55)
+                api = FakeGitHub([second], saved_check(conclusion='success', state=state))
+                self.assertIs(self.run_gate(api), True)
+                saved = json.loads(api.check['output']['text'])
+                self.assertEqual(saved['baseline'], ['old'])
+                self.assertEqual(saved['observed_since'], 0)
+                self.assertEqual(saved['candidate_at'], 60)
+                self.assertEqual([row['status'] for row in api.writes],
+                                 ['in_progress', 'in_progress', 'completed'])
+
     def test_new_evidence_history_takes_precedence_and_native_job_is_not_state(self):
         clean = sample(thumbs=['new'], summary='complete', completed=True)
         legacy = saved_check(name='codex-cloud-review', identifier=3)
