@@ -2,11 +2,11 @@
 name: Codex Review Check
 on:
   workflow_call:
-permissions:
-  contents: read
-  pull-requests: read
-  issues: read
-  checks: write
+    inputs:
+      required-job:
+        description: Native required job to rerun instead of publishing a legacy check
+        type: string
+        default: ''
 jobs:
   observe:
     if: >-
@@ -31,6 +31,7 @@ jobs:
       - name: Observe metadata without executing PR code
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          CODEX_REQUIRED_JOB: ${{ inputs.required-job }}
         shell: bash
         run: |
           python3 - <<'CODEX_GATE_PY'
@@ -432,7 +433,8 @@ jobs:
                       req.add_header("If-None-Match", cached[0])
                   try:
                       with urllib.request.urlopen(req, timeout=20) as response:
-                          value = json.load(response)
+                          body = response.read()
+                          value = json.loads(body) if body else None
                           if req.get_method() == "GET" and response.headers.get("ETag"):
                               self.cache[path] = (response.headers["ETag"], value)
                           return copy.deepcopy(value)
@@ -911,16 +913,18 @@ jobs:
                       state = {"version": 1, "head": head, "base": base,
                                "started": now, "initialized": False}
                   elif check["conclusion"] == "success":
+                      accepted_since = state.get("candidate_at")
                       renewed = dict(state, started=now, candidate_at=now - INTERVAL)
                       try:
                           snapshot = api.snapshot(number)
                           status, reason = observe(renewed, snapshot, now)
                           if status == "success" and original_proof == renewed.get("proof"):
                               return True
-                          state = initialize(snapshot, now) | {
-                              key: renewed[key] for key in ("disposition_floors", "manual_since", "manual_active")
-                              if key in renewed}
-                          state["head"], state["base"] = head, base
+                          state = renewed
+                          if accepted_since is not None:
+                              state["manual_since"] = max(state.get("manual_since", accepted_since), accepted_since)
+                          state.pop("proof", None)
+                          state["candidate"] = state["candidate_at"] = None
                       except APIBlocked:
                           raise
                       except Exception:
@@ -969,6 +973,81 @@ jobs:
                   sleep(INTERVAL)
 
 
+          def persist_disposition_floors(api, number, head, base, checks, now):
+              floors = getattr(api, "disposition_floors", {})
+              if not floors:
+                  return
+              external = f"codex-gate-v1:{api.repo}:{number}:{head}"
+              owned = [check for check in checks if check.get("name") == EVIDENCE_CHECK
+                       and check.get("head_sha") == head and (check.get("app") or {}).get("id") == ACTIONS_APP_ID
+                       and check.get("external_id") == external]
+              check = max(owned, key=lambda row: row["id"]) if owned else None
+              state = {"version": 1, "head": head, "base": base, "started": now, "initialized": False}
+              if check:
+                  saved = json.loads(check["output"]["text"])
+                  if saved["version"] != 1 or saved["head"] != head:
+                      raise ValueError("Invalid saved observation")
+                  if saved.get("base") == base:
+                      state = saved
+              advance_floors(state, floors)
+              state.pop("proof", None)
+              state["candidate"] = state["candidate_at"] = None
+              if not check or check.get("conclusion") is not None:
+                  check = api.repo_call("check-runs", {"name": EVIDENCE_CHECK, "head_sha": head,
+                                        "external_id": external, "status": "in_progress",
+                                        "output": {"title": "Feedback changed; required review rerun pending",
+                                                   "summary": "Persisted Codex review observation.",
+                                                   "text": json.dumps(state, sort_keys=True)}})
+              else:
+                  publish(api, check["id"], state, "pending", "Feedback changed; required review rerun pending")
+
+
+          def rerun_required_job(api, number, job_name, workflow_path, clock=time.time, sleep=time.sleep):
+              pr = api.repo_call(f"pulls/{number}")
+              head, base = pr["head"]["sha"], base_identity(pr)
+              started = clock()
+              while True:
+                  if pr["state"] != "open" or pr["draft"] or pr["head"]["sha"] != head or base_identity(pr) != base:
+                      return False
+                  checks = api.pages(f"commits/{head}/check-runs?filter=all", "check_runs")
+                  for check in sorted(checks, key=lambda row: row["id"], reverse=True):
+                      if (check.get("name") != job_name or check.get("head_sha") != head
+                              or (check.get("app") or {}).get("id") != ACTIONS_APP_ID):
+                          continue
+                      match = re.fullmatch(r"https://github\.com/" + re.escape(api.repo)
+                                           + r"/actions/runs/([1-9][0-9]*)/job/([1-9][0-9]*)",
+                                           check.get("details_url") or "")
+                      if not match:
+                          continue
+                      run_id, job_id = map(int, match.groups())
+                      job = api.repo_call(f"actions/jobs/{job_id}")
+                      if (job.get("id") != job_id or job.get("run_id") != run_id or job.get("name") != job_name
+                              or job.get("check_run_url") != f"https://api.github.com/repos/{api.repo}/check-runs/{check['id']}"):
+                          continue
+                      workflow = api.repo_call(f"actions/runs/{run_id}")
+                      if (workflow.get("id") != run_id or workflow.get("event") != "pull_request_target"
+                              or workflow.get("path") != workflow_path
+                              or not any(row.get("number") == number and (row.get("head") or {}).get("sha") == head
+                                         and all((row.get("base") or {}).get(key) == value for key, value in base.items())
+                                         for row in workflow.get("pull_requests", []))):
+                          continue
+                      if job.get("status") == "completed" and workflow.get("status") == "completed":
+                          current = api.repo_call(f"pulls/{number}")
+                          if (current["state"] != "open" or current["draft"]
+                                  or current["head"]["sha"] != head or base_identity(current) != base):
+                              return False
+                          persist_disposition_floors(api, number, head, base, checks, clock())
+                          api.repo_call(f"actions/jobs/{job_id}/rerun", {}, "POST")
+                          print("Requested native required review rerun", flush=True)
+                          return True
+                      break
+                  if clock() - started >= TIMEOUT:
+                      print("No completed current native required job available to rerun", flush=True)
+                      return False
+                  sleep(INTERVAL)
+                  pr = api.repo_call(f"pulls/{number}")
+
+
           def main():
               required = os.environ.get("CODEX_REQUIRED_REVIEW") == "true"
               if required and os.environ["GITHUB_EVENT_NAME"] != "pull_request_target":
@@ -1001,6 +1080,18 @@ jobs:
                       raise ValueError("Missing or malformed event head")
                   accepted = run(api, number, expected_head=expected_head)
                   raise SystemExit(0 if accepted is True else 1)
+              required_job = os.environ.get("CODEX_REQUIRED_JOB", "")
+              if required_job:
+                  prefix = api.repo + "/"
+                  workflow_ref = os.environ.get("GITHUB_WORKFLOW_REF", "")
+                  if not workflow_ref.startswith(prefix):
+                      raise ValueError("Missing trusted caller workflow identity")
+                  workflow_path, separator, ref = workflow_ref[len(prefix):].partition("@")
+                  if not separator or not ref or not re.fullmatch(r"\.github/workflows/[^/@]+\.ya?ml", workflow_path):
+                      raise ValueError("Invalid caller workflow identity")
+                  if not rerun_required_job(api, number, required_job, workflow_path):
+                      raise SystemExit(1)
+                  return
               run(api, number)
 
 

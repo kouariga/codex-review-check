@@ -8,11 +8,11 @@ HEADER = """# Generated from tools/codex_review_gate.py. Do not edit inline code
 name: Codex Review Check
 on:
   workflow_call:
-permissions:
-  contents: read
-  pull-requests: read
-  issues: read
-  checks: write
+    inputs:
+      required-job:
+        description: Native required job to rerun instead of publishing a legacy check
+        type: string
+        default: ''
 jobs:
   observe:
     if: >-
@@ -37,6 +37,7 @@ jobs:
       - name: Observe metadata without executing PR code
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          CODEX_REQUIRED_JOB: ${{ inputs.required-job }}
         shell: bash
         run: |
           python3 - <<'CODEX_GATE_PY'

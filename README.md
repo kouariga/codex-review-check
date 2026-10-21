@@ -45,13 +45,35 @@ rules, and exits zero only for explicit acceptance. Unfinished reviews,
 unresolved threads, stale identity, API errors, and timeouts do not succeed.
 It persists retry state in `codex-review-evidence`, including migration from
 owned legacy observations. The native job supplies the required check result.
-The reusable workflow remains report-only for comment and manual observers.
+To re-evaluate this native job after comment events, pass `required-job:
+codex-cloud-review` to the reusable workflow. Grant `actions: write` to that
+observer job, alongside `checks: write` and the existing read permissions. The reusable workflow
+inherits its caller's permissions. Without this input, it retains legacy
+report-only behavior and needs `checks: write` instead.
+
+For each authenticated Codex update or authorized disposition, the observer
+finds the latest native job for the current PR head and base. It verifies the
+job's check, original `pull_request_target` event, PR identity, and caller
+workflow path before requesting a job rerun. GitHub queues a new attempt in the
+original Actions suite to re-evaluate the required job. The native
+action then applies the existing acceptance rules to current review evidence.
+An active workflow is allowed to finish before the observer requests the job rerun. This
+covers a job that was about to succeed using evidence from before the update.
+The observer persists authorized disposition edits and deletions in
+`codex-review-evidence` before requesting the rerun. This prevents an older reply
+from becoming valid again when a newer decision disappears. The observer
+creates no legacy `codex-cloud-review` check in this mode.
 
 Pin both paths to tested commits when using per-repository adoption. The trusted
 base caller must be updated before its installation PR can exercise this native
-job. Verify the actual merge box after adoption. A completed native success
-attests to evidence at job evaluation; a later same-head review restart does not
-automatically invalidate that job. Do not treat it as continuous approval.
+job. Install the updated observer on the default branch as well. Verify the
+actual merge box after adoption, including a review restart on the same commit.
+Invalidation waits for comment delivery, runner availability, and any active
+native job to finish. A missing native job is retried for up to 20 minutes.
+GitHub limits reruns to runs less than 30 days old and at most 50 attempts.
+An unavailable job, denied rerun, or exhausted limit fails the observer visibly;
+it cannot revoke an old result without a successful rerun request. A new PR
+commit creates a new native run when an existing run cannot be rerun.
 
 ## Evidence and limits
 
