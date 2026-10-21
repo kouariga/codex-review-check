@@ -59,21 +59,34 @@ original Actions suite to re-evaluate the required job. The native
 action then applies the existing acceptance rules to current review evidence.
 An active workflow is allowed to finish before the observer requests the job rerun. This
 covers a job that was about to succeed using evidence from before the update.
-The observer persists authorized disposition edits and deletions in
-`codex-review-evidence` before requesting the rerun. This prevents an older reply
-from becoming valid again when a newer decision disappears. The observer
-creates no legacy `codex-cloud-review` check in this mode.
+Each opted-in observer has its own concurrency group so later updates cannot
+replace a pending feedback event. Before waiting for the native job, the observer
+appends authorized disposition edits and deletions to `codex-review-feedback-event`.
+The native evaluator reads these records for the current PR head and base and
+keeps the highest decision ID for each finding. An active native job cannot
+overwrite these records, and an older reply cannot become valid again when a
+newer decision disappears. The observer creates no legacy `codex-cloud-review`
+check in this mode.
 
 Pin both paths to tested commits when using per-repository adoption. The trusted
 base caller must be updated before its installation PR can exercise this native
 job. Install the updated observer on the default branch as well. Verify the
 actual merge box after adoption, including a review restart on the same commit.
 Invalidation waits for comment delivery, runner availability, and any active
-native job to finish. A missing native job is retried for up to 20 minutes.
+native job to finish. The observer waits up to 30 minutes for a completed native
+workflow and has a 35-minute job limit. This leaves time for the native job's
+20-minute observation window and 25-minute job limit.
 GitHub limits reruns to runs less than 30 days old and at most 50 attempts.
 An unavailable job, denied rerun, or exhausted limit fails the observer visibly;
 it cannot revoke an old result without a successful rerun request. A new PR
 commit creates a new native run when an existing run cannot be rerun.
+
+An ordinary required status check selects a check name and its GitHub App. It
+does not bind that check to a specific trusted workflow. The rerun observer
+verifies workflow provenance, but these changes do not configure a workflow-bound
+branch ruleset or prevent a repository writer from forging checks or saved
+state through another Actions workflow. This is a trust boundary, not a verified
+merge bypass. Keep workflow and repository write access restricted to maintainers.
 
 ## Evidence and limits
 

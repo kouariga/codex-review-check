@@ -23,10 +23,10 @@ jobs:
         startsWith(github.event.comment.body, 'Codex review:') ||
         startsWith(github.event.changes.body.from, 'Codex review:')))
     concurrency:
-      group: codex-review-check-${{ github.event.pull_request.number || github.event.issue.number || fromJSON(github.event.inputs.pr || '0') }}
+      group: codex-review-check-${{ inputs.required-job != '' && github.run_id || (github.event.pull_request.number || github.event.issue.number || fromJSON(github.event.inputs.pr || '0')) }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: ${{ inputs.required-job != '' && 35 || 25 }}
     steps:
       - name: Observe metadata without executing PR code
         env:
@@ -53,8 +53,10 @@ jobs:
           ACTIONS_APP_ID = 15368
           CHECK = "codex-cloud-review"
           EVIDENCE_CHECK = "codex-review-evidence"
+          FEEDBACK_CHECK = "codex-review-feedback-event"
           INTERVAL = 30
           TIMEOUT = 1200
+          RERUN_TIMEOUT = 1800
           MARKER = "<!-- codex-pull-request-review-summary -->"
           DECISION_PREFIX = "Codex review:"
 
@@ -871,7 +873,26 @@ jobs:
               check_name = EVIDENCE_CHECK if expected_head is not None else CHECK
               base = base_identity(pr)
               external = f"codex-gate-v1:{api.repo}:{number}:{head}"
-              history = [c for c in api.pages(f"commits/{head}/check-runs?filter=all", "check_runs")
+              checks = api.pages(f"commits/{head}/check-runs?filter=all", "check_runs")
+              event_floors = {"disposition_floors": dict(getattr(api, "disposition_floors", {}))}
+              feedback_external = f"codex-feedback-v1:{api.repo}:{number}:{head}:{digest(base)}"
+              for check in checks:
+                  if (check.get("name") != FEEDBACK_CHECK or check.get("head_sha") != head
+                          or (check.get("app") or {}).get("id") != ACTIONS_APP_ID
+                          or check.get("external_id") != feedback_external):
+                      continue
+                  saved = json.loads(check["output"]["text"])
+                  if (not isinstance(saved, dict) or type(saved.get("version")) is not int or saved["version"] != 1
+                          or saved.get("head") != head or saved.get("base") != base
+                          or check.get("status") != "completed" or check.get("conclusion") != "neutral"
+                          or not isinstance(saved.get("disposition_floors"), dict)
+                          or any(not isinstance(key, str) or not re.fullmatch(r"(?:inline|issue|review):[1-9][0-9]*", key)
+                                 or type(value) is not int or value <= 0
+                                 for key, value in saved["disposition_floors"].items())):
+                      raise ValueError("Invalid saved feedback event")
+                  advance_floors(event_floors, saved["disposition_floors"])
+              floors = event_floors["disposition_floors"]
+              history = [c for c in checks
                          if c["name"] in (CHECK, check_name) and c["app"]["id"] == ACTIONS_APP_ID]
               evidence_history = [c for c in history if c["name"] == check_name]
               history = evidence_history if any(c.get("external_id") == external for c in evidence_history) else [
@@ -885,7 +906,7 @@ jobs:
                   check = max(owned, key=lambda c: c["id"])
                   state = json.loads(check["output"]["text"])
                   original_proof = state.get("proof")
-                  advance_floors(state, getattr(api, "disposition_floors", {}))
+                  advance_floors(state, floors)
                   if state["version"] != 1 or state["head"] != head:
                       raise ValueError("Invalid saved observation")
                   if (check["conclusion"] in (None, "failure") and "initialized" not in state
@@ -920,22 +941,20 @@ jobs:
                           status, reason = observe(renewed, snapshot, now)
                           if status == "success" and original_proof == renewed.get("proof"):
                               return True
-                          state = renewed
-                          if accepted_since is not None:
-                              state["manual_since"] = max(state.get("manual_since", accepted_since), accepted_since)
-                          state.pop("proof", None)
-                          state["candidate"] = state["candidate_at"] = None
                       except APIBlocked:
                           raise
                       except Exception:
-                          state = renewed
-                          state.pop("proof", None)
-                          state["candidate"] = state["candidate_at"] = None
+                          pass
+                      state = renewed
+                      if accepted_since is not None:
+                          state["manual_since"] = max(state.get("manual_since", accepted_since), accepted_since)
+                      state.pop("proof", None)
+                      state["candidate"] = state["candidate_at"] = None
                   if check["conclusion"] is None and check["name"] == check_name:
                       check_id = check["id"]
               else:
                   state = {"version": 1, "head": head, "base": base, "started": now, "initialized": False}
-              advance_floors(state, getattr(api, "disposition_floors", {}))
+              advance_floors(state, floors)
               if check_id is None:
                   check = api.repo_call("check-runs", {"name": check_name, "head_sha": head,
                                         "external_id": external, "status": "in_progress",
@@ -973,38 +992,23 @@ jobs:
                   sleep(INTERVAL)
 
 
-          def persist_disposition_floors(api, number, head, base, checks, now):
+          def persist_disposition_floors(api, number, head, base):
               floors = getattr(api, "disposition_floors", {})
               if not floors:
                   return
-              external = f"codex-gate-v1:{api.repo}:{number}:{head}"
-              owned = [check for check in checks if check.get("name") == EVIDENCE_CHECK
-                       and check.get("head_sha") == head and (check.get("app") or {}).get("id") == ACTIONS_APP_ID
-                       and check.get("external_id") == external]
-              check = max(owned, key=lambda row: row["id"]) if owned else None
-              state = {"version": 1, "head": head, "base": base, "started": now, "initialized": False}
-              if check:
-                  saved = json.loads(check["output"]["text"])
-                  if saved["version"] != 1 or saved["head"] != head:
-                      raise ValueError("Invalid saved observation")
-                  if saved.get("base") == base:
-                      state = saved
-              advance_floors(state, floors)
-              state.pop("proof", None)
-              state["candidate"] = state["candidate_at"] = None
-              if not check or check.get("conclusion") is not None:
-                  check = api.repo_call("check-runs", {"name": EVIDENCE_CHECK, "head_sha": head,
-                                        "external_id": external, "status": "in_progress",
-                                        "output": {"title": "Feedback changed; required review rerun pending",
-                                                   "summary": "Persisted Codex review observation.",
-                                                   "text": json.dumps(state, sort_keys=True)}})
-              else:
-                  publish(api, check["id"], state, "pending", "Feedback changed; required review rerun pending")
+              state = {"version": 1, "head": head, "base": base, "disposition_floors": floors}
+              api.repo_call("check-runs", {"name": FEEDBACK_CHECK, "head_sha": head,
+                            "external_id": f"codex-feedback-v1:{api.repo}:{number}:{head}:{digest(base)}",
+                            "status": "completed", "conclusion": "neutral",
+                            "output": {"title": "Authorized feedback changed",
+                                       "summary": "Decision history retained for required review reruns.",
+                                       "text": json.dumps(state, sort_keys=True)}})
 
 
           def rerun_required_job(api, number, job_name, workflow_path, clock=time.time, sleep=time.sleep):
               pr = api.repo_call(f"pulls/{number}")
               head, base = pr["head"]["sha"], base_identity(pr)
+              persist_disposition_floors(api, number, head, base)
               started = clock()
               while True:
                   if pr["state"] != "open" or pr["draft"] or pr["head"]["sha"] != head or base_identity(pr) != base:
@@ -1036,12 +1040,11 @@ jobs:
                           if (current["state"] != "open" or current["draft"]
                                   or current["head"]["sha"] != head or base_identity(current) != base):
                               return False
-                          persist_disposition_floors(api, number, head, base, checks, clock())
                           api.repo_call(f"actions/jobs/{job_id}/rerun", {}, "POST")
                           print("Requested native required review rerun", flush=True)
                           return True
                       break
-                  if clock() - started >= TIMEOUT:
+                  if clock() - started >= RERUN_TIMEOUT:
                       print("No completed current native required job available to rerun", flush=True)
                       return False
                   sleep(INTERVAL)

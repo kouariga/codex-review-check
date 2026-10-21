@@ -29,10 +29,10 @@ jobs:
         startsWith(github.event.comment.body, 'Codex review:') ||
         startsWith(github.event.changes.body.from, 'Codex review:')))
     concurrency:
-      group: codex-review-check-${{ github.event.pull_request.number || github.event.issue.number || fromJSON(github.event.inputs.pr || '0') }}
+      group: codex-review-check-${{ inputs.required-job != '' && github.run_id || (github.event.pull_request.number || github.event.issue.number || fromJSON(github.event.inputs.pr || '0')) }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: ${{ inputs.required-job != '' && 35 || 25 }}
     steps:
       - name: Observe metadata without executing PR code
         env:
