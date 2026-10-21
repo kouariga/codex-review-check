@@ -96,13 +96,13 @@ def is_clean_review_body(body):
 
 
 def is_clean_review_receipt(body):
+    clean = "Codex Review: Didn't find any major issues."
     template = FINDING_REVIEW_WRAPPER.replace(
-        "### 💡 Codex Review\n\nHere are some automated review suggestions for this pull request.",
-        "Codex Review: Didn't find any major issues. Keep it up!")
-    normalized = re.sub(r"(\*\*Reviewed commit:\*\* `)[0-9a-f]{7,40}(`)", r"\1{commit}\2", body)
-    templates = (template, template.replace("Keep it up!", "Another round soon, please!"))
-    return body.startswith("<!-- codex-review-receipt:v1 -->") and any(
-        normalized.split() == candidate.split() for candidate in templates)
+        "### 💡 Codex Review\n\nHere are some automated review suggestions for this pull request.", clean)
+    suffix = r"(?: (?:Keep it up!|Another round soon, please!|:\+1:|:thumbsup:|👍[\ufe0e\ufe0f]?[\U0001f3fb-\U0001f3ff]?))?"
+    normalized = re.sub("^" + re.escape(clean) + suffix + "$", clean, body, flags=re.MULTILINE)
+    normalized = re.sub(r"(\*\*Reviewed commit:\*\* `)[0-9a-f]{7,40}(`)", r"\1{commit}\2", normalized)
+    return body.startswith("<!-- codex-review-receipt:v1 -->") and normalized.split() == template.split()
 
 
 def unique_object(pairs):
