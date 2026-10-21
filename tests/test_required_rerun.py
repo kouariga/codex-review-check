@@ -13,6 +13,11 @@ from test_codex_review_gate import FakeGitHub, gate, ROOT
 HEAD = 'a' * 40
 BASE = 'b' * 40
 WORKFLOW = '.github/workflows/codex-cloud-review.yml'
+BOUNDARY = 100
+
+
+def server_time(seconds):
+    return '1970-01-01T00:%02d:%02dZ' % divmod(seconds, 60)
 
 
 class NativeGitHub:
@@ -26,7 +31,7 @@ class NativeGitHub:
                       'details_url': 'https://github.com/owner/repo/actions/runs/7/job/8'}
         self.job = {'id': 8, 'run_id': 7, 'name': 'codex-cloud-review', 'status': 'completed',
                     'check_run_url': 'https://api.github.com/repos/owner/repo/check-runs/9'}
-        self.workflow = {'id': 7, 'event': 'pull_request_target', 'path': WORKFLOW, 'status': 'completed',
+        self.workflow = {'run_attempt': 1, 'id': 7, 'event': 'pull_request_target', 'path': WORKFLOW, 'status': 'completed',
                          'pull_requests': [{'number': 1, 'head': {'sha': HEAD},
                                             'base': {'sha': BASE, 'ref': 'main', 'repo': {'id': 2}}}]}
         self.evidence = None
@@ -47,7 +52,8 @@ class NativeGitHub:
             return copy.deepcopy(self.pr)
         if path == 'check-runs':
             self.writes.append((path, copy.deepcopy(data), method))
-            result = dict(copy.deepcopy(data), id=20 + len(self.feedback), app={'id': 15368})
+            result = dict(copy.deepcopy(data), id=20 + len(self.feedback), app={'id': 15368},
+                          completed_at=server_time(120))
             if data['name'] == 'codex-review-feedback-event':
                 self.feedback.append(result)
             else:
@@ -59,6 +65,8 @@ class NativeGitHub:
             return copy.deepcopy(self.evidence)
         if path == 'actions/jobs/8':
             return copy.deepcopy(self.job)
+        if path == 'actions/runs/17':
+            return {'id': 17, 'run_started_at': server_time(100)}
         if path == 'actions/runs/7':
             return copy.deepcopy(self.workflow)
         if path == 'actions/jobs/8/rerun' and method == 'POST':
@@ -71,7 +79,7 @@ class NativeGitHub:
 
 
 class NativeRerunTests(unittest.TestCase):
-    def rerun(self, api, on_sleep=None):
+    def rerun(self, api, on_sleep=None, observed_after=None):
         now = [0]
         def sleep(seconds):
             now[0] += seconds
@@ -79,7 +87,68 @@ class NativeRerunTests(unittest.TestCase):
                 on_sleep()
         with contextlib.redirect_stdout(io.StringIO()):
             return gate.rerun_required_job(api, 1, 'codex-cloud-review', WORKFLOW,
-                                           lambda: now[0], sleep)
+                                           lambda: now[0], sleep, observed_after=observed_after)
+
+    def test_later_native_attempt_covers_both_observers_without_extra_rerun(self):
+        api = NativeGitHub()
+        self.assertIs(self.rerun(api, observed_after=BOUNDARY), True)
+        api.job.update(status='in_progress', started_at=server_time(101))
+        api.workflow.update(status='in_progress', run_attempt=2)
+        self.assertIs(self.rerun(api, observed_after=BOUNDARY), True)
+        self.assertEqual(api.writes, [('actions/jobs/8/rerun', {}, 'POST')])
+
+    def test_feedback_marker_is_saved_before_coverage_and_sets_later_boundary(self):
+        api = NativeGitHub()
+        api.disposition_floors = {'inline:11': 202}
+        api.job.update(status='in_progress', started_at=server_time(121))
+        api.workflow['status'] = 'in_progress'
+        self.assertIs(self.rerun(api, observed_after=BOUNDARY), True)
+        self.assertEqual([path for path, _, _ in api.writes], ['check-runs'])
+        self.assertEqual(json.loads(api.feedback[0]['output']['text'])['disposition_floors'],
+                         {'inline:11': 202})
+        api = NativeGitHub()
+        api.disposition_floors = {'inline:11': 202}
+        api.job['started_at'] = server_time(110)
+        self.assertIs(self.rerun(api, observed_after=BOUNDARY), True)
+        self.assertEqual([path for path, _, _ in api.writes], ['check-runs', 'actions/jobs/8/rerun'])
+
+    def test_equal_earlier_or_missing_start_cannot_cover_event(self):
+        for start in (None, '', 'bad', server_time(99), server_time(100)):
+            with self.subTest(start=start):
+                api = NativeGitHub()
+                api.job['started_at'] = start
+                self.assertIs(self.rerun(api, observed_after=BOUNDARY), True)
+                self.assertEqual(api.writes, [('actions/jobs/8/rerun', {}, 'POST')])
+
+    def test_marker_without_valid_server_time_cannot_claim_coverage(self):
+        for missing in (None, '', 'bad'):
+            api = NativeGitHub()
+            api.disposition_floors = {'inline:11': 202}
+            api.job['started_at'] = server_time(121)
+            call = api.repo_call
+            def damaged(path, data=None, method=None):
+                result = call(path, data, method)
+                if path == 'check-runs':
+                    result['completed_at'] = missing
+                return result
+            api.repo_call = damaged
+            with self.assertRaises(ValueError):
+                self.rerun(api, observed_after=BOUNDARY)
+            self.assertFalse(any(path.endswith('/rerun') for path, _, _ in api.writes))
+
+    def test_racing_post_403_only_recovers_after_observed_attempt_advance(self):
+        api = NativeGitHub()
+        call = api.repo_call
+        def raced(path, data=None, method=None):
+            if path.endswith('/rerun'):
+                api.workflow.update(status='in_progress', run_attempt=2)
+                api.job.update(status='in_progress', started_at=server_time(101))
+                raise gate.APIBlocked('already rerunning')
+            return call(path, data, method)
+        api.repo_call = raced
+        sleeps = []
+        self.assertIs(self.rerun(api, lambda: sleeps.append(True), observed_after=BOUNDARY), True)
+        self.assertEqual(len(sleeps), 1)
 
     def test_completed_success_is_replaced_by_queued_native_rerun(self):
         api = NativeGitHub()
@@ -110,7 +179,8 @@ class NativeRerunTests(unittest.TestCase):
             env = {'CODEX_REQUIRED_REVIEW': '', 'CODEX_REQUIRED_JOB': 'codex-cloud-review',
                    'GITHUB_EVENT_NAME': 'pull_request_target', 'GITHUB_EVENT_PATH': event.name,
                    'GITHUB_TOKEN': 'unused', 'GITHUB_REPOSITORY': 'owner/repo',
-                   'GITHUB_WORKFLOW_REF': 'owner/repo/' + WORKFLOW + '@refs/heads/main'}
+                   'GITHUB_WORKFLOW_REF': 'owner/repo/' + WORKFLOW + '@refs/heads/main',
+                   'GITHUB_RUN_ID': '17'}
             with mock.patch.dict(os.environ, env), \
                     mock.patch.object(gate, 'GitHub', return_value=api), \
                     mock.patch.object(gate, 'rerun_required_job', side_effect=AssertionError('self rerun')):
@@ -195,11 +265,46 @@ class NativeRerunTests(unittest.TestCase):
             env = {'CODEX_REQUIRED_REVIEW': '', 'CODEX_REQUIRED_JOB': 'codex-cloud-review',
                    'GITHUB_EVENT_NAME': 'issue_comment', 'GITHUB_EVENT_PATH': event.name,
                    'GITHUB_TOKEN': 'unused', 'GITHUB_REPOSITORY': 'owner/repo',
-                   'GITHUB_WORKFLOW_REF': 'owner/repo/' + WORKFLOW + '@refs/heads/main'}
+                   'GITHUB_WORKFLOW_REF': 'owner/repo/' + WORKFLOW + '@refs/heads/main',
+                   'GITHUB_RUN_ID': '17'}
             with mock.patch.dict(os.environ, env), mock.patch.object(gate, 'GitHub', return_value=api):
                 gate.main()
         self.assertEqual(api.writes, [('actions/jobs/8/rerun', {}, 'POST')])
         self.assertEqual(api.check['status'], 'queued')
+
+    def test_comment_observer_uses_server_run_start_and_rejects_invalid_identity(self):
+        event_body = {'issue': {'number': 1, 'pull_request': {'url': 'unused'}},
+                      'comment': {'user': {'id': 199175422},
+                                  'performed_via_github_app': {'id': 1144995},
+                                  'body': 'Codex review running'}}
+        for run_id, started in (('17', server_time(100)), ('17', ''), ('17', 'bad'), ('0', server_time(100)),
+                                ('bad', server_time(100))):
+            with self.subTest(run_id=run_id, started=started):
+                api = NativeGitHub()
+                call = api.repo_call
+                def run_metadata(path, data=None, method=None):
+                    if path == 'actions/runs/17':
+                        return {'id': 17, 'run_started_at': started}
+                    return call(path, data, method)
+                api.repo_call = run_metadata
+                with tempfile.NamedTemporaryFile(mode='w') as event:
+                    json.dump(event_body, event)
+                    event.flush()
+                    env = {'CODEX_REQUIRED_REVIEW': '', 'CODEX_REQUIRED_JOB': 'codex-cloud-review',
+                           'GITHUB_EVENT_NAME': 'issue_comment', 'GITHUB_EVENT_PATH': event.name,
+                           'GITHUB_TOKEN': 'unused', 'GITHUB_REPOSITORY': 'owner/repo',
+                           'GITHUB_WORKFLOW_REF': 'owner/repo/' + WORKFLOW + '@refs/heads/main',
+                           'GITHUB_RUN_ID': run_id}
+                    with mock.patch.dict(os.environ, env), mock.patch.object(gate, 'GitHub', return_value=api), \
+                            mock.patch.object(gate, 'rerun_required_job', return_value=True) as rerun:
+                        if run_id == '17' and started == server_time(100):
+                            gate.main()
+                            rerun.assert_called_once_with(api, 1, 'codex-cloud-review', WORKFLOW,
+                                                          observed_after=BOUNDARY)
+                        else:
+                            with self.assertRaises(ValueError):
+                                gate.main()
+                            rerun.assert_not_called()
 
     def test_deleted_decision_floor_survives_native_rerun_and_blocks_older_reply(self):
         fixture = test_dispositions.DispositionTests()
