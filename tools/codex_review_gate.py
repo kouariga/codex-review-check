@@ -960,18 +960,21 @@ def persist_disposition_floors(api, number, head, base):
     if not floors:
         return
     state = {"version": 1, "head": head, "base": base, "disposition_floors": floors}
-    api.repo_call("check-runs", {"name": FEEDBACK_CHECK, "head_sha": head,
+    marker = api.repo_call("check-runs", {"name": FEEDBACK_CHECK, "head_sha": head,
                   "external_id": f"codex-feedback-v1:{api.repo}:{number}:{head}:{digest(base)}",
                   "status": "completed", "conclusion": "neutral",
                   "output": {"title": "Authorized feedback changed",
                              "summary": "Decision history retained for required review reruns.",
                              "text": json.dumps(state, sort_keys=True)}})
+    return timestamp(marker.get("completed_at"))
 
 
-def rerun_required_job(api, number, job_name, workflow_path, clock=time.time, sleep=time.sleep):
+def rerun_required_job(api, number, job_name, workflow_path, clock=time.time, sleep=time.sleep, *, observed_after=None):
     pr = api.repo_call(f"pulls/{number}")
     head, base = pr["head"]["sha"], base_identity(pr)
-    persist_disposition_floors(api, number, head, base)
+    marker_time = persist_disposition_floors(api, number, head, base)
+    if observed_after is not None and marker_time is not None:
+        observed_after = max(observed_after, marker_time)
     started = clock()
     while True:
         if pr["state"] != "open" or pr["draft"] or pr["head"]["sha"] != head or base_identity(pr) != base:
@@ -998,14 +1001,32 @@ def rerun_required_job(api, number, job_name, workflow_path, clock=time.time, sl
                                and all((row.get("base") or {}).get(key) == value for key, value in base.items())
                                for row in workflow.get("pull_requests", []))):
                 continue
+            try:
+                native_started = timestamp(job.get("started_at"))
+            except ValueError:
+                native_started = None
+            if observed_after is not None and native_started is not None and native_started > observed_after:
+                print("Current native review attempt covers this observer", flush=True)
+                return True
             if job.get("status") == "completed" and workflow.get("status") == "completed":
                 current = api.repo_call(f"pulls/{number}")
                 if (current["state"] != "open" or current["draft"]
                         or current["head"]["sha"] != head or base_identity(current) != base):
                     return False
-                api.repo_call(f"actions/jobs/{job_id}/rerun", {}, "POST")
-                print("Requested native required review rerun", flush=True)
-                return True
+                try:
+                    api.repo_call(f"actions/jobs/{job_id}/rerun", {}, "POST")
+                except APIBlocked as error:
+                    try:
+                        latest = api.repo_call(f"actions/runs/{run_id}")
+                    except Exception:
+                        raise error
+                    attempt, latest_attempt = workflow.get("run_attempt"), latest.get("run_attempt")
+                    if (latest.get("id") != run_id or type(attempt) is not int or attempt <= 0
+                            or type(latest_attempt) is not int or latest_attempt <= attempt):
+                        raise
+                else:
+                    print("Requested native required review rerun", flush=True)
+                    return True
             break
         if clock() - started >= RERUN_TIMEOUT:
             print("No completed current native required job available to rerun", flush=True)
@@ -1057,7 +1078,14 @@ def main():
         workflow_path, separator, ref = workflow_ref[len(prefix):].partition("@")
         if not separator or not ref or not re.fullmatch(r"\.github/workflows/[^/@]+\.ya?ml", workflow_path):
             raise ValueError("Invalid caller workflow identity")
-        if not rerun_required_job(api, number, required_job, workflow_path):
+        observer_run_id = os.environ.get("GITHUB_RUN_ID", "")
+        if not re.fullmatch(r"[1-9][0-9]*", observer_run_id):
+            raise ValueError("Missing trusted observer run identity")
+        observer_run = api.repo_call(f"actions/runs/{observer_run_id}")
+        if observer_run.get("id") != int(observer_run_id):
+            raise ValueError("Observer run identity mismatch")
+        observed_after = timestamp(observer_run.get("run_started_at"))
+        if not rerun_required_job(api, number, required_job, workflow_path, observed_after=observed_after):
             raise SystemExit(1)
         return
     run(api, number)
