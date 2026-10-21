@@ -7,7 +7,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from test_codex_review_gate import gate
+import test_dispositions
+from test_codex_review_gate import FakeGitHub, gate
 
 HEAD = 'a' * 40
 BASE = 'b' * 40
@@ -25,16 +26,17 @@ class NativeGitHub:
                       'details_url': 'https://github.com/owner/repo/actions/runs/7/job/8'}
         self.job = {'id': 8, 'run_id': 7, 'name': 'codex-cloud-review', 'status': 'completed',
                     'check_run_url': 'https://api.github.com/repos/owner/repo/check-runs/9'}
-        self.workflow = {'id': 7, 'event': 'pull_request_target', 'path': WORKFLOW,
+        self.workflow = {'id': 7, 'event': 'pull_request_target', 'path': WORKFLOW, 'status': 'completed',
                          'pull_requests': [{'number': 1, 'head': {'sha': HEAD},
-                                            'base': {'sha': BASE, 'ref': 'main'}}]}
+                                            'base': {'sha': BASE, 'ref': 'main', 'repo': {'id': 2}}}]}
+        self.evidence = None
         self.writes = []
         self.denied = False
         self.pr_reads = 0
         self.change_pr = None
 
     def pages(self, path, key):
-        return [copy.deepcopy(self.check)] if self.check else []
+        return copy.deepcopy([row for row in (self.check, self.evidence) if row])
 
     def repo_call(self, path, data=None, method=None):
         if path == 'pulls/1':
@@ -42,6 +44,14 @@ class NativeGitHub:
             if self.change_pr and self.pr_reads > 1:
                 self.pr.update(self.change_pr)
             return copy.deepcopy(self.pr)
+        if path == 'check-runs':
+            self.writes.append((path, copy.deepcopy(data), method))
+            self.evidence = dict(copy.deepcopy(data), id=20, app={'id': 15368}, conclusion=None)
+            return copy.deepcopy(self.evidence)
+        if path == 'check-runs/20':
+            self.writes.append((path, copy.deepcopy(data), method))
+            self.evidence.update(copy.deepcopy(data))
+            return copy.deepcopy(self.evidence)
         if path == 'actions/jobs/8':
             return copy.deepcopy(self.job)
         if path == 'actions/runs/7':
@@ -80,6 +90,15 @@ class NativeRerunTests(unittest.TestCase):
         self.assertIs(self.rerun(api, finish), True)
         self.assertEqual(api.writes, [('actions/jobs/8/rerun', {}, 'POST')])
         self.assertEqual(api.pr_reads, 3)
+
+    def test_completed_job_waits_until_its_parent_workflow_finishes(self):
+        api = NativeGitHub()
+        api.workflow['status'] = 'in_progress'
+        def finish():
+            api.workflow['status'] = 'completed'
+        self.assertIs(self.rerun(api, finish), True)
+        self.assertEqual(api.pr_reads, 3)
+        self.assertEqual(api.check['status'], 'queued')
 
     def test_bootstrap_waits_for_the_native_job(self):
         api = NativeGitHub()
@@ -144,6 +163,42 @@ class NativeRerunTests(unittest.TestCase):
                 gate.main()
         self.assertEqual(api.writes, [('actions/jobs/8/rerun', {}, 'POST')])
         self.assertEqual(api.check['status'], 'queued')
+
+    def test_deleted_decision_floor_survives_native_rerun_and_blocks_older_reply(self):
+        fixture = test_dispositions.DispositionTests()
+        fixture.setUp()
+        fixture.decisions()
+        snapshot = fixture.api.snapshot(1)
+        state, _, accepted = fixture.verdict(snapshot)
+        self.assertEqual(accepted[0], 'success')
+        for previous in (None, state):
+            api = NativeGitHub()
+            api.pr['base'] = snapshot['base']
+            api.workflow['pull_requests'][0]['base'] = snapshot['base']
+            api.disposition_floors = {'inline:11': 202}
+            if previous:
+                api.evidence = {'id': 20, 'name': 'codex-review-evidence', 'head_sha': HEAD,
+                                'app': {'id': 15368}, 'conclusion': 'success',
+                                'external_id': 'codex-gate-v1:owner/repo:1:' + HEAD,
+                                'output': {'text': json.dumps(previous)}}
+            self.assertIs(self.rerun(api), True)
+            saved = json.loads(api.evidence['output']['text'])
+            self.assertEqual(saved['disposition_floors']['inline:11'], 202)
+            self.assertNotIn('proof', saved)
+            self.assertEqual(api.writes[-1], ('actions/jobs/8/rerun', {}, 'POST'))
+            native = FakeGitHub([snapshot], api.evidence)
+            native.repo_call = self.native_calls(native, api.pr)
+            now = [180]
+            def sleep(seconds):
+                now[0] += seconds
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertIs(gate.run(native, 1, lambda: now[0], sleep, expected_head=HEAD), False)
+            self.assertEqual(native.check['conclusion'], 'failure')
+
+    @staticmethod
+    def native_calls(native, pr):
+        call = native.repo_call
+        return lambda path, data=None, method=None: copy.deepcopy(pr) if path == 'pulls/1' else call(path, data, method)
 
     def test_empty_successful_rerun_response_is_accepted_by_api(self):
         response = mock.MagicMock()

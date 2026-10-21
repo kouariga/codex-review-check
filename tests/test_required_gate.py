@@ -126,6 +126,27 @@ class RequiredGateTests(unittest.TestCase):
                 self.assertEqual([row['status'] for row in api.writes],
                                  ['in_progress', 'in_progress', 'completed'])
 
+    def test_completed_rereview_recovery_preserves_rejection_and_disposition_floors(self):
+        first = sample(thumbs=['first'], summary='first', completed=True)
+        state = gate.initialize(sample(), 0)
+        gate.observe(state, first, 0)
+        gate.observe(state, first, 30)
+        state['manual_since'] = 10
+        state['disposition_floors'] = {'finding': 99}
+        second = sample(thumbs=['second'], summary='second', completed=True)
+        unresolved = {'completed': True, 'unresolved': True, 'has_findings': False,
+                      'latest_completed_at': 50, 'summary_updated': 51}
+        for change in ({'eyes': True}, {'completed': False}, {'failed': True},
+                       {'unresolved_threads': True}, {'structured': unresolved}):
+            with self.subTest(change=change):
+                api = FakeGitHub([second | change], saved_check(conclusion='success', state=state))
+                self.assertIs(self.run_gate(api), False)
+                saved = json.loads(api.check['output']['text'])
+                self.assertEqual(saved['baseline'], ['old'])
+                self.assertEqual(saved['observed_since'], 0)
+                self.assertGreaterEqual(saved['manual_since'], 10)
+                self.assertEqual(saved['disposition_floors'], {'finding': 99})
+
     def test_new_evidence_history_takes_precedence_and_native_job_is_not_state(self):
         clean = sample(thumbs=['new'], summary='complete', completed=True)
         legacy = saved_check(name='codex-cloud-review', identifier=3)
