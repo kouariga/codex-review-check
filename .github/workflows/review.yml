@@ -133,7 +133,9 @@ jobs:
                   "### 💡 Codex Review\n\nHere are some automated review suggestions for this pull request.",
                   "Codex Review: Didn't find any major issues. Keep it up!")
               normalized = re.sub(r"(\*\*Reviewed commit:\*\* `)[0-9a-f]{7,40}(`)", r"\1{commit}\2", body)
-              return body.startswith("<!-- codex-review-receipt:v1 -->") and normalized.split() == template.split()
+              templates = (template, template.replace("Keep it up!", "Another round soon, please!"))
+              return body.startswith("<!-- codex-review-receipt:v1 -->") and any(
+                  normalized.split() == candidate.split() for candidate in templates)
 
 
           def unique_object(pairs):

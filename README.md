@@ -109,7 +109,9 @@ Manual evidence is parsed even when structured metadata is present.
 A completed Code Review may report both finding flags as null. The observer treats
 those flags as unknown and requires a fresh trusted `codex-review-receipt:v1`
 completion on the exact current head. Only the known clean receipt template is
-accepted, including its reviewed commit and boilerplate. Partial null flags,
+accepted, including its reviewed commit and boilerplate. Its closing sentence
+must be exactly `Keep it up!` or `Another round soon, please!`; other suffixes
+and additional text are rejected. Partial null flags,
 unknown completed Security Review flags, and additional receipt text block.
 The receipt follows the same start, restart, timestamp, and ambiguity checks as
 manual completion. It cannot supply clean approval without a fresh trusted
