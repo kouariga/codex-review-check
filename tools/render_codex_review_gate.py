@@ -8,35 +8,33 @@ HEADER = """# Generated from tools/codex_review_gate.py. Do not edit inline code
 name: Codex Review Check
 on:
   workflow_call:
-permissions:
-  contents: read
-  pull-requests: read
-  issues: read
-  checks: write
+    inputs:
+      required-job:
+        description: Native required job to rerun instead of publishing a legacy check
+        type: string
+        default: ''
 jobs:
   observe:
     if: >-
-      (github.event_name == 'pull_request_target' && !github.event.pull_request.draft) ||
+      (github.event_name == 'pull_request_target' && inputs.required-job == '' && !github.event.pull_request.draft) ||
       github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_review' && github.event.review.user.id == 199175422) ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
        ((github.event.comment.user.id == 199175422 &&
          github.event.comment.performed_via_github_app.id == 1144995) ||
         startsWith(github.event.comment.body, 'Codex review:') ||
         startsWith(github.event.changes.body.from, 'Codex review:'))) ||
-      (github.event_name == 'pull_request_review_comment' &&
-       ((github.event.comment.user.id == 199175422 &&
-         github.event.comment.performed_via_github_app.id == 1144995) ||
-        startsWith(github.event.comment.body, 'Codex review:') ||
-        startsWith(github.event.changes.body.from, 'Codex review:')))
+      github.event_name == 'pull_request_review_comment'
     concurrency:
-      group: codex-review-check-${{ github.event.pull_request.number || github.event.issue.number || fromJSON(github.event.inputs.pr || '0') }}
+      group: codex-review-check-${{ inputs.required-job != '' && github.run_id || (github.event.pull_request.number || github.event.issue.number || fromJSON(github.event.inputs.pr || '0')) }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: ${{ inputs.required-job != '' && 35 || 25 }}
     steps:
       - name: Observe metadata without executing PR code
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          CODEX_REQUIRED_JOB: ${{ inputs.required-job }}
         shell: bash
         run: |
           python3 - <<'CODEX_GATE_PY'

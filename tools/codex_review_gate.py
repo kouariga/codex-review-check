@@ -15,8 +15,11 @@ BOT_ID = 199175422
 CODEX_APP_ID = 1144995
 ACTIONS_APP_ID = 15368
 CHECK = "codex-cloud-review"
+EVIDENCE_CHECK = "codex-review-evidence"
+FEEDBACK_CHECK = "codex-review-feedback-event"
 INTERVAL = 30
 TIMEOUT = 1200
+RERUN_TIMEOUT = 1800
 MARKER = "<!-- codex-pull-request-review-summary -->"
 DECISION_PREFIX = "Codex review:"
 
@@ -323,6 +326,7 @@ def observe(state, snapshot, now):
              and (state["eyes"] or changed_summary))
     unknown_findings = bool(structured and structured.get("unknown_findings"))
     lifecycle_valid = (snapshot.get("review_completed", snapshot["completed"]) and not snapshot["eyes"] and not snapshot["failed"]
+                       and not snapshot.get("unresolved_threads", False)
                        and (not unknown_findings or receipt_proof is not None)
                        and (structured is None or (structured["completed"] and not structured["unresolved"]
                            and structured["latest_completed_at"] is not None
@@ -409,7 +413,8 @@ class GitHub:
             req.add_header("If-None-Match", cached[0])
         try:
             with urllib.request.urlopen(req, timeout=20) as response:
-                value = json.load(response)
+                body = response.read()
+                value = json.loads(body) if body else None
                 if req.get_method() == "GET" and response.headers.get("ETag"):
                     self.cache[path] = (response.headers["ETag"], value)
                 return copy.deepcopy(value)
@@ -609,7 +614,7 @@ class GitHub:
         reactions = [r for r in reactions if bot(r)]
         inline = self.pages(f"pulls/{number}/comments")
         reviews = self.pages(f"pulls/{number}/reviews")
-        if unknown_findings and any(bot(review) for review in reviews):
+        if any(bot(review) for review in reviews):
             updates = self.review_updates(number)
             for review in reviews:
                 if bot(review):
@@ -633,7 +638,7 @@ class GitHub:
                 continue
             associated = [c for c in codex_inline if c.get("pull_request_review_id") == review["id"]]
             try:
-                submitted = timestamp(review.get("submitted_at"))
+                submitted = max(timestamp(review.get("submitted_at")), timestamp(review.get("updated_at")))
             except ValueError:
                 submitted = None
             review_findings.append({"id": review["id"], "submitted": submitted,
@@ -733,7 +738,7 @@ class GitHub:
 
 def publish(api, check_id, state, status, reason):
     payload = {"status": "completed" if status in ("success", "failure", "stale") else "in_progress",
-               "output": {"title": reason, "summary": "Report-only rollout. Not a required check.",
+               "output": {"title": reason, "summary": "Persisted Codex review observation.",
                           "text": json.dumps(state, sort_keys=True)}}
     if (state.get("proof") or {}).get("kind") == "verified_dispositions":
         payload["output"]["summary"] += " Feedback handling is maintainer-attested. This is not clean Codex approval."
@@ -836,15 +841,40 @@ def legacy_observation_origin(checks, latest, state, head, base, external, now):
     return origin
 
 
-def run(api, number, clock=time.time, sleep=time.sleep):
+def run(api, number, clock=time.time, sleep=time.sleep, expected_head=None):
     pr = api.repo_call(f"pulls/{number}")
     if pr["state"] != "open" or pr["draft"]:
-        return
+        return False
     head = pr["head"]["sha"]
+    if expected_head is not None and head != expected_head:
+        return False
+    check_name = EVIDENCE_CHECK if expected_head is not None else CHECK
     base = base_identity(pr)
     external = f"codex-gate-v1:{api.repo}:{number}:{head}"
-    history = [c for c in api.pages(f"commits/{head}/check-runs?filter=all", "check_runs")
-               if c["name"] == CHECK and c["app"]["id"] == ACTIONS_APP_ID]
+    checks = api.pages(f"commits/{head}/check-runs?filter=all", "check_runs")
+    event_floors = {"disposition_floors": dict(getattr(api, "disposition_floors", {}))}
+    feedback_external = f"codex-feedback-v1:{api.repo}:{number}:{head}:{digest(base)}"
+    for check in checks:
+        if (check.get("name") != FEEDBACK_CHECK or check.get("head_sha") != head
+                or (check.get("app") or {}).get("id") != ACTIONS_APP_ID
+                or check.get("external_id") != feedback_external):
+            continue
+        saved = json.loads(check["output"]["text"])
+        if (not isinstance(saved, dict) or type(saved.get("version")) is not int or saved["version"] != 1
+                or saved.get("head") != head or saved.get("base") != base
+                or check.get("status") != "completed" or check.get("conclusion") != "neutral"
+                or not isinstance(saved.get("disposition_floors"), dict)
+                or any(not isinstance(key, str) or not re.fullmatch(r"(?:inline|issue|review):[1-9][0-9]*", key)
+                       or type(value) is not int or value <= 0
+                       for key, value in saved["disposition_floors"].items())):
+            raise ValueError("Invalid saved feedback event")
+        advance_floors(event_floors, saved["disposition_floors"])
+    floors = event_floors["disposition_floors"]
+    history = [c for c in checks
+               if c["name"] in (CHECK, check_name) and c["app"]["id"] == ACTIONS_APP_ID]
+    evidence_history = [c for c in history if c["name"] == check_name]
+    history = evidence_history if any(c.get("external_id") == external for c in evidence_history) else [
+        c for c in history if c["name"] == CHECK]
     owned = [c for c in history if c.get("external_id") == external]
     if sum(c["conclusion"] is None for c in owned) > 1:
         raise ValueError("Multiple active owned checks; refusing ambiguous state")
@@ -854,7 +884,7 @@ def run(api, number, clock=time.time, sleep=time.sleep):
         check = max(owned, key=lambda c: c["id"])
         state = json.loads(check["output"]["text"])
         original_proof = state.get("proof")
-        advance_floors(state, getattr(api, "disposition_floors", {}))
+        advance_floors(state, floors)
         if state["version"] != 1 or state["head"] != head:
             raise ValueError("Invalid saved observation")
         if (check["conclusion"] in (None, "failure") and "initialized" not in state
@@ -882,31 +912,35 @@ def run(api, number, clock=time.time, sleep=time.sleep):
             state = {"version": 1, "head": head, "base": base,
                      "started": now, "initialized": False}
         elif check["conclusion"] == "success":
-            renewed = dict(state, started=now, candidate_at=now - INTERVAL)
+            accepted_since = state.get("candidate_at")
+            renewed = copy.deepcopy(state)
+            renewed.update(started=now, candidate_at=now - INTERVAL)
             try:
                 snapshot = api.snapshot(number)
                 status, reason = observe(renewed, snapshot, now)
                 if status == "success" and original_proof == renewed.get("proof"):
-                    return
-                state = initialize(snapshot, now) | {
-                    key: renewed[key] for key in ("disposition_floors", "manual_since", "manual_active")
-                    if key in renewed}
-                state["head"], state["base"] = head, base
+                    return True
             except APIBlocked:
                 raise
             except Exception:
-                state = renewed
-                state.pop("proof", None)
-                state["candidate"] = state["candidate_at"] = None
-        if check["conclusion"] is None:
+                renewed = copy.deepcopy(state)
+                renewed.update(started=now, renewal={"proof": original_proof,
+                                                   "accepted_since": accepted_since})
+            state = renewed
+            if ("renewal" not in state and accepted_since is not None
+                    and (original_proof is None or original_proof != state.get("proof"))):
+                state["manual_since"] = max(state.get("manual_since", accepted_since), accepted_since)
+            state.pop("proof", None)
+            state["candidate"] = state["candidate_at"] = None
+        if check["conclusion"] is None and check["name"] == check_name:
             check_id = check["id"]
     else:
         state = {"version": 1, "head": head, "base": base, "started": now, "initialized": False}
-    advance_floors(state, getattr(api, "disposition_floors", {}))
+    advance_floors(state, floors)
     if check_id is None:
-        check = api.repo_call("check-runs", {"name": CHECK, "head_sha": head,
+        check = api.repo_call("check-runs", {"name": check_name, "head_sha": head,
                               "external_id": external, "status": "in_progress",
-                              "output": {"title": "Observing Codex review", "summary": "Report-only rollout",
+                              "output": {"title": "Observing Codex review", "summary": "Persisted Codex review observation",
                                          "text": json.dumps(state)}})
         check_id = check["id"]
     while True:
@@ -920,11 +954,20 @@ def run(api, number, clock=time.time, sleep=time.sleep):
                     state = initialize(snapshot, state["started"],
                                        observed_since=state.get("observed_since", state["started"])) | {
                                            "disposition_floors": state.get("disposition_floors", {})}
+                if "renewal" in state and clock() - state["started"] < TIMEOUT:
+                    prior = state["renewal"]
+                    comparison = copy.deepcopy(state)
+                    observe(comparison, snapshot, clock())
+                    if (prior.get("proof") is None or comparison.get("proof") != prior["proof"]):
+                        if prior["accepted_since"] is not None:
+                            state["manual_since"] = max(state.get("manual_since", prior["accepted_since"]),
+                                                        prior["accepted_since"])
+                    del state["renewal"]
                 status, reason = observe(state, snapshot, clock())
             publish(api, check_id, state, status, reason)
             print(status + ": " + reason, flush=True)
             if status != "pending":
-                return
+                return status == "success"
         except APIBlocked:
             raise
         except Exception as error:
@@ -936,13 +979,99 @@ def run(api, number, clock=time.time, sleep=time.sleep):
             publish(api, check_id, state, status, reason)
             print(reason, flush=True)
             if status == "failure":
-                return
+                return False
         sleep(INTERVAL)
 
 
+def persist_disposition_floors(api, number, head, base):
+    floors = getattr(api, "disposition_floors", {})
+    if not floors:
+        return
+    state = {"version": 1, "head": head, "base": base, "disposition_floors": floors}
+    marker = api.repo_call("check-runs", {"name": FEEDBACK_CHECK, "head_sha": head,
+                  "external_id": f"codex-feedback-v1:{api.repo}:{number}:{head}:{digest(base)}",
+                  "status": "completed", "conclusion": "neutral",
+                  "output": {"title": "Authorized feedback changed",
+                             "summary": "Decision history retained for required review reruns.",
+                             "text": json.dumps(state, sort_keys=True)}})
+    return timestamp(marker.get("completed_at"))
+
+
+def rerun_required_job(api, number, job_name, workflow_path, clock=time.time, sleep=time.sleep, *, observed_after=None):
+    pr = api.repo_call(f"pulls/{number}")
+    head, base = pr["head"]["sha"], base_identity(pr)
+    marker_time = persist_disposition_floors(api, number, head, base)
+    if observed_after is not None and marker_time is not None:
+        observed_after = max(observed_after, marker_time)
+    started = clock()
+    while True:
+        if pr["state"] != "open" or pr["draft"] or pr["head"]["sha"] != head or base_identity(pr) != base:
+            return False
+        checks = api.pages(f"commits/{head}/check-runs?filter=all", "check_runs")
+        for check in sorted(checks, key=lambda row: row["id"], reverse=True):
+            if (check.get("name") != job_name or check.get("head_sha") != head
+                    or (check.get("app") or {}).get("id") != ACTIONS_APP_ID):
+                continue
+            match = re.fullmatch(r"https://github\.com/" + re.escape(api.repo)
+                                 + r"/actions/runs/([1-9][0-9]*)/job/([1-9][0-9]*)",
+                                 check.get("details_url") or "")
+            if not match:
+                continue
+            run_id, job_id = map(int, match.groups())
+            job = api.repo_call(f"actions/jobs/{job_id}")
+            if (job.get("id") != job_id or job.get("run_id") != run_id or job.get("name") != job_name
+                    or job.get("check_run_url") != f"https://api.github.com/repos/{api.repo}/check-runs/{check['id']}"):
+                continue
+            workflow = api.repo_call(f"actions/runs/{run_id}")
+            if (workflow.get("id") != run_id or workflow.get("event") != "pull_request_target"
+                    or (workflow.get("path") or "").partition("@")[0] != workflow_path
+                    or not any(row.get("number") == number and (row.get("head") or {}).get("sha") == head
+                               and all((row.get("base") or {}).get(key) == value for key, value in base.items())
+                               for row in workflow.get("pull_requests", []))):
+                continue
+            try:
+                native_started = timestamp(job.get("started_at"))
+            except ValueError:
+                native_started = None
+            if observed_after is not None and native_started is not None and native_started > observed_after:
+                print("Current native review attempt covers this observer", flush=True)
+                return True
+            if job.get("status") == "completed" and workflow.get("status") == "completed":
+                current = api.repo_call(f"pulls/{number}")
+                if (current["state"] != "open" or current["draft"]
+                        or current["head"]["sha"] != head or base_identity(current) != base):
+                    return False
+                try:
+                    api.repo_call(f"actions/jobs/{job_id}/rerun", {}, "POST")
+                except APIBlocked as error:
+                    try:
+                        latest = api.repo_call(f"actions/runs/{run_id}")
+                    except Exception:
+                        raise error
+                    attempt, latest_attempt = workflow.get("run_attempt"), latest.get("run_attempt")
+                    if (latest.get("id") != run_id or type(attempt) is not int or attempt <= 0
+                            or type(latest_attempt) is not int or latest_attempt <= attempt):
+                        raise
+                else:
+                    print("Requested native required review rerun", flush=True)
+                    return True
+            break
+        if clock() - started >= RERUN_TIMEOUT:
+            print("No completed current native required job available to rerun", flush=True)
+            return False
+        sleep(INTERVAL)
+        pr = api.repo_call(f"pulls/{number}")
+
+
 def main():
-    if os.environ["GITHUB_EVENT_NAME"] not in ("pull_request_target", "issue_comment", "pull_request_review_comment", "workflow_dispatch"):
+    required = os.environ.get("CODEX_REQUIRED_REVIEW") == "true"
+    if required and os.environ["GITHUB_EVENT_NAME"] != "pull_request_target":
+        raise ValueError("Required review needs a trusted pull_request_target event")
+    if not required and os.environ["GITHUB_EVENT_NAME"] not in ("pull_request_target", "issue_comment", "pull_request_review_comment", "pull_request_review", "workflow_dispatch"):
         raise ValueError("Unsupported caller event")
+    required_job = os.environ.get("CODEX_REQUIRED_JOB", "")
+    if not required and required_job and os.environ["GITHUB_EVENT_NAME"] == "pull_request_target":
+        return
     api = GitHub(os.environ["GITHUB_TOKEN"], os.environ["GITHUB_REPOSITORY"])
     with open(os.environ["GITHUB_EVENT_PATH"]) as event_file:
         event = json.load(event_file)
@@ -951,6 +1080,8 @@ def main():
                  or event.get("inputs", {}).get("pr", 0))
     if number <= 0:
         raise ValueError("Missing PR number")
+    if os.environ["GITHUB_EVENT_NAME"] == "pull_request_review" and not bot(event.get("review", {})):
+        return
     if os.environ["GITHUB_EVENT_NAME"] in ("issue_comment", "pull_request_review_comment"):
         if os.environ["GITHUB_EVENT_NAME"] == "issue_comment" and not event["issue"].get("pull_request"):
             return
@@ -958,11 +1089,42 @@ def main():
         if not trusted(comment):
             previous = event.get("changes", {}).get("body", {}).get("from", "")
             bodies = [comment.get("body", ""), previous]
-            if (not any(body.startswith(DECISION_PREFIX) for body in bodies)
-                    or not api.privileged(event.get("sender")) or not api.privileged(comment.get("user"))):
+            if (any(body.startswith(DECISION_PREFIX) for body in bodies)
+                    and api.privileged(event.get("sender"))
+                    and (event.get("action") in ("edited", "deleted") or api.privileged(comment.get("user")))):
+                api.disposition_floors = {key: comment["id"] for body in bodies
+                                          for key in decision_targets(body, comment.get("in_reply_to_id"))}
+            elif os.environ["GITHUB_EVENT_NAME"] != "pull_request_review_comment":
                 return
-            api.disposition_floors = {key: comment["id"] for body in bodies
-                                      for key in decision_targets(body, comment.get("in_reply_to_id"))}
+    if required:
+        pr = event["pull_request"]
+        source_repo = (pr["head"].get("repo") or {}).get("full_name")
+        if (source_repo != os.environ["GITHUB_REPOSITORY"]
+                or (pr.get("user") or {}).get("login") == "dependabot[bot]"):
+            raise ValueError("Required review does not support fork or Dependabot PRs")
+        expected_head = pr["head"]["sha"]
+        if not isinstance(expected_head, str) or not re.fullmatch(r"[0-9a-f]{40}", expected_head):
+            raise ValueError("Missing or malformed event head")
+        accepted = run(api, number, expected_head=expected_head)
+        raise SystemExit(0 if accepted is True else 1)
+    if required_job:
+        prefix = api.repo + "/"
+        workflow_ref = os.environ.get("GITHUB_WORKFLOW_REF", "")
+        if not workflow_ref.startswith(prefix):
+            raise ValueError("Missing trusted caller workflow identity")
+        workflow_path, separator, ref = workflow_ref[len(prefix):].partition("@")
+        if not separator or not ref or not re.fullmatch(r"\.github/workflows/[^/@]+\.ya?ml", workflow_path):
+            raise ValueError("Invalid caller workflow identity")
+        observer_run_id = os.environ.get("GITHUB_RUN_ID", "")
+        if not re.fullmatch(r"[1-9][0-9]*", observer_run_id):
+            raise ValueError("Missing trusted observer run identity")
+        observer_run = api.repo_call(f"actions/runs/{observer_run_id}")
+        if observer_run.get("id") != int(observer_run_id):
+            raise ValueError("Observer run identity mismatch")
+        observed_after = timestamp(observer_run.get("run_started_at"))
+        if not rerun_required_job(api, number, required_job, workflow_path, observed_after=observed_after):
+            raise SystemExit(1)
+        return
     run(api, number)
 
 

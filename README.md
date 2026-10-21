@@ -8,10 +8,11 @@ resolves discussions, or merges PRs. Initial deployment is report-only.
 
 After the first tested `v1` release is published, copy [examples/caller.yml](examples/caller.yml)
 to `.github/workflows/codex-cloud-review.yml` in each caller repository.
-Install on its default branch for comment/dispatch events and on any other
-trusted target branches used for `pull_request_target` events. Review permissions
-before enabling. A new adapter cannot observe its own installation PR before
-trusted target/default branches contain the caller.
+Install on its default branch for `issue_comment`, `workflow_dispatch`, and
+`pull_request_target`. `pull_request_review` and inline
+`pull_request_review_comment` events use the PR merge-ref workflow, which must
+also contain the subscriptions. Review permissions
+before enabling. An unmerged installation PR cannot replace the default caller.
 
 The caller uses this public reusable workflow with its own repository-scoped
 `GITHUB_TOKEN`. It grants `contents`, `issues`, and `pull-requests` read and
@@ -31,6 +32,97 @@ Compatible releases update the moving `v1` reference centrally. Callers need no
 update PRs for those releases. Event subscriptions, permissions, or breaking
 interface changes may still require caller changes. A full commit SHA can be
 used instead when per-repository adoption control is preferred.
+
+## Required native Actions job
+
+Required mode supports same-repository PRs except Dependabot PRs. It rejects fork,
+Dependabot, and missing-source-repository payloads before evaluating acceptance.
+Their review-event tokens cannot invalidate a successful native job. A trusted
+writable relay is required before this mode can support those PRs.
+
+Use a dedicated review workflow with no jobs depending on the native gate through
+`needs`. GitHub reruns the selected job and its dependent jobs, so downstream
+build, publish, or deployment jobs must stay in separate workflows.
+
+Use strict up-to-date branch protection with required mode. Base-branch pushes
+do not start this observer, so loose required checks cannot detect an unobserved
+base update.
+
+Merge queues are unsupported. Do not configure this gate as a required merge-queue
+check. Reviews bind to a PR head and base, and do not attest the synthetic
+`merge_group` commit. Queue support needs a separate review contract.
+
+For enforcement, define a native job named `codex-cloud-review` in a trusted
+`pull_request_target` caller. Its step uses `kouariga/codex-review-check@<reviewed-commit-sha>`
+as a composite action, with the same repository permissions shown above. Do not
+check out or execute PR code. Required mode rejects `pull_request` because that
+event lets the PR replace its own workflow definition.
+
+The action binds the event head to the live PR, polls the existing acceptance
+rules, and exits zero only for explicit acceptance. Unfinished reviews,
+unresolved threads, stale identity, API errors, and timeouts do not succeed.
+It persists retry state in `codex-review-evidence`, including migration from
+owned legacy observations. The native job supplies the required check result.
+To re-evaluate this native job after comment events, pass `required-job:
+codex-cloud-review` to the reusable workflow. Grant `actions: write` to that
+observer job, alongside `checks: write` and the existing read permissions. The reusable workflow
+inherits its caller's permissions. Without this input, it retains legacy
+report-only behavior and needs `checks: write` instead.
+Native callers must also subscribe to `pull_request_review` with `submitted`,
+`edited`, and `dismissed` so review-body changes trigger re-evaluation. Reviews
+use the same immutable Codex author ID as the snapshot evaluator.
+
+Thread resolution changes do not trigger Actions. After resolving threads,
+manually dispatch the caller workflow to re-evaluate the native job. Reopening
+a resolved thread after a successful check does not automatically invalidate
+that result. Automatic handling of this case is outside the supported contract;
+do not treat a completed check as a continuous guarantee of thread state.
+Retargeting a PR while an older `pull_request_target` run is queued is also
+unsupported. That run is not bound to the event's original base. Cancel stale
+runs and start a new run for the current target before relying on its result.
+
+For each authenticated Codex update or authorized disposition, the observer
+finds the latest native job for the current PR head and base. It verifies the
+job's check, original `pull_request_target` event, PR identity, and caller
+workflow path before requesting a job rerun. GitHub queues a new attempt in the
+original Actions suite to re-evaluate the required job. The native
+action then applies the existing acceptance rules to current review evidence.
+If the latest native attempt started after this observer's server timestamp and
+any saved feedback event, that attempt already covers the update. The observer
+uses it without another rerun. Equal-second timestamps require another attempt.
+After a competing rerun, the observer rechecks only when GitHub confirms the
+owning run's attempt number advanced. Other API denials remain failures.
+An active workflow is allowed to finish before the observer requests the job rerun. This
+covers a job that was about to succeed using evidence from before the update.
+Each opted-in observer has its own concurrency group so later updates cannot
+replace a pending feedback event. Before waiting for the native job, the observer
+appends authorized disposition edits and deletions to `codex-review-feedback-event`.
+The native evaluator reads these records for the current PR head and base and
+keeps the highest decision ID for each finding. An active native job cannot
+overwrite these records, and an older reply cannot become valid again when a
+newer decision disappears. The observer creates no legacy `codex-cloud-review`
+check in this mode.
+
+Pin both paths to tested commits when using per-repository adoption. The trusted
+default caller must be updated before its installation PR can exercise this native
+job or the updated observer. Verify the
+actual merge box after adoption, including a review restart on the same commit.
+Invalidation waits for comment delivery, runner availability, and any active
+native job to finish. The observer waits up to 30 minutes for a completed native
+workflow and has a 35-minute job limit. This leaves time for the native job's
+20-minute observation window and 25-minute job limit.
+GitHub limits reruns to runs less than 30 days old and at most 50 attempts.
+An unavailable job, denied rerun, or exhausted limit fails the observer visibly;
+it cannot revoke an old result without a successful rerun request. A new PR
+commit creates a new native run when an existing run cannot be rerun.
+
+An ordinary required status check selects a check name and its GitHub App. It
+does not bind that check to a specific trusted workflow. The rerun observer
+verifies workflow provenance, but these changes do not configure a workflow-bound
+branch ruleset. A PR author whose workflows execute can create another Actions
+job with the same name, including a fork author allowed by workflow approval
+policy. An author with a writable Actions token can also forge auxiliary checks
+or saved state. Merge-box acceptance of those checks is unverified here.
 
 ## Evidence and limits
 
@@ -115,8 +207,7 @@ assertion, the optional suffix may be `Keep it up!`, `Another round soon, please
 or one positive thumbs-up token (`:+1:`, `:thumbsup:`, or `👍` with an optional
 variation selector and skin tone). Unknown prose, other reaction tokens, and
 additional text are rejected. This normalizes equivalent positive reactions; it
-does not accept arbitrary future closing sentences. Partial null flags,
-unknown completed Security Review flags, and additional receipt text block.
+does not accept arbitrary future closing sentences when the finding flags are unknown.
 The receipt follows the same start, restart, timestamp, and ambiguity checks as
 manual completion. It cannot supply clean approval without a fresh trusted
 thumbs-up. When any historical findings exist, every finding still needs a valid
@@ -130,7 +221,7 @@ a newer wrong-head receipt blocks fallback to an older current-head receipt.
 
 Finding comments require both creation and update timestamps. Substantive review
 chronology requires submission and update timestamps. GitHub REST reviews omit
-the update timestamp, so unknown-flags observations enrich Codex review rows from
+the update timestamp, so observations enrich Codex review rows from
 the paginated GraphQL reviews connection, joining by database ID. Missing,
 malformed, ambiguous, or unavailable chronology blocks acceptance.
 
@@ -194,8 +285,8 @@ After replying and resolving the threads, explicitly dispatch the caller
 workflow for the PR. GitHub has no supported review-thread-resolution Actions
 trigger. The example caller subscribes to `pull_request_review_comment` and
 `issue_comment` creation, edit, and deletion, plus pushes via
-`pull_request_target`. Those subscriptions must be installed on the trusted
-branches before they can trigger. For a manual recheck, run:
+`pull_request_target`. Install the default-branch subscriptions and the PR merge-ref inline subscription
+before relying on them. For a manual recheck, run:
 
 ```sh
 gh workflow run codex-cloud-review.yml --repo owner/repo -f pr=123
@@ -209,9 +300,21 @@ against its inline findings. Unknown or additional review text needs a decision.
 For each finding, only the newest privileged recognized decision is eligible.
 Malformed or edited newest decisions block older ones. The observer persists
 per-finding reply ID boundaries, including across successful-check renewal.
-Authorized edit and deletion events preserve the previous target as well as the
-new target, so removing or retargeting a decision cannot restore an older reply.
-A newer valid reply recovers it. Outsider comments cannot advance these boundaries.
+Once an authorized edit or deletion event is saved, it preserves the previous
+target as well as the new target, so that event cannot restore an older reply.
+A current maintainer can invalidate an edited or deleted decision even if its
+author no longer has write access. Creation still requires a privileged author;
+acceptance always rechecks the decision author's current permission.
+A newer valid reply recovers it. Events initiated by users without write access cannot advance these boundaries.
+
+If an observer fails before saving a deletion, a manual dispatch cannot rebuild
+the missing payload. Rerun the original failed event with its retained payload,
+or post a new decision reply and verify it with a manual dispatch. Do not treat
+a resolved thread or a later green observer as proof that the deletion was saved.
+Fork and Dependabot review and inline-comment events normally receive read-only tokens, so
+they cannot persist these records or rerun the native job. Their inline event
+handling is unsupported without a trusted writable route. See [GitHub event
+permissions](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_review_comment).
 
 Decision authors must have account type `User`. The collaborator permission
 endpoint must currently grant write, maintain, or admin and return the same
@@ -277,9 +380,12 @@ This prevents an earlier completion comment from approving an observed same-head
 restart. Unobserved overlapping same-head reviews cannot be fully distinguished
 without an upstream lifecycle ID; multiple eligible comments fail closed.
 
-State lives in the latest owned check output. Code Review must be present;
-Security Review alone cannot approve the check. Per-PR job concurrency, after narrow event filtering, serializes
-observations. Ordinary comments do not enter that queue. Receipt creation, edits,
+Observation state lives in the latest owned evidence check output. Native mode
+also reads the append-only feedback records. Code Review must be present;
+Security Review alone cannot approve the check. In legacy report-only mode,
+per-PR job concurrency serializes observations after event filtering. Ordinary
+issue comments do not enter that queue. All inline comment events trigger
+revalidation because a new reply can invalidate a prior decision. Receipt creation, edits,
 and deletions qualify only when the event sender currently has repository write
 authority, checked before any check write. Marker removal uses the previous
 comment body supplied with an edit event. A restart resumes an incomplete run. A new authorized invocation creates a new
@@ -288,7 +394,9 @@ and clearing candidate confirmation. Completed runs remain history; only the
 latest owned run supplies resumable state, except for the bounded legacy origin
 recovery described above. Multiple active runs block as ambiguous.
 Failed or expired attempts get a renewed deadline. Each attempt is
-still bounded to 20 minutes and recovery requires two stable observations. GitHub may coalesce pending runs; the observer reads the latest live head.
+still bounded to 20 minutes and recovery requires two stable observations.
+GitHub may coalesce pending runs in legacy report-only mode. Opted-in native
+observers retain separate event runs and read the latest live head.
 Same-head review restarts invalidate previous success when running evidence is
 observed. A head or base change during evidence collection is rejected. The caller
 subscribes to `edited` to observe retargeting. Base-branch pushes alone may not

@@ -1,0 +1,11 @@
+name: Codex required review
+description: Require verified completed Codex review on the pull request head
+runs:
+  using: composite
+  steps:
+    - name: Verify current pull request review
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        CODEX_REQUIRED_REVIEW: 'true'
+      run: python3 "$GITHUB_ACTION_PATH/tools/codex_review_gate.py"

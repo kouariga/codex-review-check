@@ -52,7 +52,7 @@ class DispositionTests(unittest.TestCase):
         self.api.pages = self.pages
         self.api.review_threads = lambda number: copy.deepcopy(self.resolved)
         self.review_updated = {}
-        self.api.review_updates = lambda number: {r["id"]: self.review_updated.get(r["id"], r["submitted_at"]) for r in self.reviews}
+        self.api.review_updates = lambda number: {r["id"]: self.review_updated.get(r["id"], r.get("updated_at", r["submitted_at"])) for r in self.reviews}
         self.refresh_summary()
 
     def refresh_summary(self, status='Completed', completion=90):
@@ -427,6 +427,14 @@ class DispositionTests(unittest.TestCase):
                     evidence.clear()
                     evidence.update(original)
 
+    def test_known_flags_reject_disposition_after_review_edit(self):
+        self.decisions()
+        self.assertEqual(self.verdict(self.api.snapshot(1))[2][0], 'success')
+        self.review_updated[33] = iso(120)
+        snapshot = self.api.snapshot(1)
+        self.assertFalse(snapshot['dispositions']['review:33']['valid'])
+        self.assertEqual(self.verdict(snapshot)[2][0], 'pending')
+
     def test_unknown_flags_require_authoritative_review_update_chronology(self):
         self.metadata['code_review'].update(has_any_findings=None, has_unresolved_findings=None)
         self.refresh_summary()
@@ -474,6 +482,25 @@ class DispositionTests(unittest.TestCase):
         comment['body'] = previous
         self.assertTrue(self.event('pull_request_review_comment', comment, action='deleted'))
 
+    def test_current_maintainer_can_edit_or_delete_revoked_authors_decision(self):
+        comment = self.decision('inline:11')
+        comment['user'] = {'id': 99, 'login': 'former-maintainer', 'type': 'User'}
+        with mock.patch.object(self.api, 'privileged', side_effect=lambda user: user['id'] == 42):
+            for event_name in ('issue_comment', 'pull_request_review_comment'):
+                with self.subTest(event=event_name):
+                    self.assertEqual(self.event(event_name, comment, action='created'),
+                                     event_name == 'pull_request_review_comment')
+                    self.assertFalse(hasattr(self.api, 'disposition_floors'))
+                    for action in ('edited', 'deleted'):
+                        self.assertTrue(self.event(event_name, comment, action=action))
+                        self.assertEqual(self.api.disposition_floors, {'inline:11': 101})
+                    del self.api.disposition_floors
+            self.user = {'id': 98, 'login': 'outsider', 'type': 'User'}
+            for action in ('edited', 'deleted'):
+                self.assertFalse(self.event('issue_comment', comment, action=action))
+                self.assertTrue(self.event('pull_request_review_comment', comment, action=action))
+                self.assertFalse(hasattr(self.api, 'disposition_floors'))
+
     def test_top_level_target_edits_floor_both_old_and_new_targets(self):
         comment = self.decision('issue:21')
         previous = comment['body']
@@ -481,14 +508,17 @@ class DispositionTests(unittest.TestCase):
         self.assertTrue(self.event('issue_comment', comment, previous, 'edited'))
         self.assertEqual(self.api.disposition_floors, {'issue:21': 101, 'review:33': 101})
 
-    def test_ordinary_and_outsider_events_do_not_mutate_checks_or_floors(self):
+    def test_outsider_decisions_cannot_advance_floors(self):
         comment = self.decision('inline:11')
         self.permission = {'permission': 'read', 'user': {'id': 42}}
-        self.assertFalse(self.event('pull_request_review_comment', comment))
+        self.assertTrue(self.event('pull_request_review_comment', comment))
+        self.assertFalse(self.event('issue_comment', comment))
         self.assertFalse(hasattr(self.api, 'disposition_floors'))
         self.permission = {'permission': 'write', 'user': {'id': 42}}
         comment['body'] = 'Ordinary conversation'
-        self.assertFalse(self.event('pull_request_review_comment', comment))
+        self.assertFalse(self.event('issue_comment', comment))
+        self.assertTrue(self.event('pull_request_review_comment', comment))
+        self.assertFalse(hasattr(self.api, 'disposition_floors'))
 
     def test_deleted_reply_floor_survives_new_observer_and_saved_success_renewal(self):
         self.decisions()
