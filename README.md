@@ -32,6 +32,27 @@ update PRs for those releases. Event subscriptions, permissions, or breaking
 interface changes may still require caller changes. A full commit SHA can be
 used instead when per-repository adoption control is preferred.
 
+## Required native Actions job
+
+For enforcement, define a native job named `codex-cloud-review` in a trusted
+`pull_request_target` caller. Its step uses `kouariga/codex-review-check@<reviewed-commit-sha>`
+as a composite action, with the same repository permissions shown above. Do not
+check out or execute PR code. Required mode rejects `pull_request` because that
+event lets the PR replace its own workflow definition.
+
+The action binds the event head to the live PR, polls the existing acceptance
+rules, and exits zero only for explicit acceptance. Unfinished reviews,
+unresolved threads, stale identity, API errors, and timeouts do not succeed.
+It persists retry state in `codex-review-evidence`, including migration from
+owned legacy observations. The native job supplies the required check result.
+The reusable workflow remains report-only for comment and manual observers.
+
+Pin both paths to tested commits when using per-repository adoption. The trusted
+base caller must be updated before its installation PR can exercise this native
+job. Verify the actual merge box after adoption. A completed native success
+attests to evidence at job evaluation; a later same-head review restart does not
+automatically invalidate that job. Do not treat it as continuous approval.
+
 ## Evidence and limits
 
 Every 30 seconds, for at most 20 minutes, observe trusted Codex metadata:
