@@ -302,8 +302,9 @@ Malformed or edited newest decisions block older ones. The observer persists
 per-finding reply ID boundaries, including across successful-check renewal.
 Once an authorized edit or deletion event is saved, it preserves the previous
 target as well as the new target, so that event cannot restore an older reply.
-A current maintainer can invalidate a deleted decision even if its author no
-longer has write access. Creation and edit events still require a privileged author.
+A current maintainer can invalidate an edited or deleted decision even if its
+author no longer has write access. Creation still requires a privileged author;
+acceptance always rechecks the decision author's current permission.
 A newer valid reply recovers it. Outsider comments cannot advance these boundaries.
 
 If an observer fails before saving a deletion, a manual dispatch cannot rebuild
