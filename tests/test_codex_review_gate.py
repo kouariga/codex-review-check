@@ -634,6 +634,8 @@ class ManualFixtureTests(unittest.TestCase):
             return {"sha": head}
         api.repo_call = call
         api.review_threads = lambda number: {}
+        api.review_updates = lambda number: {r['id']: r.get('updated_at', r.get('submitted_at'))
+                                              for r in api.pages(f'pulls/{number}/reviews')}
         api.pages = lambda path: copy.deepcopy(
             fixture["reactions"] if path.endswith("reactions") else
             fixture["comments"] if path.startswith("issues/") else [])
@@ -1135,7 +1137,7 @@ class ExplicitCleanReactionTests(unittest.TestCase):
                 self.assertEqual(gate.observe(restarted, later, now + 90)[0], "pending")
                 self.assertEqual(gate.observe(restarted, later, now + 120)[0], "success")
 
-    def finding_snapshot(self, *, resolved=True, created="2026-10-18T03:55:00Z", submitted="2026-10-18T03:55:00Z", replies=()):
+    def finding_snapshot(self, *, resolved=True, created="2026-10-18T03:55:00Z", submitted="2026-10-18T03:55:00Z", replies=(), updated=None):
         fixture = self.fixture()
         api = ManualFixtureTests().api(fixture)
         original = api.pages
@@ -1144,7 +1146,7 @@ class ExplicitCleanReactionTests(unittest.TestCase):
                 "pull_request_review_id": 81, "created_at": created, "updated_at": created}
         review = {"id": 81, "user": {"id": gate.BOT_ID}, "commit_id": head,
                   "state": "COMMENTED", "body": gate.FINDING_REVIEW_WRAPPER.replace("{commit}", head),
-                  "submitted_at": submitted}
+                  "submitted_at": submitted, "updated_at": updated or submitted}
         api.pages = lambda path: ([root, *replies] if path == "pulls/1/comments" else
                                 [review] if path == "pulls/1/reviews" else original(path))
         api.review_threads = lambda number: {71: resolved}
@@ -1158,6 +1160,10 @@ class ExplicitCleanReactionTests(unittest.TestCase):
                         {"submitted": "2026-10-18T03:55:35Z"}):
             with self.subTest(changes=changes):
                 self.assertEqual(self.result(self.finding_snapshot(**changes))[0], "pending")
+
+    def test_review_edit_after_clean_completion_remains_blocking(self):
+        snapshot = self.finding_snapshot(updated="2026-10-18T03:55:50Z")
+        self.assertEqual(self.result(snapshot)[0], "pending")
 
     def test_later_security_completion_cannot_supersede_new_code_finding(self):
         snapshot = self.finding_snapshot(created="2026-10-18T03:55:35Z")
