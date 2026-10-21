@@ -1135,7 +1135,7 @@ class ExplicitCleanReactionTests(unittest.TestCase):
                 self.assertEqual(gate.observe(restarted, later, now + 90)[0], "pending")
                 self.assertEqual(gate.observe(restarted, later, now + 120)[0], "success")
 
-    def finding_snapshot(self, *, resolved=True, created="2026-10-18T03:55:00Z", submitted="2026-10-18T03:55:00Z"):
+    def finding_snapshot(self, *, resolved=True, created="2026-10-18T03:55:00Z", submitted="2026-10-18T03:55:00Z", replies=()):
         fixture = self.fixture()
         api = ManualFixtureTests().api(fixture)
         original = api.pages
@@ -1145,7 +1145,7 @@ class ExplicitCleanReactionTests(unittest.TestCase):
         review = {"id": 81, "user": {"id": gate.BOT_ID}, "commit_id": head,
                   "state": "COMMENTED", "body": gate.FINDING_REVIEW_WRAPPER.replace("{commit}", head),
                   "submitted_at": submitted}
-        api.pages = lambda path: ([root] if path == "pulls/1/comments" else
+        api.pages = lambda path: ([root, *replies] if path == "pulls/1/comments" else
                                 [review] if path == "pulls/1/reviews" else original(path))
         api.review_threads = lambda number: {71: resolved}
         return api.snapshot(1)
@@ -1179,12 +1179,10 @@ class ExplicitCleanReactionTests(unittest.TestCase):
         for actor, expected in ((gate.BOT_ID, "pending"), (123, "success")):
             for field in ("created_at", "updated_at"):
                 with self.subTest(actor=actor, field=field):
-                    snapshot = self.finding_snapshot()
-                    reply = {"user": {"id": actor}, "created_at": "2026-10-18T03:55:00Z",
+                    reply = {"id": 72, "in_reply_to_id": 71, "user": {"id": actor}, "created_at": "2026-10-18T03:55:00Z",
                              "updated_at": "2026-10-18T03:55:00Z", "body": "P1 Badge revised finding"}
                     reply[field] = "2026-10-18T03:55:50Z"
-                    snapshot["inventory"][0]["replies"] = [reply]
-                    snapshot["inventory_digest"] = gate.digest(snapshot["inventory"])
+                    snapshot = self.finding_snapshot(replies=[reply])
                     self.assertEqual(self.result(snapshot)[0], expected)
 
     def test_untrusted_or_missing_reaction_timestamp_cannot_approve(self):

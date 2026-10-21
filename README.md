@@ -144,6 +144,8 @@ When review completion timestamps are available, an automatic clean thumbs-up
 must postdate the current completion, structured summary update, original observer
 start, and any observed restart. A late API observation of an old reaction does
 not make that reaction fresh. Structured summaries require reaction timestamps.
+A recovered observation can reuse an existing thumbs-up only when it follows the
+saved start boundary, completion, and summary update.
 An observed running state, failure, or eyes reaction advances the restart boundary
 and invalidates earlier thumbs. A same-head re-review that starts and remains
 unobserved can leave an earlier success visible until an active signal or changed
