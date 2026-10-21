@@ -208,7 +208,7 @@ class RequiredGateTests(unittest.TestCase):
 class RequiredMainTests(unittest.TestCase):
     def test_required_cli_exits_zero_only_for_explicit_true(self):
         with tempfile.NamedTemporaryFile(mode='w') as event:
-            json.dump({'pull_request': {'number': 1, 'head': {'sha': HEAD}}}, event)
+            json.dump({'pull_request': {'number': 1, 'head': {'sha': HEAD, 'repo': {'full_name': 'owner/repo'}}}}, event)
             event.flush()
             env = {'CODEX_REQUIRED_REVIEW': 'true', 'GITHUB_EVENT_NAME': 'pull_request_target',
                    'GITHUB_EVENT_PATH': event.name, 'GITHUB_TOKEN': 'unused', 'GITHUB_REPOSITORY': 'owner/repo'}
@@ -219,6 +219,20 @@ class RequiredMainTests(unittest.TestCase):
                         gate.main()
                     self.assertEqual(result.exception.code, code)
                     self.assertEqual(run.call_args.kwargs, {'expected_head': HEAD})
+
+    def test_required_mode_rejects_fork_dependabot_and_missing_repository(self):
+        for repository, author in (("other/fork", "person"), ("owner/repo", "dependabot[bot]"), (None, "person")):
+            with self.subTest(repository=repository, author=author), tempfile.NamedTemporaryFile(mode='w') as event:
+                json.dump({'pull_request': {'number': 1, 'head': {'sha': HEAD, 'repo': {'full_name': repository}},
+                                           'user': {'login': author}}}, event)
+                event.flush()
+                env = {'CODEX_REQUIRED_REVIEW': 'true', 'GITHUB_EVENT_NAME': 'pull_request_target',
+                       'GITHUB_EVENT_PATH': event.name, 'GITHUB_TOKEN': 'unused', 'GITHUB_REPOSITORY': 'owner/repo'}
+                with mock.patch.dict(os.environ, env), mock.patch.object(gate, 'GitHub'), \
+                        mock.patch.object(gate, 'run', return_value=True) as run:
+                    with self.assertRaises(ValueError):
+                        gate.main()
+                    run.assert_not_called()
 
     def test_required_mode_rejects_pr_controlled_and_other_events(self):
         for event in ('pull_request', 'workflow_dispatch', 'issue_comment', 'pull_request_review'):

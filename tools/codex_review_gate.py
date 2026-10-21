@@ -1079,7 +1079,12 @@ def main():
             api.disposition_floors = {key: comment["id"] for body in bodies
                                       for key in decision_targets(body, comment.get("in_reply_to_id"))}
     if required:
-        expected_head = event["pull_request"]["head"]["sha"]
+        pr = event["pull_request"]
+        source_repo = (pr["head"].get("repo") or {}).get("full_name")
+        if (source_repo != os.environ["GITHUB_REPOSITORY"]
+                or (pr.get("user") or {}).get("login") == "dependabot[bot]"):
+            raise ValueError("Required review does not support fork or Dependabot PRs")
+        expected_head = pr["head"]["sha"]
         if not isinstance(expected_head, str) or not re.fullmatch(r"[0-9a-f]{40}", expected_head):
             raise ValueError("Missing or malformed event head")
         accepted = run(api, number, expected_head=expected_head)

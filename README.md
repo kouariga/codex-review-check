@@ -35,6 +35,15 @@ used instead when per-repository adoption control is preferred.
 
 ## Required native Actions job
 
+Required mode supports same-repository PRs except Dependabot PRs. It rejects fork,
+Dependabot, and missing-source-repository payloads before evaluating acceptance.
+Their review-event tokens cannot invalidate a successful native job. A trusted
+writable relay is required before this mode can support those PRs.
+
+Use a dedicated review workflow with no jobs depending on the native gate through
+`needs`. GitHub reruns the selected job and its dependent jobs, so downstream
+build, publish, or deployment jobs must stay in separate workflows.
+
 Merge queues are unsupported. Do not configure this gate as a required merge-queue
 check. Reviews bind to a PR head and base, and do not attest the synthetic
 `merge_group` commit. Queue support needs a separate review contract.
