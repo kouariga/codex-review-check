@@ -61,24 +61,25 @@ when outdated or attached to an older head. Missing thread mappings, partial API
 responses, and incomplete pagination cannot produce acceptance.
 
 Resolving threads alone is not approval. Earlier aggregate review messages,
-including changes-requested reviews, can be superseded only by a fresh trusted
-manual clean completion on the current head.
-The earlier review must have associated inline findings and all their threads
-must be resolved. Its submission must strictly precede the manual completion
-comment's creation. Unthreaded review findings
-or missing timestamps remain blockers. A new finding after clean completion blocks.
+including changes-requested reviews, can be superseded by fresh trusted clean
+approval on the current head. The earlier review must have associated inline
+findings and all their threads must be resolved. With explicit clean structured
+metadata, review submission and every Codex thread comment's creation and last edit
+must precede the earliest present review completion. Legacy manual evidence uses the completion comment's
+creation as its boundary. Unthreaded review findings or missing timestamps remain
+blockers. A new finding after clean completion blocks.
 Resolved old-head findings must predate the earliest review completion's
 whole-second timestamp. Same-second ordering is ambiguous. A later security
 review cannot approve a code finding that arrived after Code Review completed.
 Trusted priority-badge findings posted as plain issue comments have no reliable
 reviewed SHA and block conservatively, including after a new push, until a
 maintainer resolves that ambiguous evidence. The adapter does not delete comments.
-Manual Code Review is accepted when the trusted summary and a trusted
-`Codex Review: Didn't find any major issues.` comment each resolve to the exact
-current head. The comment must contain exactly one explicit reviewed commit.
-A reaction alone cannot approve a manual review. Unknown triggers block.
+Without structured metadata, Manual Code Review requires the trusted summary and
+a trusted `Codex Review: Didn't find any major issues.` comment to resolve to the
+exact current head. The comment must contain exactly one explicit reviewed commit.
+A reaction alone cannot approve a legacy manual review. Unknown triggers block.
 
-Manual acceptance requires a new completion-comment ID and a fresh trusted
+Legacy manual acceptance requires a new completion-comment ID and a fresh trusted
 thumbs-up. The completion comment must precede the summary completion time,
 which must strictly precede the reaction. Equal-second completion and reaction
 timestamps are ambiguous and cannot supply acceptance. All evidence must follow the observation's
@@ -89,22 +90,22 @@ are ambiguous. An invalid newest completion cannot fall back to an older one.
 The observer confirms the same comment digest, summary, and reaction IDs and
 timestamps twice, at least 30 seconds apart.
 
-Structured `codex-review-state:v1` metadata constrains lifecycle consistency. It
-never supplies approval. The marker must contain exactly `code_review` and
+Structured `codex-review-state:v1` metadata supplies review status and finding
+flags. It still requires a fresh trusted root thumbs-up for clean approval.
+The marker must contain exactly `code_review` and
 `security_review` objects with `commit_sha`, `has_any_findings`,
 `has_unresolved_findings`, and `status`. Code Review is required. An absent Security
 Review has all four fields null. Advertised reviews must match the current full
 head and human summary rows. Malformed, duplicate, contradictory, active, failed,
 or unresolved metadata cannot fall back to apparently clean reaction evidence.
-Automatic clean approval requires no reported current-head findings, even when
-those threads are resolved and structured metadata says there are no findings.
-Inline roots use their original commit identity before any reanchored commit.
-Resolved old-head roots can precede a clean current-head review, but roots created
-at or after completion, or without a known commit or creation time, block automatic
-approval. Standalone unthreaded findings remain blockers regardless of head.
-A later explicit manual clean review can supersede earlier associated resolved
-findings under the chronology above.
-Manual evidence is parsed even when structured metadata is present.
+When every present review is completed with explicit false finding flags, manual
+and automatic reviews use the same fresh-reaction path. Notification comments are
+not parsed, so closing prose such as `Bravo.` or an absent notification does not
+change acceptance. Resolved associated findings can be superseded under the
+chronology above, including on the same head. Inline roots use their original
+commit identity before any reanchored commit. Standalone and unassociated
+findings remain blockers. Running, failed, or explicitly unresolved metadata cannot
+use a notification to supply acceptance.
 
 A completed Code Review may report both finding flags as null. The observer treats
 those flags as unknown and requires a fresh trusted `codex-review-receipt:v1`
@@ -142,7 +143,16 @@ with no findings and no fresh reaction remains pending.
 When review completion timestamps are available, an automatic clean thumbs-up
 must postdate the current completion, structured summary update, original observer
 start, and any observed restart. A late API observation of an old reaction does
-not make that reaction fresh. Older summaries without timestamps retain the
+not make that reaction fresh. Structured summaries require reaction timestamps.
+A recovered observation can reuse an existing thumbs-up only when it follows the
+saved start boundary, completion, and summary update.
+An observed running state, failure, or eyes reaction advances the restart boundary
+and invalidates earlier thumbs. A same-head re-review that starts and remains
+unobserved can leave an earlier success visible until an active signal or changed
+summary is observed.
+Reactions do not identify a review generation or emit workflow events. If Codex
+keeps its old thumbs-up instead of replacing it, a new observation stays pending.
+Older summaries without timestamps retain the
 legacy reaction-ID and changed-summary checks. Reactions are read from the PR
 root description, not from inline feedback.
 

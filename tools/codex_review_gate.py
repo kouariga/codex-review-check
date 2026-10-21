@@ -237,9 +237,12 @@ def observe(state, snapshot, now):
     if now - state["started"] >= TIMEOUT:
         return "failure", "Timed out without unambiguous current-head acceptance"
     state["eyes"] = state["eyes"] or snapshot["eyes"]
-    fresh = sorted(set(snapshot["thumbs"]) - set(state["baseline"]))
-    changed_summary = snapshot["summary"] != state["baseline_summary"]
     manual = snapshot.get("manual")
+    structured = snapshot.get("structured")
+    recovering = (state.get("manual_recovery") and manual is None and structured is not None
+                  and not structured["unknown_findings"])
+    fresh = sorted(set(snapshot["thumbs"]) - (set() if recovering else set(state["baseline"])))
+    changed_summary = recovering or snapshot["summary"] != state["baseline_summary"]
     receipt_proof = None
     manual_proof = None
     if not snapshot.get("review_completed", snapshot["completed"]) or snapshot["eyes"] or snapshot["failed"]:
@@ -280,11 +283,15 @@ def observe(state, snapshot, now):
                             manual["completed_at"], manual["summary_updated"]]
         fresh = eligible if manual_proof else []
         changed_summary = bool(manual_proof)
+    supersession_boundary = manual_proof[0]["created"] if manual_proof else (
+        math.floor(structured["completed_at"]) if structured and structured["completed"]
+        and not structured["unknown_findings"] and not structured["has_findings"]
+        and not structured["unresolved"] else None)
     findings = list(snapshot["findings"])
     for review in snapshot.get("review_findings", []):
-        if not (manual_proof and review["resolved_threads"]
+        if not (supersession_boundary is not None and review["resolved_threads"]
                 and review["submitted"] is not None
-                and review["submitted"] < manual_proof[0]["created"]):
+                and review["submitted"] < supersession_boundary):
             findings.append(review["id"])
     for item in snapshot.get("inventory", []):
         if "root" not in item:
@@ -293,14 +300,19 @@ def observe(state, snapshot, now):
         root = item["root"]
         try:
             created = timestamp(root.get("created_at"))
+            if not manual_proof and supersession_boundary is not None:
+                thread_evidence = [root] + [reply for reply in item.get("replies", []) if bot(reply)]
+                created = max(timestamp(comment.get(field)) for comment in thread_evidence
+                              for field in ("created_at", "updated_at"))
         except ValueError:
             created = None
         associated = next((r for r in snapshot.get("review_findings", [])
                            if r["id"] == root.get("pull_request_review_id")), None)
-        superseded = (manual_proof and item["resolved"] and associated
+        superseded = (supersession_boundary is not None and item["resolved"] and associated
                       and associated["resolved_threads"] and associated["submitted"] is not None
-                      and associated["submitted"] < manual_proof[0]["created"]
-                      and (created is None or created < manual_proof[0]["created"]))
+                      and associated["submitted"] < supersession_boundary
+                      and ((created is None and manual_proof) or
+                           (created is not None and created < supersession_boundary)))
         reviewed_head = root.get("original_commit_id") or root.get("commit_id")
         if not superseded and (not reviewed_head or reviewed_head == snapshot["head"]
                                or created is None or snapshot.get("completed_at") is None
@@ -309,7 +321,6 @@ def observe(state, snapshot, now):
     clean = (snapshot["completed"] and not findings
              and not snapshot["eyes"] and fresh
              and (state["eyes"] or changed_summary))
-    structured = snapshot.get("structured")
     unknown_findings = bool(structured and structured.get("unknown_findings"))
     lifecycle_valid = (snapshot.get("review_completed", snapshot["completed"]) and not snapshot["eyes"] and not snapshot["failed"]
                        and (not unknown_findings or receipt_proof is not None)
@@ -321,6 +332,8 @@ def observe(state, snapshot, now):
         clean = clean and (bool(manual_proof) or not structured["has_findings"])
     if unknown_findings:
         clean = clean and bool(manual_proof) and not structured["has_findings"] and not snapshot.get("inventory")
+    if manual is None and structured is not None and "reaction_times" not in snapshot:
+        clean = False
     if manual is None and "reaction_times" in snapshot:
         boundary = max(state.get("observed_since", state["started"]),
                        state.get("manual_since", state.get("observed_since", state["started"])),
@@ -633,7 +646,7 @@ class GitHub:
                      and re.search(r"\bP[0-3] Badge\b", c["body"])]
         review_completed = bool(completed)
         manual_evidence = None
-        if manual or unknown_findings or (structured is not None and not structured["completed"]):
+        if unknown_findings or (structured is None and manual):
             completions = []
             for comment in comments:
                 if not trusted(comment):
