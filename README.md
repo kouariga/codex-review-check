@@ -305,7 +305,7 @@ target as well as the new target, so that event cannot restore an older reply.
 A current maintainer can invalidate an edited or deleted decision even if its
 author no longer has write access. Creation still requires a privileged author;
 acceptance always rechecks the decision author's current permission.
-A newer valid reply recovers it. Outsider comments cannot advance these boundaries.
+A newer valid reply recovers it. Events initiated by users without write access cannot advance these boundaries.
 
 If an observer fails before saving a deletion, a manual dispatch cannot rebuild
 the missing payload. Rerun the original failed event with its retained payload,
