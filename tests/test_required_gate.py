@@ -143,7 +143,7 @@ class RequiredMainTests(unittest.TestCase):
         with tempfile.NamedTemporaryFile(mode='w') as event:
             json.dump({'pull_request': {'number': 1, 'head': {'sha': HEAD}}}, event)
             event.flush()
-            env = {'CODEX_REQUIRED_REVIEW': 'true', 'GITHUB_EVENT_NAME': 'pull_request',
+            env = {'CODEX_REQUIRED_REVIEW': 'true', 'GITHUB_EVENT_NAME': 'pull_request_target',
                    'GITHUB_EVENT_PATH': event.name, 'GITHUB_TOKEN': 'unused', 'GITHUB_REPOSITORY': 'owner/repo'}
             for verdict, code in ((True, 0), (False, 1), (None, 1)):
                 with mock.patch.dict(os.environ, env), mock.patch.object(gate, 'GitHub'), \
@@ -153,10 +153,14 @@ class RequiredMainTests(unittest.TestCase):
                     self.assertEqual(result.exception.code, code)
                     self.assertEqual(run.call_args.kwargs, {'expected_head': HEAD})
 
-    def test_required_mode_rejects_other_events(self):
-        with mock.patch.dict(os.environ, {'CODEX_REQUIRED_REVIEW': 'true', 'GITHUB_EVENT_NAME': 'workflow_dispatch'}):
-            with self.assertRaises(ValueError):
-                gate.main()
+    def test_required_mode_rejects_pr_controlled_and_other_events(self):
+        for event in ('pull_request', 'workflow_dispatch', 'issue_comment'):
+            with self.subTest(event=event), mock.patch.dict(os.environ, {
+                    'CODEX_REQUIRED_REVIEW': 'true', 'GITHUB_EVENT_NAME': event}):
+                with mock.patch.object(gate, 'GitHub') as api:
+                    with self.assertRaises(ValueError):
+                        gate.main()
+                    api.assert_not_called()
 
     def test_legacy_cli_remains_report_only(self):
         with tempfile.NamedTemporaryFile(mode='w') as event:

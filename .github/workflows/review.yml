@@ -971,8 +971,8 @@ jobs:
 
           def main():
               required = os.environ.get("CODEX_REQUIRED_REVIEW") == "true"
-              if required and os.environ["GITHUB_EVENT_NAME"] != "pull_request":
-                  raise ValueError("Required review needs a pull_request event")
+              if required and os.environ["GITHUB_EVENT_NAME"] != "pull_request_target":
+                  raise ValueError("Required review needs a trusted pull_request_target event")
               if not required and os.environ["GITHUB_EVENT_NAME"] not in ("pull_request_target", "issue_comment", "pull_request_review_comment", "workflow_dispatch"):
                   raise ValueError("Unsupported caller event")
               api = GitHub(os.environ["GITHUB_TOKEN"], os.environ["GITHUB_REPOSITORY"])
