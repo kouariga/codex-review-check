@@ -1143,10 +1143,32 @@ class ExplicitCleanReactionTests(unittest.TestCase):
 
     def test_resolved_associated_same_head_findings_precede_clean_completion(self):
         self.assertEqual(self.result(self.finding_snapshot())[0], "success")
-        for changes in ({"resolved": False}, {"created": "2026-10-18T03:55:35Z"},
-                        {"created": None}, {"submitted": None}, {"submitted": "2026-10-18T03:55:35Z"}):
+        for changes in ({"resolved": False}, {"created": "2026-10-18T03:55:34Z"},
+                        {"created": "2026-10-18T03:55:35Z"}, {"created": None},
+                        {"submitted": None}, {"submitted": "2026-10-18T03:55:34Z"},
+                        {"submitted": "2026-10-18T03:55:35Z"}):
             with self.subTest(changes=changes):
                 self.assertEqual(self.result(self.finding_snapshot(**changes))[0], "pending")
+
+    def test_later_security_completion_cannot_supersede_new_code_finding(self):
+        snapshot = self.finding_snapshot(created="2026-10-18T03:55:35Z")
+        later = gate.timestamp("2026-10-18T03:55:36Z")
+        snapshot["structured"]["latest_completed_at"] = later
+        snapshot["structured"]["summary_updated"] = later
+        snapshot["completed_at"] = later
+        self.assertEqual(self.result(snapshot)[0], "pending")
+
+    def test_untrusted_or_missing_reaction_timestamp_cannot_approve(self):
+        for change in ("actor", "timestamp"):
+            with self.subTest(change=change):
+                fixture = self.fixture()
+                if change == "actor":
+                    fixture["reactions"][0]["user"]["id"] = 123
+                    self.assertEqual(self.result(self.snapshot(fixture))[0], "pending")
+                else:
+                    del fixture["reactions"][0]["created_at"]
+                    with self.assertRaises(ValueError):
+                        self.snapshot(fixture)
 
     def test_standalone_and_unassociated_findings_remain_blocking(self):
         snapshot = self.snapshot(self.fixture())

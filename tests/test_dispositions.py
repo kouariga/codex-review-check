@@ -360,8 +360,10 @@ class DispositionTests(unittest.TestCase):
         self.decisions()
         self.comments[0]['body'] = self.comments[0]['body'].replace('New commits', 'Manual request')
         snapshot = self.api.snapshot(1)
-        self.assertFalse(snapshot['completed'])
+        self.assertTrue(snapshot['completed'])
         self.assertTrue(snapshot['review_completed'])
+        self.assertTrue(snapshot['structured']['has_findings'])
+        self.assertEqual(self.verdict(snapshot | {'dispositions': {}})[2][0], 'pending')
         self.assertEqual(self.verdict(snapshot)[2][0], 'success')
 
     def test_unknown_completed_flags_need_fresh_receipt_and_every_disposition_without_reaction(self):
