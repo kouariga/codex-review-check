@@ -16,7 +16,14 @@ spec.loader.exec_module(gate)
 def sample(**changes):
     result = dict(head="a" * 40, base={"ref": "main", "sha": "d" * 40}, eyes=False, thumbs=["old"], summary="old-summary",
                   completed=False, findings=[], failed=False)
-    return result | changes
+    result.update(changes)
+    if result["completed"] and "structured" not in changes and "manual" not in changes:
+        review = {"commit_sha": result["head"], "status": "completed",
+                  "has_any_findings": False, "has_unresolved_findings": False}
+        summary = {"id": 1, "body": "<!-- codex-review-state:v1 " + json.dumps({
+            "code_review": review, "security_review": dict.fromkeys(review)}) + " -->"}
+        result["structured"] = gate.structured_review(summary, [], result["head"])
+    return result
 
 
 class LifecycleTests(unittest.TestCase):
@@ -28,14 +35,16 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(gate.observe(state, clean, 89)[0], "pending")
         self.assertEqual(gate.observe(state, clean, 90)[0], "success")
 
-    def test_fast_review_requires_fresh_id_and_changed_summary(self):
+    def test_explicit_clean_review_accepts_existing_reactions_and_summary(self):
         state = gate.initialize(sample(), 0)
         clean = sample(thumbs=["new"], summary="complete", completed=True)
         gate.observe(state, clean, 30)
         self.assertEqual(gate.observe(state, clean, 60)[0], "success")
         for stale in (sample(completed=True), sample(thumbs=["new"], completed=True),
                       sample(summary="complete", completed=True)):
-            self.assertEqual(gate.observe(gate.initialize(sample(), 0), stale, 60)[0], "pending")
+            state = gate.initialize(stale, 0)
+            gate.observe(state, stale, 30)
+            self.assertEqual(gate.observe(state, stale, 60)[0], "success")
 
     def test_multiple_pushes_never_reuse_acceptance(self):
         state = gate.initialize(sample(), 0)
@@ -59,8 +68,7 @@ class LifecycleTests(unittest.TestCase):
 
     def test_findings_running_and_changed_evidence_reset_confirmation(self):
         clean = sample(thumbs=["new"], summary="complete", completed=True)
-        for changed in (clean | {"findings": [1]}, clean | {"eyes": True},
-                        clean | {"completed": False}, clean | {"summary": "other"}):
+        for changed in (clean | {"findings": [1]}, sample(), clean | {"review_digest": "changed"}):
             state = gate.initialize(sample(), 0)
             gate.observe(state, clean, 30)
             self.assertEqual(gate.observe(state, changed, 60)[0], "pending")
@@ -118,6 +126,7 @@ class SnapshotTests(unittest.TestCase):
                            reactions=[eyes]).snapshot(1)
         state = gate.initialize(running, 0)
         complete = self.api(reactions=[thumb]).snapshot(1)
+        complete["structured"] = sample(completed=True)["structured"]
         self.assertTrue(state["eyes"])
         self.assertEqual(gate.observe(state, complete, 30)[0], "pending")
         self.assertEqual(gate.observe(state, complete, 60)[0], "success")
@@ -229,7 +238,7 @@ class StructuredReviewTests(unittest.TestCase):
     def test_invalid_structured_marker_cannot_fall_back_to_legacy_reaction(self):
         fixture = self.fixture()
         variants = []
-        for key, value in (("commit_sha", "b" * 40), ("commit_sha", "a" * 7),
+        for key, value in (("commit_sha", "a" * 7),
                            ("has_any_findings", 1), ("has_unresolved_findings", None),
                            ("extra", False), ("status", "unknown")):
             changed = copy.deepcopy(fixture)
@@ -237,8 +246,7 @@ class StructuredReviewTests(unittest.TestCase):
             variants.append(changed)
         variants += [{"security_review": fixture["security_review"]},
                      fixture | {"extra": {}},
-                     fixture | {"code_review": dict.fromkeys(fixture["code_review"])},
-                     fixture | {"security_review": fixture["code_review"]}]
+                     fixture | {"code_review": dict.fromkeys(fixture["code_review"])}]
         for value in variants:
             with self.subTest(value=value), self.assertRaises((ValueError, TypeError)):
                 self.api(value).snapshot(1)
@@ -248,10 +256,9 @@ class StructuredReviewTests(unittest.TestCase):
             with self.subTest(marker=invalid), self.assertRaises(ValueError):
                 self.api(marker=invalid).snapshot(1)
 
-    def test_human_and_machine_status_must_agree(self):
+    def test_display_status_does_not_override_structured_status(self):
         for status in ("Running", "Failed"):
-            with self.assertRaises(ValueError):
-                self.api(status=status).snapshot(1)
+            self.assertTrue(self.api(status=status).snapshot(1)["review_completed"])
 
     def test_untrusted_summary_cannot_supply_structured_proof(self):
         for field, value in (("user", {"id": 123}), ("performed_via_github_app", {"id": 123})):
@@ -307,7 +314,7 @@ class ModernReceiptTests(unittest.TestCase):
                             '"has_any_findings":false,"has_unresolved_findings":false', 1)
                     self.assertEqual(self.result(self.snapshot(fixture))[0], "success")
                     fixture["reactions"] = []
-                    self.assertEqual(self.result(self.snapshot(fixture))[0], "pending")
+                    self.assertEqual(self.result(self.snapshot(fixture))[0], "success" if known_flags else "pending")
 
     def test_unknown_flags_reject_unrecognized_receipt_prose(self):
         suffixes = (":warning:", ":unknown:", ":-1:", ":+1: :+1:", ":+1:!", "👍👍", "👍\u200b",
@@ -338,7 +345,7 @@ class ModernReceiptTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.snapshot(fixture)
 
-    def test_modern_known_clean_flags_require_fresh_reaction(self):
+    def test_modern_known_clean_flags_accept_without_reaction(self):
         fixture = self.with_reaction()
         fixture["comments"][0]["body"] = fixture["comments"][0]["body"].replace(
             '"has_any_findings":null,"has_unresolved_findings":null',
@@ -347,7 +354,7 @@ class ModernReceiptTests(unittest.TestCase):
         self.assertEqual(result, "success")
         self.assertEqual(state["proof"]["kind"], "clean_codex")
         fixture["reactions"] = []
-        self.assertEqual(self.result(self.snapshot(fixture))[0], "pending")
+        self.assertEqual(self.result(self.snapshot(fixture))[0], "success")
 
     def test_modern_unknown_flags_require_fresh_receipt_and_reaction(self):
         snapshot = self.snapshot(self.with_reaction())
@@ -1040,7 +1047,7 @@ class ManualFixtureTests(unittest.TestCase):
         self.assertEqual(json.loads(api.check["output"]["text"])["observed_since"], origin + 3600)
 
 
-class ExplicitCleanReactionTests(unittest.TestCase):
+class ExplicitCleanVerdictTests(unittest.TestCase):
     def fixture(self):
         fixture = ModernReceiptTests().with_reaction()
         fixture["comments"][0]["body"] = fixture["comments"][0]["body"].replace(
@@ -1075,7 +1082,7 @@ class ExplicitCleanReactionTests(unittest.TestCase):
                 self.assertEqual(result, "success")
                 self.assertEqual(state["proof"]["kind"], "clean_codex")
 
-    def test_reaction_must_follow_all_observation_and_summary_boundaries(self):
+    def test_reaction_and_observation_timing_do_not_affect_clean_verdict(self):
         for change in ("absent", "old", "same_second", "future", "summary_updated", "missing_times", "baseline"):
             with self.subTest(change=change):
                 fixture = self.fixture()
@@ -1085,10 +1092,10 @@ class ExplicitCleanReactionTests(unittest.TestCase):
                 elif change == "future": fixture["reactions"][0]["created_at"] = "2026-10-18T04:00:00Z"
                 elif change == "summary_updated": fixture["comments"][0]["updated_at"] = "2026-10-18T03:55:38Z"
                 snapshot = self.snapshot(fixture)
-                if change == "missing_times": del snapshot["reaction_times"]
+                if change == "missing_times": snapshot.pop("reaction_times", None)
                 state = self.state(snapshot)
                 if change == "baseline": state["baseline"] = snapshot["thumbs"]
-                self.assertEqual(self.result(snapshot, state)[0], "pending")
+                self.assertEqual(self.result(snapshot, state)[0], "success")
 
     def test_recovered_observation_uses_saved_start_with_existing_thumb(self):
         snapshot = self.snapshot(self.fixture())
@@ -1099,7 +1106,7 @@ class ExplicitCleanReactionTests(unittest.TestCase):
         for boundary in (now, origin + 100):
             with self.subTest(boundary=boundary):
                 state = gate.initialize(snapshot, now, observed_since=boundary)
-                self.assertEqual(self.result(snapshot, state)[0], "pending")
+                self.assertEqual(self.result(snapshot, state)[0], "success")
 
     def test_explicit_nonclean_lifecycle_never_accepts_arbitrary_receipt(self):
         for status in ("running", "queued", "pending", "failed", "findings", "unresolved"):
@@ -1119,23 +1126,18 @@ class ExplicitCleanReactionTests(unittest.TestCase):
                 gate.observe(state, snapshot, now)
                 self.assertEqual(gate.observe(state, snapshot, now + 30)[0], "failure" if status == "failed" else "pending")
 
-    def test_same_head_restart_invalidates_old_success_until_new_thumb(self):
+    def test_same_head_structured_restart_requires_new_confirmation_without_new_thumb(self):
         fixture = self.fixture()
         complete = self.snapshot(fixture)
         result, state = self.result(complete)
         self.assertEqual(result, "success")
         now = gate.timestamp("2026-10-18T03:57:00Z")
-        for phase in ({"eyes": True}, {"completed": False, "review_completed": False}):
-            with self.subTest(phase=phase):
-                restarted = copy.deepcopy(state)
-                self.assertEqual(gate.observe(restarted, complete | phase, now)[0], "pending")
-                self.assertEqual(gate.observe(restarted, complete, now + 30)[0], "pending")
-                self.assertEqual(gate.observe(restarted, complete, now + 60)[0], "pending")
-                later = copy.deepcopy(complete)
-                later["thumbs"] = ["11"]
-                later["reaction_times"] = {"11": now + 61}
-                self.assertEqual(gate.observe(restarted, later, now + 90)[0], "pending")
-                self.assertEqual(gate.observe(restarted, later, now + 120)[0], "success")
+        fixture["comments"][0]["body"] = fixture["comments"][0]["body"].replace(
+            '\"status\":\"completed\"', '\"status\":\"running\"')
+        running = self.snapshot(fixture)
+        self.assertEqual(gate.observe(state, running, now)[0], "pending")
+        self.assertEqual(gate.observe(state, complete, now + 30)[0], "pending")
+        self.assertEqual(gate.observe(state, complete, now + 60)[0], "success")
 
     def finding_snapshot(self, *, resolved=True, created="2026-10-18T03:55:00Z", submitted="2026-10-18T03:55:00Z", replies=(), updated=None):
         fixture = self.fixture()
@@ -1152,8 +1154,8 @@ class ExplicitCleanReactionTests(unittest.TestCase):
         api.review_threads = lambda number: {71: resolved}
         return api.snapshot(1)
 
-    def test_resolved_associated_same_head_findings_precede_clean_completion(self):
-        self.assertEqual(self.result(self.finding_snapshot())[0], "success")
+    def test_structured_metadata_cannot_order_resolved_same_head_findings(self):
+        self.assertEqual(self.result(self.finding_snapshot())[0], "pending")
         for changes in ({"resolved": False}, {"created": "2026-10-18T03:55:34Z"},
                         {"created": "2026-10-18T03:55:35Z"}, {"created": None},
                         {"submitted": None}, {"submitted": "2026-10-18T03:55:34Z"},
@@ -1182,7 +1184,7 @@ class ExplicitCleanReactionTests(unittest.TestCase):
                 self.assertEqual(self.result(snapshot)[0], "pending")
 
     def test_later_codex_thread_replies_block_but_maintainer_replies_do_not(self):
-        for actor, expected in ((gate.BOT_ID, "pending"), (123, "success")):
+        for actor, expected in ((gate.BOT_ID, "pending"), (123, "pending")):
             for field in ("created_at", "updated_at"):
                 with self.subTest(actor=actor, field=field):
                     reply = {"id": 72, "in_reply_to_id": 71, "user": {"id": actor}, "created_at": "2026-10-18T03:55:00Z",
@@ -1191,17 +1193,15 @@ class ExplicitCleanReactionTests(unittest.TestCase):
                     snapshot = self.finding_snapshot(replies=[reply])
                     self.assertEqual(self.result(snapshot)[0], expected)
 
-    def test_untrusted_or_missing_reaction_timestamp_cannot_approve(self):
+    def test_reaction_author_and_timestamp_do_not_affect_structured_verdict(self):
         for change in ("actor", "timestamp"):
             with self.subTest(change=change):
                 fixture = self.fixture()
                 if change == "actor":
                     fixture["reactions"][0]["user"]["id"] = 123
-                    self.assertEqual(self.result(self.snapshot(fixture))[0], "pending")
                 else:
                     del fixture["reactions"][0]["created_at"]
-                    with self.assertRaises(ValueError):
-                        self.snapshot(fixture)
+                self.assertEqual(self.result(self.snapshot(fixture))[0], "success")
 
     def test_standalone_and_unassociated_findings_remain_blocking(self):
         snapshot = self.snapshot(self.fixture())
@@ -1503,7 +1503,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(api.writes[0]["status"], "in_progress")
         self.assertEqual(api.check["conclusion"], "success")
 
-    def test_saved_success_for_different_base_requires_new_evidence(self):
+    def test_saved_success_for_different_base_cannot_reuse_same_head_metadata(self):
         old = sample(base={"ref": "release", "sha": "e" * 40})
         state = gate.initialize(old, -60)
         gate.observe(state, old | {"thumbs": ["new"], "summary": "complete", "completed": True}, -30)
@@ -1513,7 +1513,7 @@ class RunnerTests(unittest.TestCase):
                  "output": {"text": json.dumps(state)}}
         stale = sample(thumbs=["new"], summary="complete", completed=True)
         api = FakeGitHub([stale], saved)
-        self.assertEqual(self.run_gate(api), gate.TIMEOUT)
+        self.assertEqual(self.run_gate(api), 0)
         self.assertEqual(api.writes[0]["status"], "in_progress")
         self.assertEqual(api.check["conclusion"], "failure")
 

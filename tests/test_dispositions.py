@@ -118,7 +118,7 @@ class DispositionTests(unittest.TestCase):
 
     def test_old_thumb_cannot_approve_new_review_even_if_first_seen_late(self):
         clean = sample(thumbs=['new'], summary='complete', completed=True,
-                       reaction_times={'new': 20}, completed_at=50)
+                       reaction_times={'new': 20}, completed_at=50, structured=None)
         state = gate.initialize(sample(), 0)
         self.assertEqual(gate.observe(state, clean, 60)[0], 'pending')
         self.assertEqual(gate.observe(state, clean, 90)[0], 'pending')
@@ -142,12 +142,12 @@ class DispositionTests(unittest.TestCase):
         self.refresh_summary()
         self.assertEqual(gate.observe(state, self.api.snapshot(1), 180)[0], 'pending')
 
-    def test_no_findings_structured_metadata_without_thumb_stays_pending(self):
+    def test_no_findings_structured_metadata_without_thumb_succeeds(self):
         self.inline, self.reviews, self.resolved = [], [], {}
         self.comments = self.comments[:1]
         self.metadata['code_review']['has_any_findings'] = False
         self.refresh_summary()
-        self.assertEqual(self.verdict()[2][0], 'pending')
+        self.assertEqual(self.verdict()[2][0], 'success')
 
     def test_additional_body_finding_is_not_hidden_by_associated_inline_threads(self):
         self.reviews[0]['body'] += '\nAdditional unthreaded correctness finding.'

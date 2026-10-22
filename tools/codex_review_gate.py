@@ -3,6 +3,7 @@
 import copy
 import datetime
 import hashlib
+import html
 import json
 import math
 import os
@@ -159,65 +160,81 @@ def advance_floors(state, additions):
     for key, identifier in additions.items():
         floors[key] = max(floors.get(key, 0), identifier)
 
+class StructuredEvidenceError(ValueError):
+    """The supported structured verdict is unavailable or malformed."""
+
+
 def structured_review(summary, rows, head):
     body = summary.get("body", "")
     if "codex-review-state:" not in body:
         return None
-    markers = re.findall(r"<!-- codex-review-state:v1 (.*?) -->", body)
+    if type(summary.get("id")) is not int or summary["id"] <= 0:
+        raise ValueError("Missing structured summary identity")
+    markers = re.findall(r"<!-- codex-review-state:v1 (.*?) -->", body, re.DOTALL)
     if len(markers) != 1 or body.count("codex-review-state:") != 1:
-        raise ValueError("Ambiguous structured review marker")
-
-
+        raise ValueError("Ambiguous or unsupported structured review marker")
     value = json.loads(markers[0], object_pairs_hook=unique_object)
-    names = {"code_review": "**Code Review**", "security_review": "**Security Review**"}
-    if not isinstance(value, dict) or set(value) != set(names):
+    names = {"code_review", "security_review"}
+    if not isinstance(value, dict) or set(value) != names:
         raise ValueError("Unknown structured review fields")
     fields = {"commit_sha", "has_any_findings", "has_unresolved_findings", "status"}
-    statuses = {"completed": "Completed", "running": "Running", "queued": "Queued",
-                "pending": "Pending", "failed": "Failed"}
-    completions, reviews, active, failed, unresolved = [], {}, False, False, False
-    unknown_findings = False
-    for kind, label in names.items():
+    statuses = {"completed", "running", "queued", "pending", "failed"}
+    labels = [re.sub(r"\[([^]]*)\](?:\([^)]*\)|\[[^]]*\])", r"\1",
+                     html.unescape(row.split("|")[1])) for row in rows]
+    labels = [re.sub(r"<[^>]*>|[*_`]", "", label).casefold() for label in labels]
+    security_advertised = any("security" in label for label in labels)
+    reviews = {}
+    for kind in sorted(names):
         review = value[kind]
-        matching = [row.split("|") for row in rows if label in row.split("|")[1]]
         if not isinstance(review, dict) or set(review) != fields:
             raise ValueError("Unknown structured review shape")
         if all(item is None for item in review.values()):
-            if kind == "code_review" or matching:
-                raise ValueError("Missing structured review")
+            if kind == "code_review" or security_advertised:
+                raise ValueError("Missing required structured review")
             continue
-        status = review["status"]
-        unknown = (kind == "code_review" and status == "completed"
+        unknown = (kind == "code_review" and review["status"] == "completed"
                    and review["has_any_findings"] is None and review["has_unresolved_findings"] is None)
-        unknown_findings = unknown_findings or unknown
-        findings_valid = all(type(review[field]) is bool or
-                             ((status != "completed" or unknown) and review[field] is None)
-                             for field in ("has_any_findings", "has_unresolved_findings"))
         if (not isinstance(review["commit_sha"], str)
                 or not re.fullmatch(r"[0-9a-f]{40}", review["commit_sha"])
-                or review["commit_sha"] != head or status not in statuses
-                or not findings_valid
-                or (review["has_unresolved_findings"] and not review["has_any_findings"])
-                or len(matching) != 1
-                or re.findall(r"\*\*([^*]+)\*\*", matching[0][2]) != [statuses[status]]):
-            raise ValueError("Contradictory structured review")
-        completed_at = None
-        if status == "completed":
-            times = re.findall(r'<relative-time datetime="([^"<>]+)">', matching[0][2])
-            if len(times) != 1:
-                raise ValueError("Missing structured completion timestamp")
-            completed_at = timestamp(times[0])
-            completions.append(completed_at)
-        reviews[kind] = {"status": status, "completed_at": completed_at, "digest": digest([review, matching[0][2:5]])}
-        active = active or status != "completed"
-        failed = failed or status == "failed"
-        unresolved = unresolved or review["has_unresolved_findings"] is True
-    return {"digest": digest(reviews), "reviews": reviews, "completed_at": min(completions) if completions else None,
-            "latest_completed_at": max(completions) if completions else None,
-            "summary_updated": timestamp(summary.get("updated_at")),
-            "completed": not active, "failed": failed, "unresolved": unresolved,
-            "unknown_findings": unknown_findings,
-            "has_findings": any(r["has_any_findings"] for r in value.values())}
+                or not isinstance(review["status"], str) or review["status"] not in statuses
+                or any(type(review[field]) is not bool and not (
+                    review[field] is None and (review["status"] != "completed" or unknown))
+                       for field in ("has_any_findings", "has_unresolved_findings"))
+                or (review["has_unresolved_findings"] is True and review["has_any_findings"] is False)):
+            raise ValueError("Contradictory or invalid structured review")
+        reviews[kind] = review
+    completed = all(review["status"] == "completed" for review in reviews.values())
+    unknown = any(review[field] is None for review in reviews.values()
+                  for field in ("has_any_findings", "has_unresolved_findings"))
+    has_findings = any(review["has_any_findings"] is True for review in reviews.values())
+    unresolved = any(review["has_unresolved_findings"] is True for review in reviews.values())
+    return {"comment_id": summary["id"], "reviews": reviews,
+            "digest": digest([summary["id"], reviews]),
+            "current_head": all(review["commit_sha"] == head for review in reviews.values()),
+            "completed": completed, "failed": any(review["status"] == "failed" for review in reviews.values()),
+            "unresolved": unresolved, "unknown_findings": unknown, "has_findings": has_findings,
+            "clean": completed and not unknown and not has_findings and not unresolved}
+
+
+def summary_rows(api, rows, head, structured=False):
+    completed = any("**Code Review**" in row.split("|")[1] for row in rows)
+    manual, completion_times = False, []
+    for row in rows:
+        cells = row.split("|")
+        if (len(cells) != 6 or not cells[1].strip().endswith(
+                ("**Code Review**", "**Security Review**"))):
+            raise ValueError("Unknown review summary format")
+        if cells[4].strip() not in ("PR opened", "New commits", "Draft marked ready", "Manual request"):
+            raise ValueError("Unknown review trigger")
+        manual = manual or cells[4].strip() == "Manual request"
+        times = re.findall(r'<relative-time datetime="([^"<>]+)">', cells[2])
+        completion_times.append(timestamp(times[0]) if len(times) == 1 else None)
+        match = re.fullmatch(r"\s*`([0-9a-f]{7,40})`\s*", cells[3])
+        if not match:
+            raise ValueError("Missing reviewed commit")
+        resolved = (head if head.startswith(match[1]) else None) if structured else api.repo_call("commits/" + match[1])["sha"]
+        completed = completed and resolved == head and "**Completed**" in cells[2]
+    return completed, manual, completion_times
 
 
 def initialize(snapshot, now, observed_since=None):
@@ -242,14 +259,16 @@ def observe(state, snapshot, now):
     state["eyes"] = state["eyes"] or snapshot["eyes"]
     manual = snapshot.get("manual")
     structured = snapshot.get("structured")
-    recovering = (state.get("manual_recovery") and manual is None and structured is not None
-                  and not structured["unknown_findings"])
-    fresh = sorted(set(snapshot["thumbs"]) - (set() if recovering else set(state["baseline"])))
-    changed_summary = recovering or snapshot["summary"] != state["baseline_summary"]
+    if structured is not None:
+        state["evidence"] = {"expected_sha": state["head"], "comment_id": structured["comment_id"],
+                             "reviews": structured["reviews"], "observed_at": now}
+    else:
+        state.pop("evidence", None)
+    fresh = sorted(set(snapshot["thumbs"]) - set(state["baseline"]))
     receipt_proof = None
     manual_proof = None
     if not snapshot.get("review_completed", snapshot["completed"]) or snapshot["eyes"] or snapshot["failed"]:
-        active = digest([(snapshot.get("structured") or {}).get("digest", snapshot["summary"]),
+        active = digest([snapshot.get("lifecycle_digest", (snapshot.get("structured") or {}).get("digest", snapshot["summary"])),
                          snapshot.get("review_completed", snapshot["completed"]),
                          snapshot["eyes"], snapshot["failed"]])
         if state.get("manual_active") != active:
@@ -285,11 +304,7 @@ def observe(state, snapshot, now):
             manual_proof = [comments[0], {r: manual["thumbs"][r] for r in eligible},
                             manual["completed_at"], manual["summary_updated"]]
         fresh = eligible if manual_proof else []
-        changed_summary = bool(manual_proof)
-    supersession_boundary = manual_proof[0]["created"] if manual_proof else (
-        math.floor(structured["completed_at"]) if structured and structured["completed"]
-        and not structured["unknown_findings"] and not structured["has_findings"]
-        and not structured["unresolved"] else None)
+    supersession_boundary = manual_proof[0]["created"] if manual_proof else None
     findings = list(snapshot["findings"])
     for review in snapshot.get("review_findings", []):
         if not (supersession_boundary is not None and review["resolved_threads"]
@@ -303,10 +318,6 @@ def observe(state, snapshot, now):
         root = item["root"]
         try:
             created = timestamp(root.get("created_at"))
-            if not manual_proof and supersession_boundary is not None:
-                thread_evidence = [root] + [reply for reply in item.get("replies", []) if bot(reply)]
-                created = max(timestamp(comment.get(field)) for comment in thread_evidence
-                              for field in ("created_at", "updated_at"))
         except ValueError:
             created = None
         associated = next((r for r in snapshot.get("review_findings", [])
@@ -317,38 +328,25 @@ def observe(state, snapshot, now):
                       and ((created is None and manual_proof) or
                            (created is not None and created < supersession_boundary)))
         reviewed_head = root.get("original_commit_id") or root.get("commit_id")
-        if not superseded and (not reviewed_head or reviewed_head == snapshot["head"]
+        if not superseded and (structured is not None or not reviewed_head or reviewed_head == snapshot["head"]
                                or created is None or snapshot.get("completed_at") is None
                                or created >= math.floor(snapshot.get("earliest_completed_at", snapshot["completed_at"]))):
             findings.append(item["key"])
-    clean = (snapshot["completed"] and not findings
-             and not snapshot["eyes"] and fresh
-             and (state["eyes"] or changed_summary))
-    unknown_findings = bool(structured and structured.get("unknown_findings"))
-    lifecycle_valid = (snapshot.get("review_completed", snapshot["completed"]) and not snapshot["eyes"] and not snapshot["failed"]
-                       and not snapshot.get("unresolved_threads", False)
+    unknown_findings = bool(structured and structured["unknown_findings"])
+    lifecycle_valid = (snapshot.get("review_completed", snapshot["completed"]) and not snapshot["eyes"]
+                       and not snapshot["failed"] and not snapshot.get("unresolved_threads", False)
                        and (not unknown_findings or receipt_proof is not None)
-                       and (structured is None or (structured["completed"] and not structured["unresolved"]
-                           and structured["latest_completed_at"] is not None
-                           and structured["latest_completed_at"] <= now
-                           and math.floor(structured["latest_completed_at"]) <= structured["summary_updated"] <= now)))
-    if structured is not None:
-        clean = clean and (bool(manual_proof) or not structured["has_findings"])
-    if unknown_findings:
-        clean = clean and bool(manual_proof) and not structured["has_findings"] and not snapshot.get("inventory")
-    if manual is None and structured is not None and "reaction_times" not in snapshot:
-        clean = False
-    if manual is None and "reaction_times" in snapshot:
-        boundary = max(state.get("observed_since", state["started"]),
-                       state.get("manual_since", state.get("observed_since", state["started"])),
-                       snapshot.get("completed_at") or now,
-                       (structured or {}).get("summary_updated", 0))
-        fresh = [identifier for identifier in fresh
-                 if boundary < snapshot["reaction_times"][identifier] <= now]
-        clean = clean and bool(fresh)
+                       and (structured is None or (structured["current_head"] and structured["completed"]
+                                                  and not structured["unresolved"])))
     proof = None
-    if lifecycle_valid and clean:
-        proof = {"kind": "clean_codex", "digest": digest([snapshot["summary"], fresh, manual_proof])}
+    if (structured and structured["current_head"] and structured["clean"] and not findings
+            and snapshot.get("review_completed", snapshot["completed"]) and not snapshot["failed"]
+            and not snapshot.get("unresolved_threads", False)):
+        proof = {"kind": "clean_codex", "digest": structured["digest"]}
+    elif (lifecycle_valid and manual_proof and not findings
+          and (structured is None or not structured["has_findings"])
+          and (not unknown_findings or not snapshot.get("inventory"))):
+        proof = {"kind": "clean_codex", "digest": digest(manual_proof)}
     dispositions = snapshot.get("dispositions", {})
     advance_floors(state, {key: value["id"] for key, value in dispositions.items()})
     keys = {item["key"] for item in snapshot.get("inventory", [])}
@@ -364,21 +362,28 @@ def observe(state, snapshot, now):
         if unknown_findings:
             proof["receipt"] = receipt_proof
             proof["digest"] = digest([replies, receipt_proof])
-    if proof is None or not lifecycle_valid:
+    if proof is None:
         state["candidate"] = state["candidate_at"] = None
-        reason = "Waiting for fresh trusted reaction and completed current-head review"
+        reason = "Review result unavailable; waiting for explicit current-head clean metadata"
+        if structured and not structured["current_head"]:
+            reason = "Waiting for structured review of the expected head"
+        elif structured and structured["has_findings"]:
+            reason = "Codex review found issues; waiting for verified feedback handling"
         if findings:
             reason = "Codex findings remain; waiting for resolution and a fresh clean review"
         if snapshot.get("review_completed", snapshot["completed"]) and snapshot.get("inventory") and not snapshot.get("unresolved_threads", False):
             reason = "Review completed; waiting for verified feedback handling or clean Codex approval"
         if dispositions and not verified:
             reason = "Every finding needs a valid current fixed or won’t-fix decision"
-        if not snapshot.get("review_completed", snapshot["completed"]) or snapshot["eyes"]:
+        if (structured and structured["current_head"] and not structured["completed"]) or (
+                structured is None and snapshot.get("legacy_active", False)):
             reason = "Codex review in progress; acceptance is pending"
         if snapshot["failed"]:
             return "failure", "Codex review failed; no automatic retry is requested"
         return "pending", reason
-    evidence = [snapshot["head"], snapshot["base"], snapshot["summary"], fresh]
+    evidence = [snapshot["head"], snapshot["base"]]
+    if not (structured and structured["clean"] and proof["kind"] == "clean_codex"):
+        evidence += [snapshot["summary"], fresh]
     candidate = digest(evidence + [proof, snapshot.get("review_digest"), snapshot.get("inventory_digest")])
     state["proof"] = proof
     if state["candidate"] != candidate:
@@ -585,31 +590,23 @@ class GitHub:
             raise ValueError("Multiple trusted summary comments; ambiguous evidence")
         summary = summaries[0] if summaries else {}
         body = summary.get("body", "")
-        rows = [line for line in body.splitlines()
-                if line.startswith("|") and not line.startswith("| Review |")
+        rows = [line.strip() for line in body.splitlines() if "|" in line]
+        rows = [line if line.startswith("|") else "|" + line for line in rows]
+        rows = [line for line in rows if not line.startswith("| Review |")
                 and not re.fullmatch(r"[| :\-]+", line)]
-        completed = any("**Code Review**" in row.split("|")[1] for row in rows)
-        manual = False
-        completion_times = []
-        for row in rows:
-            cells = row.split("|")
-            if (len(cells) != 6 or not cells[1].strip().endswith(
-                    ("**Code Review**", "**Security Review**"))):
-                raise ValueError("Unknown review summary format")
-            if cells[4].strip() not in ("PR opened", "New commits", "Draft marked ready", "Manual request"):
-                raise ValueError("Unknown review trigger")
-            manual = manual or cells[4].strip() == "Manual request"
-            times = re.findall(r'<relative-time datetime="([^"<>]+)">', cells[2])
-            completion_times.append(timestamp(times[0]) if len(times) == 1 else None)
-            match = re.fullmatch(r"\s*`([0-9a-f]{7,40})`\s*", cells[3])
-            if not match:
-                raise ValueError("Missing reviewed commit")
-            resolved = self.repo_call("commits/" + match[1])["sha"]
-            completed = completed and resolved == head and "**Completed**" in cells[2]
-        structured = structured_review(summary, rows, head)
+        try:
+            structured = structured_review(summary, rows, head)
+        except (ValueError, TypeError, KeyError):
+            raise StructuredEvidenceError("Malformed, unsupported, or conflicting structured metadata") from None
+        try:
+            display_completed, manual, completion_times = summary_rows(self, rows, head, structured is not None)
+        except (ValueError, KeyError, TypeError):
+            if structured is None:
+                raise
+            display_completed, manual, completion_times = False, False, []
         unknown_findings = bool(structured and structured["unknown_findings"])
-        if structured is not None:
-            completed = completed and structured["completed"]
+        completed = (structured["completed"] and structured["current_head"]
+                     if structured is not None else display_completed)
         reactions = self.pages(f"issues/{number}/reactions")
         reactions = [r for r in reactions if bot(r)]
         inline = self.pages(f"pulls/{number}/comments")
@@ -651,7 +648,7 @@ class GitHub:
                      and re.search(r"\bP[0-3] Badge\b", c["body"])]
         review_completed = bool(completed)
         manual_evidence = None
-        if unknown_findings or (structured is None and manual):
+        if (unknown_findings and completion_times) or (structured is None and manual):
             completions = []
             for comment in comments:
                 if not trusted(comment):
@@ -675,7 +672,7 @@ class GitHub:
                                         "current_head": current_head,
                                         "created": timestamp(comment.get("created_at")),
                                         "updated": timestamp(comment.get("updated_at"))})
-            if completed and any(value is None for value in completion_times):
+            if completed and (not completion_times or any(value is None for value in completion_times)):
                 raise ValueError("Missing manual completion timestamp")
             manual_evidence = {"comments": completions,
                                "completed_at": max(completion_times) if completed else 0,
@@ -714,8 +711,8 @@ class GitHub:
                  for row in evidence), default=float("-inf"))
         inventory.sort(key=lambda item: item["key"])
         inventory_digest = digest(inventory)
-        review_digest = digest([review_evidence(summary), [review_evidence(r) for r in
-                                sorted((r for r in reviews if bot(r)), key=lambda r: r["id"])]])
+        review_digest = digest([review_evidence(r) for r in
+                                sorted((r for r in reviews if bot(r)), key=lambda r: r["id"])])
         dispositions = self.finding_dispositions(comments, inline, head, base_identity(pr),
                                                   inventory, completion_times, summary.get("updated_at"), reviews)
         after = self.repo_call(f"pulls/{number}")
@@ -726,13 +723,14 @@ class GitHub:
                 "thumbs": sorted(str(r["id"]) for r in reactions if r["content"] == "+1"),
                 "summary": digest([summary.get("id"), body, summary.get("updated_at")]),
                 "completed": bool(completed), "review_completed": review_completed, "findings": findings, "review_findings": review_findings,
-                "failed": any("**Failed**" in row for row in rows), "manual": manual_evidence, "structured": structured,
+                "failed": (structured["failed"] and structured["current_head"] if structured is not None
+                           else any("**Failed**" in row for row in rows)), "manual": manual_evidence, "structured": structured,
+                "lifecycle_digest": digest([structured, [row.split("|")[2:5] for row in rows]]),
+                "legacy_active": bool(rows) and not display_completed,
                 "inventory": inventory, "inventory_digest": inventory_digest, "review_digest": review_digest,
                 "unresolved_threads": any(not threads[root] for root in root_ids),
                 "dispositions": dispositions,
-                **({"reaction_times": {str(r["id"]): timestamp(r.get("created_at"))
-                                       for r in reactions if r["content"] == "+1"},
-                    "completed_at": max(completion_times), "earliest_completed_at": min(completion_times)}
+                **({"completed_at": max(completion_times), "earliest_completed_at": min(completion_times)}
                    if completion_times and all(t is not None for t in completion_times) else {})}
 
 
@@ -909,8 +907,8 @@ def run(api, number, clock=time.time, sleep=time.sleep, expected_head=None):
             state["candidate"] = state["candidate_at"] = None
         # Preserve success only while its exact evidence still agrees.
         if state.get("base") != base:
-            state = {"version": 1, "head": head, "base": base,
-                     "started": now, "initialized": False}
+            state.pop("proof", None)
+            state["candidate"] = state["candidate_at"] = None
         elif check["conclusion"] == "success":
             accepted_since = state.get("candidate_at")
             renewed = copy.deepcopy(state)
@@ -919,7 +917,10 @@ def run(api, number, clock=time.time, sleep=time.sleep, expected_head=None):
                 snapshot = api.snapshot(number)
                 status, reason = observe(renewed, snapshot, now)
                 if status == "success" and original_proof == renewed.get("proof"):
-                    return True
+                    current = api.repo_call(f"pulls/{number}")
+                    if (current["head"]["sha"] == head and base_identity(current) == base
+                            and current["state"] == "open" and not current["draft"]):
+                        return True
             except APIBlocked:
                 raise
             except Exception:
@@ -943,9 +944,14 @@ def run(api, number, clock=time.time, sleep=time.sleep, expected_head=None):
                               "output": {"title": "Observing Codex review", "summary": "Persisted Codex review observation",
                                          "text": json.dumps(state)}})
         check_id = check["id"]
+    if state.get("base") != base:
+        publish(api, check_id, state, "stale",
+                "PR base changed at the same head; update the PR branch before acceptance")
+        return False
     while True:
         try:
             snapshot = api.snapshot(number)
+            state.pop("unavailable", None)
             if snapshot["head"] != head or snapshot["base"] != base:
                 state.pop("proof", None)
                 status, reason = "stale", "PR head or base changed; observation stopped"
@@ -964,6 +970,12 @@ def run(api, number, clock=time.time, sleep=time.sleep, expected_head=None):
                                                         prior["accepted_since"])
                     del state["renewal"]
                 status, reason = observe(state, snapshot, clock())
+            if status == "success":
+                current = api.repo_call(f"pulls/{number}")
+                if (current["head"]["sha"] != head or base_identity(current) != base
+                        or current["state"] != "open" or current["draft"]):
+                    state.pop("proof", None)
+                    status, reason = "stale", "PR changed before acceptance publication"
             publish(api, check_id, state, status, reason)
             print(status + ": " + reason, flush=True)
             if status != "pending":
@@ -974,7 +986,8 @@ def run(api, number, clock=time.time, sleep=time.sleep, expected_head=None):
             # Do not log response bodies, credentials, or untrusted PR content.
             state.pop("proof", None)
             state["candidate"] = state["candidate_at"] = None
-            reason = "Evidence unavailable: " + type(error).__name__
+            reason = "Evidence unavailable: " + (str(error) if isinstance(error, StructuredEvidenceError) else type(error).__name__)
+            state["unavailable"] = {"expected_sha": head, "observed_at": clock(), "reason": reason}
             status = "failure" if clock() - state["started"] >= TIMEOUT else "pending"
             publish(api, check_id, state, status, reason)
             print(reason, flush=True)

@@ -37,7 +37,7 @@ class RequiredGateTests(unittest.TestCase):
 
     def test_initial_incomplete_running_unknown_failed_and_unresolved_never_accept(self):
         clean = sample(thumbs=['new'], summary='complete', completed=True)
-        for snapshot in (sample(), clean | {'eyes': True}, clean | {'completed': False},
+        for snapshot in (sample(), clean | {'structured': None}, clean | {'completed': False},
                          clean | {'failed': True}, clean | {'unresolved_threads': True}):
             with self.subTest(snapshot=snapshot):
                 api = FakeGitHub([sample(), snapshot])
@@ -71,6 +71,40 @@ class RequiredGateTests(unittest.TestCase):
             self.assertIs(self.run_gate(api), False)
             self.assertEqual(api.check['conclusion'], 'failure')
 
+    def test_base_change_remains_blocked_across_retries_and_same_head_rereviews(self):
+        clean = sample(completed=True)
+        for prior_base in ({'ref': 'release', 'sha': 'd' * 40},
+                           {'ref': 'main', 'sha': 'e' * 40}):
+            for conclusion in (None, 'failure', 'success'):
+                with self.subTest(base=prior_base, conclusion=conclusion):
+                    state = gate.initialize(clean | {'base': prior_base}, 0)
+                    saved = saved_check(conclusion=conclusion, state=state)
+                    for _ in range(2):
+                        api = FakeGitHub([sample(eyes=True), clean], saved)
+                        self.assertIs(self.run_gate(api), False)
+                        self.assertEqual(api.check['conclusion'], 'failure')
+                        self.assertEqual(json.loads(api.check['output']['text'])['base'], prior_base)
+                        self.assertIn('base changed', api.check['output']['title'])
+                        self.assertNotIn('success', [row.get('conclusion') for row in api.writes])
+                        saved = api.check
+
+    def test_new_head_after_base_change_can_accept_its_own_structured_review(self):
+        old = gate.initialize(sample(base={'ref': 'release', 'sha': 'e' * 40}), 0)
+        clean = sample(head='b' * 40, completed=True)
+        api = FakeGitHub([clean], saved_check(conclusion='failure', state=old))
+        original = api.repo_call
+        def call(path, data=None, method=None):
+            result = original(path, data, method)
+            return result | {'head': {'sha': 'b' * 40}} if path.startswith('pulls/') else result
+        api.repo_call = call
+        now = [60]
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = gate.run(api, 1, lambda: now[0], lambda seconds: now.__setitem__(0, now[0] + seconds),
+                              expected_head='b' * 40)
+        self.assertIs(result, True)
+        self.assertEqual(api.check['head_sha'], 'b' * 40)
+        self.assertEqual(api.check['conclusion'], 'success')
+
     def test_api_errors_cannot_return_acceptance(self):
         api = FakeGitHub([OSError()])
         self.assertIs(self.run_gate(api), False)
@@ -83,7 +117,7 @@ class RequiredGateTests(unittest.TestCase):
         state = gate.initialize(sample(), 0)
         gate.observe(state, clean, 0)
         gate.observe(state, clean, 30)
-        for change, expected in (({}, True), ({'eyes': True}, False), ({'unresolved_threads': True}, False)):
+        for change, expected in (({}, True), ({'eyes': True}, True), ({'unresolved_threads': True}, False)):
             for name in (EVIDENCE, 'codex-cloud-review'):
                 api = FakeGitHub([clean | change], saved_check(name=name, conclusion='success', state=state))
                 self.assertIs(self.run_gate(api), expected)
@@ -104,6 +138,7 @@ class RequiredGateTests(unittest.TestCase):
                     result = sample(thumbs=[identifier], summary=identifier, completed=True,
                                     completed_at=completed_at)
                     if manual:
+                        result['structured'] = None
                         result['manual'] = {
                             'comments': [{'id': identifier, 'created': completed_at - 1,
                                           'updated': completed_at - 1, 'digest': identifier}],
@@ -122,9 +157,9 @@ class RequiredGateTests(unittest.TestCase):
                 saved = json.loads(api.check['output']['text'])
                 self.assertEqual(saved['baseline'], ['old'])
                 self.assertEqual(saved['observed_since'], 0)
-                self.assertEqual(saved['candidate_at'], 60)
+                self.assertEqual(saved['candidate_at'], 60 if manual else 20)
                 self.assertEqual([row['status'] for row in api.writes],
-                                 ['in_progress', 'in_progress', 'completed'])
+                                 ['in_progress', 'in_progress', 'completed'] if manual else [])
 
     def test_cached_acceptance_recovers_after_transient_snapshot_error(self):
         for manual in (False, True):
@@ -132,6 +167,7 @@ class RequiredGateTests(unittest.TestCase):
                 clean = sample(thumbs=['fresh'], summary='completed', completed=True,
                                completed_at=10, reaction_times={'fresh': 12})
                 if manual:
+                    clean['structured'] = None
                     clean['manual'] = {
                         'comments': [{'id': 'receipt', 'created': 9,
                                       'updated': 9, 'digest': 'receipt'}],
@@ -227,10 +263,8 @@ class RequiredGateTests(unittest.TestCase):
         state['manual_since'] = 10
         state['disposition_floors'] = {'finding': 99}
         second = sample(thumbs=['second'], summary='second', completed=True)
-        unresolved = {'completed': True, 'unresolved': True, 'has_findings': False,
-                      'unknown_findings': False, 'completed_at': 50,
-                      'latest_completed_at': 50, 'summary_updated': 51}
-        for change in ({'eyes': True}, {'completed': False}, {'failed': True},
+        unresolved = second['structured'] | {'clean': False, 'unresolved': True, 'has_findings': True}
+        for change in ({'structured': None}, {'completed': False}, {'failed': True},
                        {'unresolved_threads': True}, {'structured': unresolved}):
             with self.subTest(change=change):
                 api = FakeGitHub([second | change], saved_check(conclusion='success', state=state))
@@ -273,12 +307,13 @@ class RequiredGateTests(unittest.TestCase):
             self.run_gate(api)
         self.assertEqual(api.writes, [])
 
-    def test_native_only_history_cannot_supply_a_baseline(self):
+    def test_native_only_history_cannot_supply_state_but_explicit_clean_can_pass(self):
         clean = sample(thumbs=['new'], summary='complete', completed=True)
         native = saved_check(name='codex-cloud-review', conclusion='success')
         native['external_id'] = None
         api = FakeGitHub([clean], native)
-        self.assertIs(self.run_gate(api), False)
+        self.assertIs(self.run_gate(api), True)
+        self.assertEqual(len(api.writes), 3)
         self.assertEqual(api.writes[0]['name'], EVIDENCE)
 
 
