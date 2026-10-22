@@ -126,6 +126,12 @@ class StructuredVerdictTests(unittest.TestCase):
         snapshot = self.api(display='Security Review is optional and was not requested.').snapshot(1)
         self.assertEqual(self.result(snapshot)[0][0], 'success')
 
+    def test_advertised_security_scope_does_not_depend_on_markdown_formatting(self):
+        for label in ('🔒 Security Review', '*Security Review*', '**Security** **Review**',
+                      '<strong>Security</strong> Review', 'SECURITY   REVIEW'):
+            with self.subTest(label=label), self.assertRaises(gate.StructuredEvidenceError):
+                self.api(display=f'| {label} | Running | `aaaaaaa` | New commits |').snapshot(1)
+
     def test_unknown_flags_cannot_use_reaction_as_clean_verdict(self):
         for flags in ((None, None), (None, False), (False, None), (False, True)):
             metadata = self.metadata(has_any_findings=flags[0], has_unresolved_findings=flags[1])

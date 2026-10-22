@@ -212,13 +212,16 @@ jobs:
                   raise ValueError("Unknown structured review fields")
               fields = {"commit_sha", "has_any_findings", "has_unresolved_findings", "status"}
               statuses = {"completed", "running", "queued", "pending", "failed"}
+              labels = [re.sub(r"<[^>]*>|[*_`]", "", row.split("|")[1]) for row in rows]
+              security_advertised = any(re.search(r"\bsecurity\s+review\b", label, re.IGNORECASE)
+                                        for label in labels)
               reviews = {}
               for kind in sorted(names):
                   review = value[kind]
                   if not isinstance(review, dict) or set(review) != fields:
                       raise ValueError("Unknown structured review shape")
                   if all(item is None for item in review.values()):
-                      if kind == "code_review" or any("**Security Review**" in row.split("|")[1] for row in rows):
+                      if kind == "code_review" or security_advertised:
                           raise ValueError("Missing required structured review")
                       continue
                   unknown = (kind == "code_review" and review["status"] == "completed"
