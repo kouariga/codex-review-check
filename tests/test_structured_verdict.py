@@ -128,9 +128,24 @@ class StructuredVerdictTests(unittest.TestCase):
 
     def test_advertised_security_scope_does_not_depend_on_markdown_formatting(self):
         for label in ('🔒 Security Review', '*Security Review*', '**Security** **Review**',
-                      '<strong>Security</strong> Review', 'SECURITY   REVIEW'):
+                      '<strong>Security</strong> Review', 'SECURITY   REVIEW',
+                      'Security<br>Review', 'Security&nbsp;Review',
+                      '[Security](https://example.com/security) [Review](https://example.com/review)',
+                      'Secu**rity** Review', 'Secu<strong>rity</strong> Review'):
             with self.subTest(label=label), self.assertRaises(gate.StructuredEvidenceError):
                 self.api(display=f'| {label} | Running | `aaaaaaa` | New commits |').snapshot(1)
+
+    def test_advertised_security_scope_allows_table_delimiter_variants(self):
+        for display in (' | **Security Review** | Running | `aaaaaaa` | New commits |',
+                        'Security Review | Running | `aaaaaaa` | New commits',
+                        '\t| Security Review | Running | `aaaaaaa` | New commits |'):
+            with self.subTest(display=display), self.assertRaises(gate.StructuredEvidenceError):
+                self.api(display=display).snapshot(1)
+
+    def test_link_targets_do_not_advertise_security_scope(self):
+        for label in ('[Code Review](https://example.com/security)', '[Code Review][security-docs]'):
+            snapshot = self.api(display=f'| {label} | Completed | `aaaaaaa` | New commits |').snapshot(1)
+            self.assertEqual(self.result(snapshot)[0][0], 'success')
 
     def test_unknown_flags_cannot_use_reaction_as_clean_verdict(self):
         for flags in ((None, None), (None, False), (False, None), (False, True)):

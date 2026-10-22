@@ -37,6 +37,7 @@ jobs:
           import copy
           import datetime
           import hashlib
+          import html
           import json
           import math
           import os
@@ -212,9 +213,10 @@ jobs:
                   raise ValueError("Unknown structured review fields")
               fields = {"commit_sha", "has_any_findings", "has_unresolved_findings", "status"}
               statuses = {"completed", "running", "queued", "pending", "failed"}
-              labels = [re.sub(r"<[^>]*>|[*_`]", "", row.split("|")[1]) for row in rows]
-              security_advertised = any(re.search(r"\bsecurity\s+review\b", label, re.IGNORECASE)
-                                        for label in labels)
+              labels = [re.sub(r"\[([^]]*)\](?:\([^)]*\)|\[[^]]*\])", r"\1",
+                               html.unescape(row.split("|")[1])) for row in rows]
+              labels = [re.sub(r"<[^>]*>|[*_`]", "", label).casefold() for label in labels]
+              security_advertised = any("security" in label for label in labels)
               reviews = {}
               for kind in sorted(names):
                   review = value[kind]
@@ -622,8 +624,9 @@ jobs:
                       raise ValueError("Multiple trusted summary comments; ambiguous evidence")
                   summary = summaries[0] if summaries else {}
                   body = summary.get("body", "")
-                  rows = [line for line in body.splitlines()
-                          if line.startswith("|") and not line.startswith("| Review |")
+                  rows = [line.strip() for line in body.splitlines() if "|" in line]
+                  rows = [line if line.startswith("|") else "|" + line for line in rows]
+                  rows = [line for line in rows if not line.startswith("| Review |")
                           and not re.fullmatch(r"[| :\-]+", line)]
                   try:
                       structured = structured_review(summary, rows, head)

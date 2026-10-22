@@ -146,6 +146,10 @@ when all four of its fields are null and the summary does not advertise Security
 Review. A populated Security Review must also satisfy the clean rule, even when
 there is no display row. An all-null object never counts as a successful review.
 Missing or null finding flags do not mean false.
+Scope detection normalizes table indentation, optional leading pipes, HTML
+entities, tags, and Markdown labels. A table label that mentions security
+conservatively requires Security Review metadata. Ordinary prose and link targets
+do not advertise review scope.
 
 The adapter trusts Codex's reported reviewed SHA. This is observed, undocumented
 Codex output, not a verified stable public API contract. An unsupported version,
