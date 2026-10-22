@@ -228,7 +228,12 @@ When unknown structured flags coexist with findings, every finding needs a valid
 disposition and every inline thread must be resolved. This produces only
 `verified_dispositions` and does not require a reaction.
 
-Finding and disposition chronology still requires creation and update timestamps.
+Finding chronology still requires creation and update timestamps. Dispositions
+use their creation time for ordering and fresh GraphQL `lastEditedAt` and `editor`
+metadata to prove that their text was never edited. The GraphQL comment must match
+the REST comment identity, type, body, and creation time. Both edit fields must be
+explicitly null; missing or unavailable edit evidence blocks acceptance. A later
+REST `updated_at` alone does not mean the text was edited.
 Substantive reviews require submission and update timestamps. GitHub REST reviews
 omit update time, so observations enrich Codex reviews from the complete paginated
 GraphQL connection by database ID. A qualifying receipt strictly follows all

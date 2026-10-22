@@ -567,6 +567,34 @@ jobs:
                   return ((result.get("user") or {}).get("id") == user["id"]
                           and result.get("permission") in ("write", "maintain", "admin"))
 
+              def disposition_unedited(self, comment):
+                  identifier = comment.get("node_id")
+                  if not isinstance(identifier, str) or not identifier:
+                      return False
+                  query = """query($id:ID!) {
+                    node(id:$id) {
+                      __typename id
+                      ... on PullRequestReviewComment {
+                        databaseId body createdAt lastEditedAt editor { __typename }
+                      }
+                      ... on IssueComment {
+                        databaseId body createdAt lastEditedAt editor { __typename }
+                      }
+                    }
+                  }"""
+                  response = self.call("graphql", {"query": query, "variables": {"id": identifier}})
+                  if not isinstance(response, dict) or response.get("errors"):
+                      raise ValueError("GraphQL disposition edit evidence unavailable")
+                  node = response["data"]["node"]
+                  expected = "PullRequestReviewComment" if comment.get("in_reply_to_id") else "IssueComment"
+                  return (isinstance(node, dict) and node.get("__typename") == expected
+                          and node.get("id") == identifier
+                          and type(node.get("databaseId")) is int and node["databaseId"] == comment["id"]
+                          and node.get("body") == comment["body"]
+                          and node.get("createdAt") == comment["created_at"]
+                          and "lastEditedAt" in node and node["lastEditedAt"] is None
+                          and "editor" in node and node["editor"] is None)
+
               def finding_dispositions(self, comments, inline, head, base, inventory,
                                        completion_times, summary_updated, reviews):
                   candidates = {}
@@ -606,9 +634,9 @@ jobs:
                           decision["valid"] = (value["Head"] == head
                               and value["Base"] == base["ref"] + "@" + base["sha"]
                               and ("Finding" not in value if "root" in item else value.get("Finding") == key)
-                              and newest["created_at"] == newest["updated_at"]
                               and bool(completion_times) and all(t is not None for t in completion_times)
-                              and decision["created"] > max(changed + completion_times + [timestamp(summary_updated)]))
+                              and decision["created"] > max(changed + completion_times + [timestamp(summary_updated)])
+                              and self.disposition_unedited(newest))
                       except (KeyError, TypeError, ValueError):
                           pass
                   return result

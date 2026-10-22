@@ -289,6 +289,41 @@ class DispositionTests(unittest.TestCase):
                     self.edit_metadata = {decision['node_id']: {field: value}}
                     self.assertEqual(self.verdict()[2][0], 'pending')
 
+    def test_unavailable_edit_evidence_cannot_authorize_a_decision(self):
+        self.decisions()
+        for response in ({}, {'data': None}, {'data': {}}, {'data': {'node': None}},
+                         {'data': {'node': {}}}, [],
+                         {'errors': [{'message': 'unavailable'}], 'data': {'node': None}}):
+            with self.subTest(response=response), mock.patch.object(self.api, 'call', return_value=response):
+                self.assertEqual(self.verdict()[2][0], 'pending')
+
+    def test_missing_node_identity_cannot_authorize_a_decision(self):
+        decisions = self.decisions()
+        for decision in (decisions[0], next(row for row in decisions if 'Finding: issue:21' in row['body'])):
+            identifier = decision.pop('node_id')
+            try:
+                self.assertEqual(self.verdict()[2][0], 'pending')
+            finally:
+                decision['node_id'] = identifier
+
+    def test_edit_metadata_is_read_again_on_the_next_observation(self):
+        decision = self.decisions()[0]
+        initial = self.api.snapshot(1)
+        state = gate.initialize(initial, 120)
+        self.assertEqual(gate.observe(state, initial, 120)[0], 'pending')
+        self.edit_metadata[decision['node_id']] = {'lastEditedAt': iso(121)}
+        self.assertEqual(gate.observe(state, self.api.snapshot(1), 150)[0], 'pending')
+
+    def test_edit_metadata_rate_limit_stops_without_retry(self):
+        self.decisions()
+        for code in (403, 429):
+            error = urllib.error.HTTPError('https://api.github.com/graphql', code, 'blocked', {}, None)
+            with self.subTest(code=code), mock.patch.object(self.api, 'call', gate.GitHub.call.__get__(self.api)), \
+                    mock.patch.object(gate.urllib.request, 'urlopen', side_effect=error) as request:
+                with self.assertRaises(gate.APIBlocked):
+                    self.api.snapshot(1)
+                self.assertEqual(request.call_count, 1)
+
     def test_newest_edited_decision_does_not_restore_an_older_valid_reply(self):
         self.decisions()
         for key in ('inline:11', 'issue:21'):
@@ -307,8 +342,10 @@ class DispositionTests(unittest.TestCase):
         first = self.decisions()[0]
         for created, updated in [(90, 90), (100, 100), (110, 111), (160, 160)]:
             first['created_at'], first['updated_at'] = iso(created), iso(updated)
+            self.edit_metadata[first['node_id']] = {'lastEditedAt': iso(updated) if created != updated else None}
             self.assertEqual(self.verdict()[2][0], 'pending')
         first['created_at'] = first['updated_at'] = iso(110)
+        self.edit_metadata.clear()
         self.inline[0]['updated_at'] = iso(111)
         self.assertEqual(self.verdict()[2][0], 'pending')
         self.inline[0]['updated_at'] = iso(50)
