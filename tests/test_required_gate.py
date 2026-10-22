@@ -37,7 +37,7 @@ class RequiredGateTests(unittest.TestCase):
 
     def test_initial_incomplete_running_unknown_failed_and_unresolved_never_accept(self):
         clean = sample(thumbs=['new'], summary='complete', completed=True)
-        for snapshot in (sample(), clean | {'eyes': True}, clean | {'completed': False},
+        for snapshot in (sample(), clean | {'structured': None}, clean | {'completed': False},
                          clean | {'failed': True}, clean | {'unresolved_threads': True}):
             with self.subTest(snapshot=snapshot):
                 api = FakeGitHub([sample(), snapshot])
@@ -83,7 +83,7 @@ class RequiredGateTests(unittest.TestCase):
         state = gate.initialize(sample(), 0)
         gate.observe(state, clean, 0)
         gate.observe(state, clean, 30)
-        for change, expected in (({}, True), ({'eyes': True}, False), ({'unresolved_threads': True}, False)):
+        for change, expected in (({}, True), ({'eyes': True}, True), ({'unresolved_threads': True}, False)):
             for name in (EVIDENCE, 'codex-cloud-review'):
                 api = FakeGitHub([clean | change], saved_check(name=name, conclusion='success', state=state))
                 self.assertIs(self.run_gate(api), expected)
@@ -104,6 +104,7 @@ class RequiredGateTests(unittest.TestCase):
                     result = sample(thumbs=[identifier], summary=identifier, completed=True,
                                     completed_at=completed_at)
                     if manual:
+                        result['structured'] = None
                         result['manual'] = {
                             'comments': [{'id': identifier, 'created': completed_at - 1,
                                           'updated': completed_at - 1, 'digest': identifier}],
@@ -122,9 +123,9 @@ class RequiredGateTests(unittest.TestCase):
                 saved = json.loads(api.check['output']['text'])
                 self.assertEqual(saved['baseline'], ['old'])
                 self.assertEqual(saved['observed_since'], 0)
-                self.assertEqual(saved['candidate_at'], 60)
+                self.assertEqual(saved['candidate_at'], 60 if manual else 20)
                 self.assertEqual([row['status'] for row in api.writes],
-                                 ['in_progress', 'in_progress', 'completed'])
+                                 ['in_progress', 'in_progress', 'completed'] if manual else [])
 
     def test_cached_acceptance_recovers_after_transient_snapshot_error(self):
         for manual in (False, True):
@@ -132,6 +133,7 @@ class RequiredGateTests(unittest.TestCase):
                 clean = sample(thumbs=['fresh'], summary='completed', completed=True,
                                completed_at=10, reaction_times={'fresh': 12})
                 if manual:
+                    clean['structured'] = None
                     clean['manual'] = {
                         'comments': [{'id': 'receipt', 'created': 9,
                                       'updated': 9, 'digest': 'receipt'}],
@@ -227,10 +229,8 @@ class RequiredGateTests(unittest.TestCase):
         state['manual_since'] = 10
         state['disposition_floors'] = {'finding': 99}
         second = sample(thumbs=['second'], summary='second', completed=True)
-        unresolved = {'completed': True, 'unresolved': True, 'has_findings': False,
-                      'unknown_findings': False, 'completed_at': 50,
-                      'latest_completed_at': 50, 'summary_updated': 51}
-        for change in ({'eyes': True}, {'completed': False}, {'failed': True},
+        unresolved = second['structured'] | {'clean': False, 'unresolved': True, 'has_findings': True}
+        for change in ({'structured': None}, {'completed': False}, {'failed': True},
                        {'unresolved_threads': True}, {'structured': unresolved}):
             with self.subTest(change=change):
                 api = FakeGitHub([second | change], saved_check(conclusion='success', state=state))
@@ -273,12 +273,13 @@ class RequiredGateTests(unittest.TestCase):
             self.run_gate(api)
         self.assertEqual(api.writes, [])
 
-    def test_native_only_history_cannot_supply_a_baseline(self):
+    def test_native_only_history_cannot_supply_state_but_explicit_clean_can_pass(self):
         clean = sample(thumbs=['new'], summary='complete', completed=True)
         native = saved_check(name='codex-cloud-review', conclusion='success')
         native['external_id'] = None
         api = FakeGitHub([clean], native)
-        self.assertIs(self.run_gate(api), False)
+        self.assertIs(self.run_gate(api), True)
+        self.assertEqual(len(api.writes), 3)
         self.assertEqual(api.writes[0]['name'], EVIDENCE)
 
 
