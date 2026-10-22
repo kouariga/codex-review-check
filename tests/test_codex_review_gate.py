@@ -1503,7 +1503,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(api.writes[0]["status"], "in_progress")
         self.assertEqual(api.check["conclusion"], "success")
 
-    def test_saved_success_for_different_base_requires_new_evidence(self):
+    def test_saved_success_for_different_base_cannot_reuse_same_head_metadata(self):
         old = sample(base={"ref": "release", "sha": "e" * 40})
         state = gate.initialize(old, -60)
         gate.observe(state, old | {"thumbs": ["new"], "summary": "complete", "completed": True}, -30)
@@ -1513,9 +1513,9 @@ class RunnerTests(unittest.TestCase):
                  "output": {"text": json.dumps(state)}}
         stale = sample(thumbs=["new"], summary="complete", completed=True)
         api = FakeGitHub([stale], saved)
-        self.assertEqual(self.run_gate(api), 30)
+        self.assertEqual(self.run_gate(api), 0)
         self.assertEqual(api.writes[0]["status"], "in_progress")
-        self.assertEqual(api.check["conclusion"], "success")
+        self.assertEqual(api.check["conclusion"], "failure")
 
     def test_unchanged_pending_output_is_not_written_each_poll(self):
         api = FakeGitHub([sample()])

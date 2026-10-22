@@ -71,6 +71,40 @@ class RequiredGateTests(unittest.TestCase):
             self.assertIs(self.run_gate(api), False)
             self.assertEqual(api.check['conclusion'], 'failure')
 
+    def test_base_change_remains_blocked_across_retries_and_same_head_rereviews(self):
+        clean = sample(completed=True)
+        for prior_base in ({'ref': 'release', 'sha': 'd' * 40},
+                           {'ref': 'main', 'sha': 'e' * 40}):
+            for conclusion in (None, 'failure', 'success'):
+                with self.subTest(base=prior_base, conclusion=conclusion):
+                    state = gate.initialize(clean | {'base': prior_base}, 0)
+                    saved = saved_check(conclusion=conclusion, state=state)
+                    for _ in range(2):
+                        api = FakeGitHub([sample(eyes=True), clean], saved)
+                        self.assertIs(self.run_gate(api), False)
+                        self.assertEqual(api.check['conclusion'], 'failure')
+                        self.assertEqual(json.loads(api.check['output']['text'])['base'], prior_base)
+                        self.assertIn('base changed', api.check['output']['title'])
+                        self.assertNotIn('success', [row.get('conclusion') for row in api.writes])
+                        saved = api.check
+
+    def test_new_head_after_base_change_can_accept_its_own_structured_review(self):
+        old = gate.initialize(sample(base={'ref': 'release', 'sha': 'e' * 40}), 0)
+        clean = sample(head='b' * 40, completed=True)
+        api = FakeGitHub([clean], saved_check(conclusion='failure', state=old))
+        original = api.repo_call
+        def call(path, data=None, method=None):
+            result = original(path, data, method)
+            return result | {'head': {'sha': 'b' * 40}} if path.startswith('pulls/') else result
+        api.repo_call = call
+        now = [60]
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = gate.run(api, 1, lambda: now[0], lambda seconds: now.__setitem__(0, now[0] + seconds),
+                              expected_head='b' * 40)
+        self.assertIs(result, True)
+        self.assertEqual(api.check['head_sha'], 'b' * 40)
+        self.assertEqual(api.check['conclusion'], 'success')
+
     def test_api_errors_cannot_return_acceptance(self):
         api = FakeGitHub([OSError()])
         self.assertIs(self.run_gate(api), False)

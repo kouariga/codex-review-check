@@ -907,8 +907,8 @@ def run(api, number, clock=time.time, sleep=time.sleep, expected_head=None):
             state["candidate"] = state["candidate_at"] = None
         # Preserve success only while its exact evidence still agrees.
         if state.get("base") != base:
-            state = {"version": 1, "head": head, "base": base,
-                     "started": now, "initialized": False}
+            state.pop("proof", None)
+            state["candidate"] = state["candidate_at"] = None
         elif check["conclusion"] == "success":
             accepted_since = state.get("candidate_at")
             renewed = copy.deepcopy(state)
@@ -944,6 +944,10 @@ def run(api, number, clock=time.time, sleep=time.sleep, expected_head=None):
                               "output": {"title": "Observing Codex review", "summary": "Persisted Codex review observation",
                                          "text": json.dumps(state)}})
         check_id = check["id"]
+    if state.get("base") != base:
+        publish(api, check_id, state, "stale",
+                "PR base changed at the same head; update the PR branch before acceptance")
+        return False
     while True:
         try:
             snapshot = api.snapshot(number)

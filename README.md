@@ -47,6 +47,11 @@ build, publish, or deployment jobs must stay in separate workflows.
 Use strict up-to-date branch protection with required mode. Base-branch pushes
 do not start this observer, so loose required checks cannot detect an unobserved
 base update.
+If a saved observation for the same head has a different base, acceptance fails
+and retains the original base across retries. Update the PR branch to a new head
+before relying on a review of the new diff. The structured marker does not report
+a reviewed base, so a same-head rereview cannot clear this observed base mismatch.
+The adapter cannot detect historical base changes that no observation recorded.
 
 Merge queues are unsupported. Do not configure this gate as a required merge-queue
 check. Reviews bind to a PR head and base, and do not attest the synthetic
