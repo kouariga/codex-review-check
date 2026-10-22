@@ -53,7 +53,24 @@ class DispositionTests(unittest.TestCase):
         self.api.review_threads = lambda number: copy.deepcopy(self.resolved)
         self.review_updated = {}
         self.api.review_updates = lambda number: {r["id"]: self.review_updated.get(r["id"], r.get("updated_at", r["submitted_at"])) for r in self.reviews}
+        self.edit_metadata = {}
+        self.api.call = mock.Mock(side_effect=self.graphql)
         self.refresh_summary()
+
+    def graphql(self, path, data=None, method=None):
+        self.assertEqual(path, 'graphql')
+        identifier = data['variables']['id']
+        comment = next(row for row in self.comments + self.inline
+                       if row.get('node_id') == identifier)
+        node = {'__typename': 'PullRequestReviewComment' if comment.get('in_reply_to_id') else 'IssueComment',
+                'id': identifier, 'databaseId': comment['id'], 'body': comment['body'],
+                'createdAt': comment['created_at'], 'lastEditedAt': None, 'editor': None}
+        for field, value in self.edit_metadata.get(identifier, {}).items():
+            if value is ...:
+                node.pop(field, None)
+            else:
+                node[field] = value
+        return {'data': {'node': node}}
 
     def refresh_summary(self, status='Completed', completion=90):
         self.comments[0]['body'] = (gate.MARKER + '\n<!-- codex-review-state:v1 ' + json.dumps(self.metadata)
@@ -78,7 +95,8 @@ class DispositionTests(unittest.TestCase):
         body = (f"Codex review: {outcome}\nHead: {'a' * 40}\nBase: main@{'d' * 40}\n"
                 + (f"Finding: {key}\n" if not key.startswith('inline:') else '')
                 + "Reason: Verified the fix against the code.\nEvidence: Test passed.\n  More evidence.")
-        comment = {'id': identifier, 'user': copy.deepcopy(self.user), 'created_at': iso(created),
+        comment = {'id': identifier, 'node_id': f'Decision_{identifier}',
+                   'user': copy.deepcopy(self.user), 'created_at': iso(created),
                    'updated_at': iso(created), 'body': body}
         if key.startswith('inline:'):
             comment['in_reply_to_id'] = int(key.split(':')[1])
@@ -230,6 +248,60 @@ class DispositionTests(unittest.TestCase):
                 self.assertEqual(self.verdict()[2][0], 'pending')
         first['body'] = original
         self.assertEqual(self.verdict()[2][0], 'success')
+
+    def test_metadata_only_updates_accept_unedited_inline_and_top_level_decisions(self):
+        decisions = self.decisions()
+        for key in ('inline:11', 'issue:21'):
+            with self.subTest(key=key):
+                decision = decisions[0] if key == 'inline:11' else next(
+                    row for row in decisions if 'Finding: issue:21' in row['body'])
+                decision['updated_at'] = iso(111)
+                try:
+                    self.assertEqual(self.verdict()[2][0], 'success')
+                    self.assertTrue(self.api.call.called)
+                finally:
+                    decision['updated_at'] = decision['created_at']
+
+    def test_explicit_edit_metadata_rejects_even_equal_rest_timestamps(self):
+        decisions = self.decisions()
+        for decision in (decisions[0], next(row for row in decisions if 'Finding: issue:21' in row['body'])):
+            for metadata in ({'lastEditedAt': iso(111)}, {'editor': {'login': 'maintainer'}},
+                             {'lastEditedAt': iso(110), 'editor': {'login': 'maintainer'}}):
+                with self.subTest(node=decision['node_id'], metadata=metadata):
+                    self.edit_metadata = {decision['node_id']: metadata}
+                    self.assertEqual(self.verdict()[2][0], 'pending')
+
+    def test_missing_edit_fields_cannot_attest_that_decisions_are_unedited(self):
+        decisions = self.decisions()
+        for decision in (decisions[0], next(row for row in decisions if 'Finding: issue:21' in row['body'])):
+            for field in ('lastEditedAt', 'editor'):
+                with self.subTest(node=decision['node_id'], field=field):
+                    self.edit_metadata = {decision['node_id']: {field: ...}}
+                    self.assertEqual(self.verdict()[2][0], 'pending')
+
+    def test_graphql_comment_must_match_the_selected_rest_decision(self):
+        decisions = self.decisions()
+        for decision in (decisions[0], next(row for row in decisions if 'Finding: issue:21' in row['body'])):
+            for field, value in (('__typename', 'PullRequestReview'), ('id', 'Other_node'),
+                                 ('databaseId', 999), ('body', 'Different decision'),
+                                 ('createdAt', iso(109))):
+                with self.subTest(node=decision['node_id'], field=field):
+                    self.edit_metadata = {decision['node_id']: {field: value}}
+                    self.assertEqual(self.verdict()[2][0], 'pending')
+
+    def test_newest_edited_decision_does_not_restore_an_older_valid_reply(self):
+        self.decisions()
+        for key in ('inline:11', 'issue:21'):
+            with self.subTest(key=key):
+                decision = self.decision(key, 202 if key == 'inline:11' else 203, 111)
+                self.edit_metadata[decision['node_id']] = {'lastEditedAt': iso(112)}
+                try:
+                    snapshot = self.api.snapshot(1)
+                    self.assertEqual(snapshot['dispositions'][key]['id'], decision['id'])
+                    self.assertEqual(self.verdict(snapshot)[2][0], 'pending')
+                finally:
+                    (self.inline if key.startswith('inline:') else self.comments).remove(decision)
+                    self.edit_metadata.clear()
 
     def test_decision_must_be_unedited_after_review_and_finding_changes(self):
         first = self.decisions()[0]
