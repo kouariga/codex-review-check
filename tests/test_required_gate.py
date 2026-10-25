@@ -131,57 +131,30 @@ class RequiredGateTests(unittest.TestCase):
                 self.assertEqual(api.check['name'], EVIDENCE)
                 self.assertEqual(len(api.writes), writes)
 
-    def test_completed_same_head_rereview_retains_original_observation_baseline(self):
-        for manual in (False, True):
-            with self.subTest(manual=manual):
-                def complete(identifier, completed_at):
-                    result = sample(thumbs=[identifier], summary=identifier, completed=True,
-                                    completed_at=completed_at)
-                    if manual:
-                        result['structured'] = None
-                        result['manual'] = {
-                            'comments': [{'id': identifier, 'created': completed_at - 1,
-                                          'updated': completed_at - 1, 'digest': identifier}],
-                            'thumbs': {identifier: completed_at + 2},
-                            'completed_at': completed_at, 'summary_updated': completed_at + 1}
-                    else:
-                        result['reaction_times'] = {identifier: completed_at + 2}
-                    return result
-                first = complete('first', 10)
-                state = gate.initialize(sample(), 0)
-                self.assertEqual(gate.observe(state, first, 20)[0], 'pending')
-                self.assertEqual(gate.observe(state, first, 50)[0], 'success')
-                second = complete('second', 55)
-                api = FakeGitHub([second], saved_check(conclusion='success', state=state))
-                self.assertIs(self.run_gate(api), True)
-                saved = json.loads(api.check['output']['text'])
-                self.assertEqual(saved['baseline'], ['old'])
-                self.assertEqual(saved['observed_since'], 0)
-                self.assertEqual(saved['candidate_at'], 60 if manual else 20)
-                self.assertEqual([row['status'] for row in api.writes],
-                                 ['in_progress', 'in_progress', 'completed'] if manual else [])
+    def test_completed_same_head_rereview_uses_structured_verdict_and_new_inventory(self):
+        def complete(identifier):
+            return sample(completed=True, review_digest=identifier)
+        state = gate.initialize(sample(), 0)
+        first = complete('first')
+        gate.observe(state, first, 20)
+        gate.observe(state, first, 50)
+        api = FakeGitHub([complete('second')], saved_check(conclusion='success', state=state))
+        self.assertIs(self.run_gate(api), True)
+        saved = json.loads(api.check['output']['text'])
+        self.assertEqual(saved['head'], HEAD)
+        self.assertEqual(saved['proof']['kind'], 'clean_codex')
 
     def test_cached_acceptance_recovers_after_transient_snapshot_error(self):
-        for manual in (False, True):
-            with self.subTest(manual=manual):
-                clean = sample(thumbs=['fresh'], summary='completed', completed=True,
-                               completed_at=10, reaction_times={'fresh': 12})
-                if manual:
-                    clean['structured'] = None
-                    clean['manual'] = {
-                        'comments': [{'id': 'receipt', 'created': 9,
-                                      'updated': 9, 'digest': 'receipt'}],
-                        'thumbs': {'fresh': 12}, 'completed_at': 10,
-                        'summary_updated': 11}
-                state = gate.initialize(sample(), 0)
-                self.assertEqual(gate.observe(state, clean, 20)[0], 'pending')
-                self.assertEqual(gate.observe(state, clean, 50)[0], 'success')
-                api = FakeGitHub([OSError('temporary'), clean],
-                                 saved_check(conclusion='success', state=state))
-                self.assertIs(self.run_gate(api), True)
-                self.assertEqual(api.check['conclusion'], 'success')
-                self.assertEqual([row['status'] for row in api.writes],
-                                 ['in_progress', 'in_progress', 'completed'])
+        clean = sample(completed=True)
+        state = gate.initialize(sample(), 0)
+        gate.observe(state, clean, 20)
+        gate.observe(state, clean, 50)
+        api = FakeGitHub([OSError('temporary'), clean],
+                         saved_check(conclusion='success', state=state))
+        self.assertIs(self.run_gate(api), True)
+        self.assertEqual(api.check['conclusion'], 'success')
+        self.assertEqual([row['status'] for row in api.writes],
+                         ['in_progress', 'in_progress', 'completed'])
 
     def test_unchanged_proof_survives_review_metadata_enrichment(self):
         clean = sample(thumbs=['fresh'], summary='completed', completed=True,
@@ -200,7 +173,7 @@ class RequiredGateTests(unittest.TestCase):
                                      saved_check(conclusion='success', state=state))
                     self.assertIs(self.run_gate(api), True)
                     saved = json.loads(api.check['output']['text'])
-                    self.assertNotIn('manual_since', saved)
+                    self.assertNotIn('review_since', saved)
                     self.assertEqual(saved['proof'], state['proof'])
 
     def test_cached_acceptance_revalidation_has_a_bounded_retry(self):
@@ -232,13 +205,13 @@ class RequiredGateTests(unittest.TestCase):
         second = sample(thumbs=['second'], summary='second', completed=True, manual={
             'comments': [receipt], 'thumbs': {'second': 57},
             'completed_at': 55, 'summary_updated': 56})
-        for snapshot, expected in ((first, True), (second, False)):
+        for snapshot, expected in ((first, True), (second, True)):
             with self.subTest(unchanged=expected):
                 recovered = FakeGitHub([snapshot], json.loads(json.dumps(pending)))
                 self.assertIs(self.run_gate(recovered), expected)
                 self.assertNotIn('renewal', json.loads(recovered.check['output']['text']))
 
-    def test_snapshot_error_cannot_reuse_prior_lifecycle_receipt(self):
+    def test_snapshot_error_ignores_receipt_changes_for_unchanged_structured_verdict(self):
         receipt = {'id': 'receipt', 'created': 9, 'updated': 9, 'digest': 'receipt'}
         first = sample(thumbs=['first'], summary='first', completed=True, manual={
             'comments': [receipt], 'thumbs': {'first': 12},
@@ -252,15 +225,15 @@ class RequiredGateTests(unittest.TestCase):
         for snapshots in ([second], [OSError('transient'), second]):
             with self.subTest(error=isinstance(snapshots[0], Exception)):
                 api = FakeGitHub(snapshots, saved_check(conclusion='success', state=state))
-                self.assertIs(self.run_gate(api), False)
-                self.assertGreaterEqual(json.loads(api.check['output']['text'])['manual_since'], 20)
+                self.assertIs(self.run_gate(api), True)
+                self.assertEqual(json.loads(api.check['output']['text'])['proof']['kind'], 'clean_codex')
 
     def test_completed_rereview_recovery_preserves_rejection_and_disposition_floors(self):
         first = sample(thumbs=['first'], summary='first', completed=True)
         state = gate.initialize(sample(), 0)
         gate.observe(state, first, 0)
         gate.observe(state, first, 30)
-        state['manual_since'] = 10
+        state['review_since'] = 10
         state['disposition_floors'] = {'finding': 99}
         second = sample(thumbs=['second'], summary='second', completed=True)
         unresolved = second['structured'] | {'clean': False, 'unresolved': True, 'has_findings': True}
@@ -270,9 +243,9 @@ class RequiredGateTests(unittest.TestCase):
                 api = FakeGitHub([second | change], saved_check(conclusion='success', state=state))
                 self.assertIs(self.run_gate(api), False)
                 saved = json.loads(api.check['output']['text'])
-                self.assertEqual(saved['baseline'], ['old'])
-                self.assertEqual(saved['observed_since'], 0)
-                self.assertGreaterEqual(saved['manual_since'], 10)
+                self.assertEqual(saved['head'], HEAD)
+                self.assertEqual(saved['head'], HEAD)
+                self.assertGreaterEqual(saved['review_since'], 10)
                 self.assertEqual(saved['disposition_floors'], {'finding': 99})
 
     def test_new_evidence_history_takes_precedence_and_native_job_is_not_state(self):
@@ -291,7 +264,7 @@ class RequiredGateTests(unittest.TestCase):
         api = FakeGitHub([clean, clean], saved_check(conclusion='failure'))
         self.assertIs(self.run_gate(api), True)
         state = json.loads(api.check['output']['text'])
-        self.assertEqual(state['baseline'], ['old'])
+        self.assertEqual(state['head'], HEAD)
         self.assertEqual(api.writes[0]['name'], EVIDENCE)
 
     def test_duplicate_active_evidence_is_rejected(self):

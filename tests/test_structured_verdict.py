@@ -68,7 +68,7 @@ class StructuredVerdictTests(unittest.TestCase):
                             updated='1970-01-01T00:16:34Z').snapshot(1)
         state = gate.initialize(running, 990)
         self.assertEqual(gate.observe(state, running, 994)[0], 'pending')
-        self.assertEqual(state['manual_since'], 994)
+        self.assertEqual(state['review_since'], 994)
         self.assertEqual(gate.observe(state, complete, 1024)[0], 'pending')
         self.assertEqual(gate.observe(state, complete, 1054)[0], 'success')
         self.assertTrue(self.run_gate(FakeGitHub([running, complete, complete])))
@@ -114,33 +114,11 @@ class StructuredVerdictTests(unittest.TestCase):
                     expected = ('success' if status == 'completed' else 'failure' if status == 'failed' else 'pending') if security_head == 'a' * 40 else 'pending'
                     self.assertEqual(result, expected)
 
-    def test_advertised_all_null_security_cannot_be_treated_as_absent(self):
-        with self.assertRaises(gate.StructuredEvidenceError):
-            self.api(display='| **Security Review** | Pending | `aaaaaaa` | New commits |').snapshot(1)
-        metadata = self.metadata()
-        metadata['code_review'] = dict.fromkeys(metadata['code_review'])
-        with self.assertRaises(gate.StructuredEvidenceError):
-            self.api(metadata).snapshot(1)
 
     def test_prose_mention_of_security_does_not_change_review_scope(self):
         snapshot = self.api(display='Security Review is optional and was not requested.').snapshot(1)
         self.assertEqual(self.result(snapshot)[0][0], 'success')
 
-    def test_advertised_security_scope_does_not_depend_on_markdown_formatting(self):
-        for label in ('🔒 Security Review', '*Security Review*', '**Security** **Review**',
-                      '<strong>Security</strong> Review', 'SECURITY   REVIEW',
-                      'Security<br>Review', 'Security&nbsp;Review',
-                      '[Security](https://example.com/security) [Review](https://example.com/review)',
-                      'Secu**rity** Review', 'Secu<strong>rity</strong> Review'):
-            with self.subTest(label=label), self.assertRaises(gate.StructuredEvidenceError):
-                self.api(display=f'| {label} | Running | `aaaaaaa` | New commits |').snapshot(1)
-
-    def test_advertised_security_scope_allows_table_delimiter_variants(self):
-        for display in (' | **Security Review** | Running | `aaaaaaa` | New commits |',
-                        'Security Review | Running | `aaaaaaa` | New commits',
-                        '\t| Security Review | Running | `aaaaaaa` | New commits |'):
-            with self.subTest(display=display), self.assertRaises(gate.StructuredEvidenceError):
-                self.api(display=display).snapshot(1)
 
     def test_link_targets_do_not_advertise_security_scope(self):
         for label in ('[Code Review](https://example.com/security)', '[Code Review][security-docs]'):
@@ -162,7 +140,7 @@ class StructuredVerdictTests(unittest.TestCase):
         snapshot = self.api(self.metadata(has_any_findings=None, has_unresolved_findings=None)).snapshot(1)
         result, state = self.result(snapshot)
         self.assertEqual(result[0], 'pending')
-        self.assertIn('unavailable', result[1])
+        self.assertIn('unknown finding flags', result[1])
         self.assertIsNone(state['evidence']['reviews']['code_review']['has_any_findings'])
         self.assertIsNone(state['evidence']['reviews']['code_review']['has_unresolved_findings'])
 
