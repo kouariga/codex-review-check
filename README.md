@@ -147,14 +147,13 @@ For every required review, the same object must contain:
 
 Code Review is mandatory. The marker must contain exactly `code_review` and
 `security_review`, each with these four fields. Security Review is optional only
-when all four of its fields are null and the summary does not advertise Security
-Review. A populated Security Review must also satisfy the clean rule, even when
+when all four of its JSON fields are null. A populated Security Review must also satisfy the clean rule, even when
 there is no display row. An all-null object never counts as a successful review.
 Missing or null finding flags do not mean false.
-Scope detection normalizes table indentation, optional leading pipes, HTML
-entities, tags, and Markdown labels. A table label that mentions security
-conservatively requires Security Review metadata. Ordinary prose and link targets
-do not advertise review scope.
+Review scope comes only from the JSON objects. An all-null `security_review`
+means no Security Review is reported; a populated object is mandatory for acceptance.
+Markdown labels, table layout, display timestamps, receipts and reactions do not
+supply review scope or a verdict.
 
 The adapter trusts Codex's reported reviewed SHA. This is observed, undocumented
 Codex output, not a verified stable public API contract. An unsupported version,
@@ -195,8 +194,9 @@ Resolving a thread alone is not approval. Structured metadata has no completion
 time or review-run ID, so it cannot prove that another contradictory finding
 predates the clean result. Resolved findings therefore require verified
 dispositions when using this path, including resolved findings on the same head.
-Markdown completion timestamps cannot erase those blockers. The separate legacy
-receipt path retains its existing chronology rules.
+Markdown completion timestamps cannot erase those blockers. Bare free-text review
+bodies are treated conservatively as findings, even when they use an old clean
+review phrase; the checker never interprets that phrase as approval.
 
 An observed same-head structured running or queued review invalidates an earlier
 clean proof. A subsequent completed clean result can pass after two stable
@@ -206,40 +206,44 @@ identifiable without an upstream review-run ID. Poll time and summary edit time
 do not supply that identity. Event delivery and native job rerun limitations
 above still apply.
 
-Legacy receipt compatibility remains separate. Without structured metadata, a
-manual Code Review needs the trusted summary and a trusted terminal clean receipt
-with exactly one explicit reviewed commit that resolves to the captured full SHA.
-Reaction-only automatic acceptance is no longer supported. A completed structured
-Code Review with both finding flags null can use the recognized
-`codex-review-receipt:v1` clean template for this compatibility path. The template
-includes the reviewed commit and known boilerplate. Its optional positive suffix
-may be `Keep it up!`, `Another round soon, please!`, `:+1:`, `:thumbsup:`, or `👍`
-with an optional variation selector and skin tone. Unknown prose, additional
-text, and conflicting receipts fail closed. Explicit structured findings cannot
-be turned into a clean review by a receipt.
+There is no legacy approval fallback. Missing structured metadata or completed
+results with null finding flags remain pending until the observation deadline,
+even if a receipt says the review is clean or a thumbs-up is present. Historical
+receipt wording is not parsed. Older Codex responses that provide only prose or
+unknown results are intentionally unsupported.
 
-Receipt compatibility retains its original observer-start, restart, timestamp,
-and ambiguity checks, plus a fresh trusted thumbs-up. The receipt precedes the
-summary completion, which strictly precedes the reaction. Same-second ordering
-is insufficient. The newest eligible receipt must identify the current head.
-A newer wrong-head receipt cannot fall back to an older valid one. Every required
-review must be complete. A receipt cannot substitute for a required Security Review.
-When unknown structured flags coexist with findings, every finding needs a valid
-disposition and every inline thread must be resolved. This produces only
-`verified_dispositions` and does not require a reaction.
+Finding chronology still uses creation/update metadata from GitHub. Dispositions
+must follow the latest summary update, every bot review update, and later
+non-decision replies on their finding. Their text must be unedited, proven by
+fresh GraphQL `lastEditedAt` and `editor` fields matching the selected REST comment.
+Both edit fields must be explicitly null; missing or unavailable edit evidence
+blocks acceptance. A later REST `updated_at` alone does not mean the reply was edited.
+Bot review update times come from the complete GraphQL connection, joined by
+review database ID. Display completion timestamps are never used for chronology.
 
-Finding chronology still requires creation and update timestamps. Dispositions
-use their creation time for ordering and fresh GraphQL `lastEditedAt` and `editor`
-metadata to prove that their text was never edited. The GraphQL comment must match
-the REST comment identity, type, body, and creation time. Both edit fields must be
-explicitly null; missing or unavailable edit evidence blocks acceptance. A later
-REST `updated_at` alone does not mean the text was edited.
-Substantive reviews require submission and update timestamps. GitHub REST reviews
-omit update time, so observations enrich Codex reviews from the complete paginated
-GraphQL connection by database ID. A qualifying receipt strictly follows all
-finding and substantive review changes. Missing or ambiguous chronology blocks
-receipt and disposition acceptance. Display chronology remains necessary for
-these compatibility paths, but not for structured clean acceptance.
+### Finding the running review summary
+
+Codex maintains a review-summary issue comment as reviews start and finish. A
+rerun can update that existing comment instead of posting a new running message.
+The rendered comment shows a status table; its raw Markdown contains the hidden
+`<!-- codex-review-state:v1 ... -->` JSON marker. The observer reads that raw body
+through GitHub's issue-comments API, including while the review is still running.
+It does not wait for a final review receipt or request a review itself.
+
+For an accessible repository, locate the trusted summary with:
+
+```sh
+gh api repos/OWNER/REPO/issues/PR/comments --paginate --jq '
+  .[] | select(.user.id == 199175422 and .performed_via_github_app.id == 1144995)
+  | select(.body | startswith("<!-- codex-pull-request-review-summary -->"))
+  | {html_url, created_at, updated_at, body}'
+```
+
+The summary's created/edited events can trigger the caller's `issue_comment`
+subscription; an active observer also polls it every 30 seconds. A running result
+keeps acceptance pending. The existing 20-minute timeout is unchanged: if no valid
+terminal result arrives, the attempt fails, and a later authorized observation can
+re-evaluate the current JSON.
 
 A separate proof kind, `verified_dispositions`, accepts accountable handling of
 feedback. It does not mean Codex gave a clean review. A repository writer,
@@ -334,48 +338,14 @@ kinds restarts confirmation. Clean Codex approval takes precedence when both
 paths qualify. The workflow is event-driven, not a continuous monitor; changes
 are detected on its next invocation.
 
-An existing observation that could not initialize can recover a manual review
-completed after that observation started. Recovery preserves the original start
-when renewing the 20-minute deadline. For legacy failed checks that lack a stored
-origin, recovery walks consecutive GitHub Actions observation records in descending
-check-ID order. Each record must be uninitialized, failed, and match the exact head,
-external ID, state version, and base identity. Start times must be finite, nonnegative,
-not in the future, and nonincreasing while walking backward. An initialized, successful,
-mismatched, malformed, or nonmonotonic record stops the walk. A stored origin is
-preserved except for the narrowly verified migration described below. This recovers an original start
-lost by legacy retries without crossing another review lifecycle.
-An initialized legacy observation can also recover when every consecutive failed
-record has the exact original state shape: an empty reaction baseline, the digest
-of an absent summary, no observed eyes, and no candidate. Only the start time may
-change. Any lifecycle, identity, malformed-state, or ordering boundary stops recovery.
-This path preserves the empty reaction baseline and still requires a new reaction;
-it does not enable the uninitialized path's reaction-baseline exception.
+An observer starting after completion can use an existing explicit structured
+verdict for the captured head. No receipt-start or reaction baseline is recovered.
+An observed structured running, queued, pending or failed state invalidates prior
+approval and advances the disposition freshness floor once per semantic lifecycle
+change. Repeated identical active polls and cosmetic summary edits do not advance
+that floor. Existing persisted observations retain their head/base binding and
+disposition floors, but old receipt proofs cannot establish acceptance.
 
-The first manual-evidence release could promote this virgin legacy state by storing
-the most recent retry time as its origin and the already-completed comment IDs as
-its manual baseline. Recovery recognizes only that exact mechanical promotion of
-its immediate legacy predecessor, with no extra fields, active lifecycle, or
-candidate. The current trusted manual comment IDs must match the promotion's
-baseline, and their update times and summary update time must precede the promotion.
-Only this verified migration can replace a stored origin and discard its
-migration-created manual baseline. Ordinary new observations and states that
-observed a review restart cannot rewind their origins.
-
-Legacy receipt recovery cannot accept a review completed before observation began. This restriction does not apply to explicit structured clean results. Observing any running or failed review ends recovery and
-records any available manual completion-comment IDs as its baseline. Subsequent manual
-evidence must follow the first observation of that active review state. A changed
-structured review state or legacy summary/status advances this boundary; identical
-active polls and structured-summary timestamp updates alone do not. Receipts
-created after the first active observation remain eligible when seen before
-summary completion. Receipts already present at that observation stay excluded. Completion
-resets the active-state identity so a later restart advances the boundary again. Older initialized
-state without these IDs also records a baseline before accepting manual evidence.
-This prevents an earlier completion comment from approving an observed same-head
-restart. Unobserved overlapping same-head reviews cannot be fully distinguished
-without an upstream lifecycle ID; multiple eligible comments fail closed.
-
-Observation state lives in the latest owned evidence check output. Native mode
-also reads the append-only feedback records. Code Review must be present;
 Security Review alone cannot approve the check. In legacy report-only mode,
 per-PR job concurrency serializes observations after event filtering. Ordinary
 issue comments do not enter that queue. All inline comment events trigger
@@ -383,10 +353,9 @@ revalidation because a new reply can invalidate a prior decision. Receipt creati
 and deletions qualify only when the event sender currently has repository write
 authority, checked before any check write. Marker removal uses the previous
 comment body supplied with an edit event. A restart resumes an incomplete run. A new authorized invocation creates a new
-run when renewing a completed lifecycle, preserving the original reaction baseline
-and clearing candidate confirmation. Completed runs remain history; only the
-latest owned run supplies resumable state, except for the bounded legacy origin
-recovery described above. Multiple active runs block as ambiguous.
+run when renewing a completed lifecycle, retaining head/base and disposition
+floors while clearing candidate confirmation. Completed runs remain history; only
+the latest owned run supplies resumable state. Multiple active runs block as ambiguous.
 Failed or expired attempts get a renewed deadline. Each attempt is
 still bounded to 20 minutes and recovery requires two stable observations.
 GitHub may coalesce pending runs in legacy report-only mode. Opted-in native
@@ -400,7 +369,9 @@ the last API read can briefly race check publication; the check is still bound
 to the captured SHA and subsequent events re-evaluate evidence.
 
 This is a practical lifecycle observation, not a cryptographic review attestation.
-Webhook delay remains a limitation. Reaction propagation also affects legacy receipt compatibility. Only required review types reported in the evolving summary format are observed; absent optional Security metadata does not prove a security review ran. Unsupported structured metadata fails closed.
+Webhook delay remains a limitation. Only review scopes populated in the JSON are
+observed; an all-null optional Security object does not prove a security review ran.
+Unsupported structured metadata fails closed.
 Check creation uses the GitHub Actions App, not a dedicated adapter App; other
 trusted writable workflows share that identity. Do not execute untrusted PR code
 with this write token. Do not make this report-only check required until live
