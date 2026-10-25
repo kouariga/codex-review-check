@@ -202,7 +202,6 @@ def initialize(snapshot, now):
 
 
 def observe(state, snapshot, now):
-    """Evaluate only structured lifecycle/verdict data plus independent finding guards."""
     state.pop("proof", None)
     if snapshot["head"] != state["head"]:
         return "stale", "PR head changed; this observation cannot pass the new head"
@@ -223,7 +222,6 @@ def observe(state, snapshot, now):
             state["review_active"] = active
     elif structured and structured["current_head"] and structured["completed"]:
         state.pop("review_active", None)
-    # Retain the disposition freshness floor when reading an earlier saved observation.
     if "manual_since" in state:
         state["review_since"] = max(state.get("review_since", float("-inf")), state.pop("manual_since"))
     lifecycle_valid = bool(structured and structured["current_head"] and structured["completed"]
