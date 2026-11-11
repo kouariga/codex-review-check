@@ -198,7 +198,7 @@ class NativeRerunTests(unittest.TestCase):
         self.assertIs(self.rerun(api), False)
         self.assertEqual(api.writes, [])
 
-    def test_opted_in_pull_request_target_leaves_native_job_to_its_own_workflow(self):
+    def test_observer_rejects_pull_request_target_owned_by_the_native_job(self):
         api = NativeGitHub()
         api.job['status'] = api.check['status'] = api.workflow['status'] = 'in_progress'
         api.check['conclusion'] = None
@@ -213,7 +213,8 @@ class NativeRerunTests(unittest.TestCase):
             with mock.patch.dict(os.environ, env), \
                     mock.patch.object(gate, 'GitHub', return_value=api), \
                     mock.patch.object(gate, 'rerun_required_job', side_effect=AssertionError('self rerun')):
-                self.assertIsNone(gate.main())
+                with self.assertRaises(ValueError):
+                    gate.main()
         self.assertEqual(api.pr_reads, 0)
         self.assertEqual(api.writes, [])
         self.assertEqual((api.check['status'], api.check['conclusion']), ('in_progress', None))
@@ -520,8 +521,10 @@ class NativeRerunTests(unittest.TestCase):
 
     def test_opted_in_observers_do_not_share_pending_event_slot(self):
         workflow = (ROOT / '.github/workflows/review.yml').read_text()
-        self.assertIn("inputs.required-job != '' && github.run_id ||", workflow)
-        self.assertIn("timeout-minutes: ${{ inputs.required-job != '' && 35 || 25 }}", workflow)
+        self.assertIn("group: codex-review-check-${{ github.run_id }}\n", workflow)
+        self.assertIn("    timeout-minutes: 35\n", workflow)
+        self.assertIn("default: codex-cloud-review\n", workflow)
+        self.assertNotIn("github.event_name == 'pull_request_target'", workflow)
 
     @staticmethod
     def native_calls(native, pr):

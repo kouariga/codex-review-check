@@ -1,25 +1,39 @@
 # Codex Review Check
 
-Observe an existing Codex Cloud review and publish `codex-cloud-review` on the
-exact PR head. The adapter never requests a review, changes application code,
-resolves discussions, or merges PRs. Initial deployment is report-only.
+Observe an existing Codex Cloud review and report it as a native Actions job
+named `codex-cloud-review` on the exact PR head. The job passes only for explicit
+acceptance. The adapter never requests a review, changes application code,
+resolves discussions, or merges PRs.
+
+A repository that lists `codex-cloud-review` as a required status check blocks
+merging until the job passes. A repository that does not list it gets the same
+native job as an informational check. The job runs the same rules and reports
+pass or fail, but GitHub does not block merging on it.
 
 ## Install
 
 After the first tested `v1` release is published, copy [examples/caller.yml](examples/caller.yml)
 to `.github/workflows/codex-cloud-review.yml` in each caller repository.
+The caller has two jobs. On `pull_request_target`, the `required-review` job runs
+the composite action as the native `codex-cloud-review` job. On the other events,
+the `review` job calls the reusable workflow, which reruns that native job after
+Codex review and disposition events. The workflow's `required-job` input names the
+native job and defaults to `codex-cloud-review`.
 Install on its default branch for `issue_comment`, `workflow_dispatch`, and
 `pull_request_target`. `pull_request_review` and inline
 `pull_request_review_comment` events use the PR merge-ref workflow, which must
 also contain the subscriptions. Review permissions
 before enabling. An unmerged installation PR cannot replace the default caller.
 
-The caller uses this public reusable workflow with its own repository-scoped
-`GITHUB_TOKEN`. It grants `contents`, `issues`, and `pull-requests` read and
-`checks: write`. No PAT, OpenAI key, source checkout, or inherited secrets are
+The caller uses this public action and reusable workflow with its own
+repository-scoped `GITHUB_TOKEN`. It grants `contents`, `issues`, and
+`pull-requests` read and `checks: write`. The observer job also needs
+`actions: write` to rerun the native job; the reusable workflow inherits its
+caller's permissions. No PAT, OpenAI key, source checkout, or inherited secrets are
 needed. Private callers do not publish their code into this repository.
 `checks: write` is repository-wide capability; the implementation limits writes
-to its observation check but token permissions cannot restrict a check name.
+to its `codex-review-evidence` and `codex-review-feedback-event` checks, but token
+permissions cannot restrict a check name.
 Organization Actions policy must allow this reusable workflow and its caller's
 `pull_request_target` event. Public callers need an applicable event policy that
 permits `pull_request_target`: GitHub's default public-repository policy begins
@@ -33,18 +47,18 @@ update PRs for those releases. Event subscriptions, permissions, or breaking
 interface changes may still require caller changes. A full commit SHA can be
 used instead when per-repository adoption control is preferred.
 
-## Required native Actions job
+## Native Actions job
 
-Required mode supports same-repository PRs except Dependabot PRs. It rejects fork,
+The native job supports same-repository PRs except Dependabot PRs. It rejects fork,
 Dependabot, and missing-source-repository payloads before evaluating acceptance.
 Their review-event tokens cannot invalidate a successful native job. A trusted
-writable relay is required before this mode can support those PRs.
+writable relay is required before the native job can support those PRs.
 
 Use a dedicated review workflow with no jobs depending on the native gate through
 `needs`. GitHub reruns the selected job and its dependent jobs, so downstream
 build, publish, or deployment jobs must stay in separate workflows.
 
-Use strict up-to-date branch protection with required mode. Base-branch pushes
+Use strict up-to-date branch protection when `codex-cloud-review` is required. Base-branch pushes
 do not start this observer, so loose required checks cannot detect an unobserved
 base update.
 If a saved observation for the same head has a different base, acceptance fails
@@ -57,23 +71,19 @@ Merge queues are unsupported. Do not configure this gate as a required merge-que
 check. Reviews bind to a PR head and base, and do not attest the synthetic
 `merge_group` commit. Queue support needs a separate review contract.
 
-For enforcement, define a native job named `codex-cloud-review` in a trusted
-`pull_request_target` caller. Its step uses `kouariga/codex-review-check@<reviewed-commit-sha>`
-as a composite action, with the same repository permissions shown above. Do not
-check out or execute PR code. Required mode rejects `pull_request` because that
+The native job named `codex-cloud-review` runs in a trusted `pull_request_target`
+caller. Its step uses `kouariga/codex-review-check@v1` or a reviewed commit SHA
+as a composite action, with the repository permissions shown above. Do not
+check out or execute PR code. The native job rejects `pull_request` because that
 event lets the PR replace its own workflow definition.
 
 The action binds the event head to the live PR, polls the existing acceptance
 rules, and exits zero only for explicit acceptance. Unfinished reviews,
 unresolved threads, stale identity, API errors, and timeouts do not succeed.
 It persists retry state in `codex-review-evidence`, including migration from
-owned legacy observations. The native job supplies the required check result.
-To re-evaluate this native job after comment events, pass `required-job:
-codex-cloud-review` to the reusable workflow. Grant `actions: write` to that
-observer job, alongside `checks: write` and the existing read permissions. The reusable workflow
-inherits its caller's permissions. Without this input, it retains legacy
-report-only behavior and needs `checks: write` instead.
-Native callers must also subscribe to `pull_request_review` with `submitted`,
+observations saved by the retired report-only observer. The native job supplies
+the check result. The reusable workflow re-evaluates this native job after
+comment events. Callers must also subscribe to `pull_request_review` with `submitted`,
 `edited`, and `dismissed` so review-body changes trigger re-evaluation. Reviews
 use the same immutable Codex author ID as the snapshot evaluator.
 
@@ -99,14 +109,14 @@ After a competing rerun, the observer rechecks only when GitHub confirms the
 owning run's attempt number advanced. Other API denials remain failures.
 An active workflow is allowed to finish before the observer requests the job rerun. This
 covers a job that was about to succeed using evidence from before the update.
-Each opted-in observer has its own concurrency group so later updates cannot
+Each observer run has its own concurrency group so later updates cannot
 replace a pending feedback event. Before waiting for the native job, the observer
 appends authorized disposition edits and deletions to `codex-review-feedback-event`.
 The native evaluator reads these records for the current PR head and base and
 keeps the highest decision ID for each finding. An active native job cannot
 overwrite these records, and an older reply cannot become valid again when a
-newer decision disappears. The observer creates no legacy `codex-cloud-review`
-check in this mode.
+newer decision disappears. The observer never creates a `codex-cloud-review`
+check.
 
 Pin both paths to tested commits when using per-repository adoption. The trusted
 default caller must be updated before its installation PR can exercise this native
@@ -346,9 +356,8 @@ change. Repeated identical active polls and cosmetic summary edits do not advanc
 that floor. Existing persisted observations retain their head/base binding and
 disposition floors, but old receipt proofs cannot establish acceptance.
 
-Security Review alone cannot approve the check. In legacy report-only mode,
-per-PR job concurrency serializes observations after event filtering. Ordinary
-issue comments do not enter that queue. All inline comment events trigger
+Security Review alone cannot approve the check. Ordinary issue comments do not
+start the observer. All inline comment events trigger
 revalidation because a new reply can invalidate a prior decision. Receipt creation, edits,
 and deletions qualify only when the event sender currently has repository write
 authority, checked before any check write. Marker removal uses the previous
@@ -358,8 +367,7 @@ floors while clearing candidate confirmation. Completed runs remain history; onl
 the latest owned run supplies resumable state. Multiple active runs block as ambiguous.
 Failed or expired attempts get a renewed deadline. Each attempt is
 still bounded to 20 minutes and recovery requires two stable observations.
-GitHub may coalesce pending runs in legacy report-only mode. Opted-in native
-observers retain separate event runs and read the latest live head.
+Observers retain separate event runs and read the latest live head.
 Same-head review restarts invalidate previous success when running evidence is
 observed. A head or base change during evidence collection is rejected. The caller
 subscribes to `edited` to observe retargeting. Base-branch pushes alone may not
@@ -374,8 +382,8 @@ observed; an all-null optional Security object does not prove a security review 
 Unsupported structured metadata fails closed.
 Check creation uses the GitHub Actions App, not a dedicated adapter App; other
 trusted writable workflows share that identity. Do not execute untrusted PR code
-with this write token. Do not make this report-only check required until live
-behavior and repository policies have been validated.
+with this write token. Validate live behavior and repository policies before
+listing `codex-cloud-review` as a required status check.
 
 Authenticated conditional GETs reuse unchanged responses (304) without consuming
 GitHub's primary REST quota; identical check outputs are not repeatedly written.
@@ -403,7 +411,8 @@ CI runs tests with read-only permissions. No live check write is part of unit te
 
 1. Open an implementation PR; run tests and obtain required review on its exact head.
 2. Merge only after those requirements pass. Record the tested commit SHA.
-3. Validate an explicitly authorized report-only caller against that SHA; inspect
+3. Validate an explicitly authorized caller that does not yet require
+   `codex-cloud-review` against that SHA; inspect
    pending, two-observation success, and head binding. Do not request paid reviews
    or push empty application commits merely to exercise the adapter.
 4. Create an immutable version tag such as `v1.0.0` at the validated commit, then

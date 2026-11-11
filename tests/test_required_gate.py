@@ -328,20 +328,12 @@ class RequiredMainTests(unittest.TestCase):
                         gate.main()
                     api.assert_not_called()
 
-    def test_legacy_cli_remains_report_only(self):
-        with tempfile.NamedTemporaryFile(mode='w') as event:
-            json.dump({'pull_request': {'number': 1}}, event)
-            event.flush()
-            env = {'CODEX_REQUIRED_REVIEW': '', 'GITHUB_EVENT_PATH': event.name,
-                   'GITHUB_TOKEN': 'unused', 'GITHUB_REPOSITORY': 'owner/repo'}
-            for event_name in ('pull_request_target', 'pull_request_review'):
-                event.seek(0)
-                event.truncate()
-                json.dump({'pull_request': {'number': 1}, 'review': {'user': {'id': 199175422}}}, event)
-                event.flush()
-                with mock.patch.dict(os.environ, env | {'CODEX_REQUIRED_JOB': '',
-                                                       'GITHUB_EVENT_NAME': event_name}), \
-                        mock.patch.object(gate, 'GitHub') as api, \
-                        mock.patch.object(gate, 'run', return_value=False) as run:
-                    self.assertIsNone(gate.main())
-                    run.assert_called_once_with(api.return_value, 1)
+    def test_observer_without_required_job_never_publishes_a_check(self):
+        for event_name in ('pull_request_target', 'pull_request_review', 'workflow_dispatch'):
+            with self.subTest(event=event_name), mock.patch.dict(os.environ, {
+                    'CODEX_REQUIRED_REVIEW': '', 'CODEX_REQUIRED_JOB': '', 'GITHUB_EVENT_NAME': event_name}), \
+                    mock.patch.object(gate, 'GitHub') as api, mock.patch.object(gate, 'run') as run:
+                with self.assertRaises(ValueError):
+                    gate.main()
+                api.assert_not_called()
+                run.assert_not_called()
