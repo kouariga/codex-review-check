@@ -80,6 +80,8 @@ class DispositionTests(unittest.TestCase):
     def call(self, path):
         if path.startswith('pulls/'):
             return copy.deepcopy(self.pr)
+        if path == 'actions/runs/17':
+            return {'id': 17, 'run_started_at': iso(100)}
         if path.startswith('collaborators/'):
             if isinstance(self.permission, Exception):
                 raise self.permission
@@ -489,10 +491,12 @@ class DispositionTests(unittest.TestCase):
             handle.flush()
             with mock.patch.dict(gate.os.environ, {'GITHUB_EVENT_NAME': name,
                     'GITHUB_TOKEN': 'unused', 'GITHUB_REPOSITORY': 'owner/repo',
-                    'GITHUB_EVENT_PATH': handle.name}), mock.patch.object(gate, 'GitHub', return_value=self.api), \
-                    mock.patch.object(gate, 'run') as run:
+                    'GITHUB_EVENT_PATH': handle.name, 'CODEX_REQUIRED_JOB': 'codex-cloud-review',
+                    'GITHUB_WORKFLOW_REF': 'owner/repo/.github/workflows/codex-cloud-review.yml@refs/heads/main',
+                    'GITHUB_RUN_ID': '17'}), mock.patch.object(gate, 'GitHub', return_value=self.api), \
+                    mock.patch.object(gate, 'rerun_required_job', return_value=True) as rerun:
                 gate.main()
-                return run.called
+                return rerun.called
 
     def test_reply_events_and_marker_removal_preserve_per_finding_floors(self):
         comment = self.decision('inline:11')
@@ -547,7 +551,7 @@ class DispositionTests(unittest.TestCase):
         self.decisions()
         snapshot = self.api.snapshot(1)
         state, _, _ = self.verdict(snapshot)
-        saved = {'id': 5, 'name': gate.CHECK, 'head_sha': 'a' * 40,
+        saved = {'id': 5, 'name': gate.EVIDENCE_CHECK, 'head_sha': 'a' * 40,
                  'app': {'id': gate.ACTIONS_APP_ID}, 'conclusion': 'success',
                  'external_id': 'codex-gate-v1:owner/repo:1:' + 'a' * 40,
                  'output': {'text': json.dumps(state)}}
@@ -558,7 +562,7 @@ class DispositionTests(unittest.TestCase):
             def sleep(seconds):
                 now[0] += seconds
             with contextlib.redirect_stdout(io.StringIO()):
-                gate.run(api, 1, lambda: now[0], sleep)
+                gate.run(api, 1, lambda: now[0], sleep, expected_head='a' * 40)
             self.assertEqual(api.check['conclusion'], 'failure')
             self.assertEqual(json.loads(api.check['output']['text'])['disposition_floors']['inline:11'], 202)
 
@@ -566,7 +570,7 @@ class DispositionTests(unittest.TestCase):
         self.decisions()
         original = self.api.snapshot(1)
         state, _, _ = self.verdict(original)
-        saved = {'id': 5, 'name': gate.CHECK, 'head_sha': 'a' * 40,
+        saved = {'id': 5, 'name': gate.EVIDENCE_CHECK, 'head_sha': 'a' * 40,
                  'app': {'id': gate.ACTIONS_APP_ID}, 'conclusion': 'success',
                  'external_id': 'codex-gate-v1:owner/repo:1:' + 'a' * 40,
                  'output': {'text': json.dumps(state)}}
@@ -576,7 +580,7 @@ class DispositionTests(unittest.TestCase):
         def sleep(seconds):
             now[0] += seconds
         with contextlib.redirect_stdout(io.StringIO()):
-            gate.run(api, 1, lambda: now[0], sleep)
+            gate.run(api, 1, lambda: now[0], sleep, expected_head='a' * 40)
         self.assertEqual(api.check['conclusion'], 'failure')
         self.assertEqual(json.loads(api.check['output']['text'])['disposition_floors']['inline:11'], 202)
     def test_permission_lookup_is_once_per_author_per_snapshot_then_rechecked(self):

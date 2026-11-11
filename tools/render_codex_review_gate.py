@@ -10,13 +10,12 @@ on:
   workflow_call:
     inputs:
       required-job:
-        description: Native required job to rerun instead of publishing a legacy check
+        description: Native required job to rerun after Codex review and disposition events
         type: string
-        default: ''
+        default: codex-cloud-review
 jobs:
   observe:
     if: >-
-      (github.event_name == 'pull_request_target' && inputs.required-job == '' && !github.event.pull_request.draft) ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request_review' && github.event.review.user.id == 199175422) ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
@@ -26,10 +25,10 @@ jobs:
         startsWith(github.event.changes.body.from, 'Codex review:'))) ||
       github.event_name == 'pull_request_review_comment'
     concurrency:
-      group: codex-review-check-${{ inputs.required-job != '' && github.run_id || (github.event.pull_request.number || github.event.issue.number || fromJSON(github.event.inputs.pr || '0')) }}
+      group: codex-review-check-${{ github.run_id }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ inputs.required-job != '' && 35 || 25 }}
+    timeout-minutes: 35
     steps:
       - name: Observe metadata without executing PR code
         env:

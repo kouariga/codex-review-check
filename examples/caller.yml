@@ -2,12 +2,12 @@ name: Observe Codex review
 on:
   pull_request_target:
     types: [opened, synchronize, ready_for_review, reopened, edited]
-  pull_request_review:
-    types: [submitted, edited, dismissed]
-  pull_request_review_comment:
-    types: [created, edited, deleted]
   issue_comment:
     types: [created, edited, deleted]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
   workflow_dispatch:
     inputs:
       pr:
@@ -21,4 +21,23 @@ permissions:
   checks: write
 jobs:
   review:
+    if: github.event_name != 'pull_request_target'
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      checks: write
+      actions: write
     uses: kouariga/codex-review-check/.github/workflows/review.yml@v1
+    with:
+      required-job: codex-cloud-review
+  required-review:
+    name: ${{ github.event_name == 'pull_request_target' && 'codex-cloud-review' || 'codex-review-idle' }}
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    concurrency:
+      group: codex-required-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - uses: kouariga/codex-review-check@v1

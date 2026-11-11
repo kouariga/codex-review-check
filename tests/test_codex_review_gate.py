@@ -567,7 +567,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(seconds, 30)
             now[0] += seconds
         with contextlib.redirect_stdout(io.StringIO()):
-            gate.run(api, 1, lambda: now[0], sleep)
+            gate.run(api, 1, lambda: now[0], sleep, expected_head="a" * 40)
         return now[0]
 
     def test_synthetic_check_lifecycle_and_api_error_between_confirmations(self):
@@ -596,7 +596,7 @@ class RunnerTests(unittest.TestCase):
         clean = sample(thumbs=["new"], summary="complete", completed=True)
         state = gate.initialize(sample(), -60)
         gate.observe(state, clean, -30)
-        saved = {"id": 1, "name": gate.CHECK, "head_sha": "a" * 40,
+        saved = {"id": 1, "name": gate.EVIDENCE_CHECK, "head_sha": "a" * 40,
                  "app": {"id": gate.ACTIONS_APP_ID}, "conclusion": None,
                  "external_id": "codex-gate-v1:owner/repo:1:" + "a" * 40,
                  "output": {"text": json.dumps(state)}}
@@ -608,7 +608,7 @@ class RunnerTests(unittest.TestCase):
     def test_other_repository_check_cannot_supply_acceptance(self):
         targets = ("alice/project", "org-one/service", "org-two/client")
         clean = sample(thumbs=["new"], summary="complete", completed=True)
-        foreign = {"id": 99, "name": gate.CHECK, "head_sha": "a" * 40,
+        foreign = {"id": 99, "name": gate.EVIDENCE_CHECK, "head_sha": "a" * 40,
                    "app": {"id": gate.ACTIONS_APP_ID}, "conclusion": "success",
                    "external_id": "codex-gate-v1:other/repo:1:" + "a" * 40,
                    "output": {"text": "not reusable state"}}
@@ -626,7 +626,7 @@ class RunnerTests(unittest.TestCase):
         clean = sample(thumbs=["new"], summary="complete", completed=True)
         state = gate.initialize(sample(), -60)
         gate.observe(state, clean, -30)
-        saved = {"id": 1, "name": gate.CHECK, "head_sha": "a" * 40,
+        saved = {"id": 1, "name": gate.EVIDENCE_CHECK, "head_sha": "a" * 40,
                  "app": {"id": gate.ACTIONS_APP_ID}, "conclusion": "success",
                  "external_id": "codex-gate-v1:owner/repo:1:" + "a" * 40,
                  "output": {"text": json.dumps(state)}}
@@ -641,7 +641,7 @@ class RunnerTests(unittest.TestCase):
         old = sample(base={"ref": "release", "sha": "e" * 40})
         state = gate.initialize(old, -60)
         gate.observe(state, old | {"thumbs": ["new"], "summary": "complete", "completed": True}, -30)
-        saved = {"id": 1, "name": gate.CHECK, "head_sha": "a" * 40,
+        saved = {"id": 1, "name": gate.EVIDENCE_CHECK, "head_sha": "a" * 40,
                  "app": {"id": gate.ACTIONS_APP_ID}, "conclusion": "success",
                  "external_id": "codex-gate-v1:owner/repo:1:" + "a" * 40,
                  "output": {"text": json.dumps(state)}}
@@ -666,7 +666,7 @@ class RunnerTests(unittest.TestCase):
         for conclusion in ("failure", None):
             for recovered in (True, False):
                 state = gate.initialize(sample(), -gate.TIMEOUT)
-                saved = {"id": 1, "name": gate.CHECK, "head_sha": "a" * 40,
+                saved = {"id": 1, "name": gate.EVIDENCE_CHECK, "head_sha": "a" * 40,
                          "app": {"id": gate.ACTIONS_APP_ID}, "conclusion": conclusion,
                          "external_id": "codex-gate-v1:owner/repo:1:" + "a" * 40,
                          "output": {"text": json.dumps(state)}}
@@ -679,7 +679,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_terminal_history_uses_latest_run_and_multiple_active_runs_block(self):
         state = gate.initialize(sample(), -gate.TIMEOUT)
-        old = {"id": 1, "name": gate.CHECK, "head_sha": "a" * 40,
+        old = {"id": 1, "name": gate.EVIDENCE_CHECK, "head_sha": "a" * 40,
                "app": {"id": gate.ACTIONS_APP_ID}, "conclusion": "failure",
                "external_id": "codex-gate-v1:owner/repo:1:" + "a" * 40,
                "output": {"text": json.dumps(state)}}
@@ -713,7 +713,6 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("workflow_call:", generated)
         self.assertNotIn("pull_request_target:", generated)
         self.assertIn("GITHUB_TOKEN: ${{ github.token }}", generated)
-        self.assertIn("fromJSON(github.event.inputs.pr || '0')", generated)
         self.assertIn("type: number", (ROOT / "examples/caller.yml").read_text())
 
 

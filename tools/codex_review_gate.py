@@ -13,7 +13,7 @@ import urllib.error
 BOT_ID = 199175422
 CODEX_APP_ID = 1144995
 ACTIONS_APP_ID = 15368
-CHECK = "codex-cloud-review"
+LEGACY_CHECK = "codex-cloud-review"
 EVIDENCE_CHECK = "codex-review-evidence"
 FEEDBACK_CHECK = "codex-review-feedback-event"
 INTERVAL = 30
@@ -596,14 +596,13 @@ def publish(api, check_id, state, status, reason):
     api.last_publish = previous
 
 
-def run(api, number, clock=time.time, sleep=time.sleep, expected_head=None):
+def run(api, number, clock=time.time, sleep=time.sleep, *, expected_head):
     pr = api.repo_call(f"pulls/{number}")
     if pr["state"] != "open" or pr["draft"]:
         return False
     head = pr["head"]["sha"]
-    if expected_head is not None and head != expected_head:
+    if head != expected_head:
         return False
-    check_name = EVIDENCE_CHECK if expected_head is not None else CHECK
     base = base_identity(pr)
     external = f"codex-gate-v1:{api.repo}:{number}:{head}"
     checks = api.pages(f"commits/{head}/check-runs?filter=all", "check_runs")
@@ -626,10 +625,10 @@ def run(api, number, clock=time.time, sleep=time.sleep, expected_head=None):
         advance_floors(event_floors, saved["disposition_floors"])
     floors = event_floors["disposition_floors"]
     history = [c for c in checks
-               if c["name"] in (CHECK, check_name) and c["app"]["id"] == ACTIONS_APP_ID]
-    evidence_history = [c for c in history if c["name"] == check_name]
+               if c["name"] in (LEGACY_CHECK, EVIDENCE_CHECK) and c["app"]["id"] == ACTIONS_APP_ID]
+    evidence_history = [c for c in history if c["name"] == EVIDENCE_CHECK]
     history = evidence_history if any(c.get("external_id") == external for c in evidence_history) else [
-        c for c in history if c["name"] == CHECK]
+        c for c in history if c["name"] == LEGACY_CHECK]
     owned = [c for c in history if c.get("external_id") == external]
     if sum(c["conclusion"] is None for c in owned) > 1:
         raise ValueError("Multiple active owned checks; refusing ambiguous state")
@@ -676,13 +675,13 @@ def run(api, number, clock=time.time, sleep=time.sleep, expected_head=None):
                 state["review_since"] = max(state.get("review_since", state.get("manual_since", accepted_since)), accepted_since)
             state.pop("proof", None)
             state["candidate"] = state["candidate_at"] = None
-        if check["conclusion"] is None and check["name"] == check_name:
+        if check["conclusion"] is None and check["name"] == EVIDENCE_CHECK:
             check_id = check["id"]
     else:
         state = {"version": 1, "head": head, "base": base, "started": now, "initialized": False}
     advance_floors(state, floors)
     if check_id is None:
-        check = api.repo_call("check-runs", {"name": check_name, "head_sha": head,
+        check = api.repo_call("check-runs", {"name": EVIDENCE_CHECK, "head_sha": head,
                               "external_id": external, "status": "in_progress",
                               "output": {"title": "Observing Codex review", "summary": "Persisted Codex review observation",
                                          "text": json.dumps(state)}})
@@ -822,11 +821,11 @@ def main():
     required = os.environ.get("CODEX_REQUIRED_REVIEW") == "true"
     if required and os.environ["GITHUB_EVENT_NAME"] != "pull_request_target":
         raise ValueError("Required review needs a trusted pull_request_target event")
-    if not required and os.environ["GITHUB_EVENT_NAME"] not in ("pull_request_target", "issue_comment", "pull_request_review_comment", "pull_request_review", "workflow_dispatch"):
+    if not required and os.environ["GITHUB_EVENT_NAME"] not in ("issue_comment", "pull_request_review_comment", "pull_request_review", "workflow_dispatch"):
         raise ValueError("Unsupported caller event")
     required_job = os.environ.get("CODEX_REQUIRED_JOB", "")
-    if not required and required_job and os.environ["GITHUB_EVENT_NAME"] == "pull_request_target":
-        return
+    if not required and not required_job:
+        raise ValueError("Missing required job to rerun")
     api = GitHub(os.environ["GITHUB_TOKEN"], os.environ["GITHUB_REPOSITORY"])
     with open(os.environ["GITHUB_EVENT_PATH"]) as event_file:
         event = json.load(event_file)
@@ -862,25 +861,22 @@ def main():
             raise ValueError("Missing or malformed event head")
         accepted = run(api, number, expected_head=expected_head)
         raise SystemExit(0 if accepted is True else 1)
-    if required_job:
-        prefix = api.repo + "/"
-        workflow_ref = os.environ.get("GITHUB_WORKFLOW_REF", "")
-        if not workflow_ref.startswith(prefix):
-            raise ValueError("Missing trusted caller workflow identity")
-        workflow_path, separator, ref = workflow_ref[len(prefix):].partition("@")
-        if not separator or not ref or not re.fullmatch(r"\.github/workflows/[^/@]+\.ya?ml", workflow_path):
-            raise ValueError("Invalid caller workflow identity")
-        observer_run_id = os.environ.get("GITHUB_RUN_ID", "")
-        if not re.fullmatch(r"[1-9][0-9]*", observer_run_id):
-            raise ValueError("Missing trusted observer run identity")
-        observer_run = api.repo_call(f"actions/runs/{observer_run_id}")
-        if observer_run.get("id") != int(observer_run_id):
-            raise ValueError("Observer run identity mismatch")
-        observed_after = timestamp(observer_run.get("run_started_at"))
-        if not rerun_required_job(api, number, required_job, workflow_path, observed_after=observed_after):
-            raise SystemExit(1)
-        return
-    run(api, number)
+    prefix = api.repo + "/"
+    workflow_ref = os.environ.get("GITHUB_WORKFLOW_REF", "")
+    if not workflow_ref.startswith(prefix):
+        raise ValueError("Missing trusted caller workflow identity")
+    workflow_path, separator, ref = workflow_ref[len(prefix):].partition("@")
+    if not separator or not ref or not re.fullmatch(r"\.github/workflows/[^/@]+\.ya?ml", workflow_path):
+        raise ValueError("Invalid caller workflow identity")
+    observer_run_id = os.environ.get("GITHUB_RUN_ID", "")
+    if not re.fullmatch(r"[1-9][0-9]*", observer_run_id):
+        raise ValueError("Missing trusted observer run identity")
+    observer_run = api.repo_call(f"actions/runs/{observer_run_id}")
+    if observer_run.get("id") != int(observer_run_id):
+        raise ValueError("Observer run identity mismatch")
+    observed_after = timestamp(observer_run.get("run_started_at"))
+    if not rerun_required_job(api, number, required_job, workflow_path, observed_after=observed_after):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
