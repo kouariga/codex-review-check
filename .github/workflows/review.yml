@@ -257,11 +257,14 @@ jobs:
                   state.pop("review_active", None)
               if "manual_since" in state:
                   state["review_since"] = max(state.get("review_since", float("-inf")), state.pop("manual_since"))
-              lifecycle_valid = bool(structured and structured["current_head"] and structured["completed"]
-                                     and not structured["unknown_findings"] and not structured["unresolved"]
+              # Codex writes has_unresolved_findings only when a review completes, so resolving the
+              # threads afterwards never clears it. Verified dispositions rely on live thread state instead.
+              review_finished = bool(structured and structured["current_head"] and structured["completed"]
+                                     and not structured["unknown_findings"]
                                      and not structured["failed"] and snapshot["completed"] and not snapshot["failed"]
                                      and snapshot.get("review_completed", snapshot["completed"])
                                      and not snapshot.get("unresolved_threads", False))
+              lifecycle_valid = review_finished and not structured["unresolved"]
               findings = (list(snapshot.get("findings", []))
                           + [review["id"] for review in snapshot.get("review_findings", [])]
                           + [item["key"] for item in snapshot.get("inventory", [])])
@@ -275,7 +278,7 @@ jobs:
                   value["valid"] and value["id"] == state["disposition_floors"].get(key)
                   and state.get("review_since", float("-inf")) < value["created"] <= now
                   for key, value in dispositions.items())
-              if proof is None and lifecycle_valid and verified:
+              if proof is None and review_finished and verified:
                   replies = [{"finding": key, "id": dispositions[key]["id"],
                               "author": dispositions[key]["author"], "digest": dispositions[key]["digest"]}
                              for key in sorted(dispositions)]
@@ -291,7 +294,7 @@ jobs:
                       reason = "Completed review has unknown finding flags; explicit structured results are required"
                   elif findings or (structured and structured["has_findings"]):
                       reason = "Codex findings remain; waiting for verified feedback handling"
-                  if dispositions and not verified and lifecycle_valid:
+                  if dispositions and not verified and review_finished:
                       reason = "Every finding needs a valid current fixed or won’t-fix decision"
                   if (structured and structured["current_head"] and structured["failed"]) or snapshot["failed"]:
                       return "failure", "Codex review failed; no automatic retry is requested"
