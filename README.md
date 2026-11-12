@@ -287,7 +287,10 @@ the latest review completion, summary update, and any change or non-decision fol
 to that finding, including human context. Decisions must also follow every bot
 review submission or update. Replies must bind the current head and base. A new commit or
 base revision requires new replies after its review completes. Clicking Resolve
-alone is insufficient. A running, failed, or unresolved review cannot pass.
+alone is insufficient. A running or failed review, or an unresolved thread, cannot pass.
+Codex sets `has_unresolved_findings` only when a review completes, so resolving
+threads afterwards leaves it `true`. Decision acceptance therefore uses the live
+thread state instead of that flag. Clean acceptance still requires it to be `false`.
 
 After replying and resolving the threads, explicitly dispatch the caller
 workflow for the PR. GitHub has no supported review-thread-resolution Actions

@@ -393,15 +393,21 @@ class DispositionTests(unittest.TestCase):
         decisions[0]['user']['type'] = 'Bot'
         self.assertEqual(self.verdict()[2][0], 'pending')
 
-    def test_active_failed_and_unresolved_reviews_block_dispositions(self):
+    def test_active_and_failed_reviews_block_dispositions(self):
         self.decisions()
         for status in ['running', 'failed']:
             self.metadata['code_review']['status'] = status
             self.refresh_summary(status.title())
             self.assertEqual(self.verdict()[2][0], 'failure' if status == 'failed' else 'pending')
-        self.metadata['code_review']['status'] = 'completed'
+
+    def test_stale_unresolved_flag_accepts_dispositions_once_threads_resolve(self):
+        self.decisions()
         self.metadata['code_review']['has_unresolved_findings'] = True
         self.refresh_summary()
+        state, _, second = self.verdict()
+        self.assertEqual(second[0], 'success')
+        self.assertEqual(state['proof']['kind'], 'verified_dispositions')
+        self.resolved[13] = False
         self.assertEqual(self.verdict()[2][0], 'pending')
 
     def test_restart_after_observed_active_review_requires_new_replies(self):
